@@ -1514,7 +1514,7 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
                 output( "\tjmp *%s\n", asm_name( imp_name ) );
                 if (is_delay)
                 {
-                    output( "\n\t.section .text$1\n" );
+                    output( "\n\t.section .text$1,\"xr\"\n" );
                     output( ".L__wine_delay_import:\n" );
                     output( "\tmov $%s,%%eax\n", asm_name( imp_name ) );
                     output( "\tjmp %s\n", asm_name( delay_load ) );
@@ -1524,7 +1524,7 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
                 output( "\tjmp *%s(%%rip)\n", asm_name( imp_name ) );
                 if (is_delay)
                 {
-                    output( "\n\t.section .text$1\n" );
+                    output( "\n\t.section .text$1,\"xr\"\n" );
                     output( ".L__wine_delay_import:\n" );
                     output( "\tlea %s(%%rip),%%rax\n", asm_name( imp_name ) );
                     output( "\tjmp %s\n", asm_name( delay_load ) );
