@@ -1,0 +1,1792 @@
+/*
+ * Graphics driver management functions
+ *
+ * Copyright 1994 Bob Amstadt
+ * Copyright 1996, 2001 Alexandre Julliard
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include <assert.h>
+#include <pthread.h>
+#ifdef __PROSPERO__
+#include <ps5platform/klog.h>
+#endif
+
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "ntgdi_private.h"
+#include "ntuser_private.h"
+#include "wine/winbase16.h"
+#include "wine/list.h"
+#include "wine/debug.h"
+#include "wine/ps5_title.h"
+#ifdef __PROSPERO__
+#include "wine/ps5_title_input.h"
+static NTSTATUS ps5_send_hardware_input( HWND hwnd, UINT flags, const INPUT *input, LPARAM lparam );
+#define NtUserSendHardwareInput ps5_send_hardware_input
+#include "wine/ps5_input.h"
+#undef NtUserSendHardwareInput
+#endif
+
+WINE_DEFAULT_DEBUG_CHANNEL(driver);
+WINE_DECLARE_DEBUG_CHANNEL(winediag);
+
+static const struct user_driver_funcs lazy_load_driver;
+static struct user_driver_funcs null_user_driver;
+static WCHAR driver_load_error[80];
+
+static INT nulldrv_AbortDoc( PHYSDEV dev )
+{
+    return 0;
+}
+
+static BOOL nulldrv_Arc( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
+                         INT xstart, INT ystart, INT xend, INT yend )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_Chord( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
+                           INT xstart, INT ystart, INT xend, INT yend )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_CreateCompatibleDC( PHYSDEV orig, PHYSDEV *pdev )
+{
+    if (!user_driver->dc_funcs.pCreateCompatibleDC) return TRUE;
+    return user_driver->dc_funcs.pCreateCompatibleDC( NULL, pdev );
+}
+
+static BOOL nulldrv_CreateDC( PHYSDEV *dev, LPCWSTR device, LPCWSTR output,
+                              const DEVMODEW *devmode )
+{
+    assert(0);  /* should never be called */
+    return FALSE;
+}
+
+static BOOL nulldrv_DeleteDC( PHYSDEV dev )
+{
+    assert(0);  /* should never be called */
+    return TRUE;
+}
+
+static BOOL nulldrv_DeleteObject( PHYSDEV dev, HGDIOBJ obj )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_Ellipse( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+{
+    return TRUE;
+}
+
+static INT nulldrv_EndDoc( PHYSDEV dev )
+{
+    return 0;
+}
+
+static INT nulldrv_EndPage( PHYSDEV dev )
+{
+    return 0;
+}
+
+static BOOL nulldrv_EnumFonts( PHYSDEV dev, LOGFONTW *logfont, font_enum_proc proc, LPARAM lParam )
+{
+    return TRUE;
+}
+
+static INT nulldrv_ExtEscape( PHYSDEV dev, INT escape, INT in_size, const void *in_data,
+                              INT out_size, void *out_data )
+{
+    return 0;
+}
+
+static BOOL nulldrv_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT type )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_FontIsLinked( PHYSDEV dev )
+{
+    return FALSE;
+}
+
+static UINT nulldrv_GetBoundsRect( PHYSDEV dev, RECT *rect, UINT flags )
+{
+    return DCB_RESET;
+}
+
+static BOOL nulldrv_GetCharABCWidths( PHYSDEV dev, UINT first, UINT count, WCHAR *chars, ABC *abc )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetCharABCWidthsI( PHYSDEV dev, UINT first, UINT count, WORD *indices, LPABC abc )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetCharWidth( PHYSDEV dev, UINT first, UINT count,
+                                  const WCHAR *chars, INT *buffer )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetCharWidthInfo( PHYSDEV dev, void *info )
+{
+    return FALSE;
+}
+
+static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
+{
+    int bpp;
+
+    switch (cap)
+    {
+    case DRIVERVERSION:   return 0x4000;
+    case TECHNOLOGY:      return DT_RASDISPLAY;
+    case HORZSIZE:        return muldiv( NtGdiGetDeviceCaps( dev->hdc, HORZRES ), 254,
+                                         NtGdiGetDeviceCaps( dev->hdc, LOGPIXELSX ) * 10 );
+    case VERTSIZE:        return muldiv( NtGdiGetDeviceCaps( dev->hdc, VERTRES ), 254,
+                                         NtGdiGetDeviceCaps( dev->hdc, LOGPIXELSY ) * 10 );
+    case HORZRES:
+    {
+        DC *dc = get_nulldrv_dc( dev );
+        RECT rect;
+        int ret;
+
+        if (dc->display[0])
+        {
+            rect = get_display_rect( dc->display );
+            if (!IsRectEmpty( &rect )) return rect.right - rect.left;
+        }
+
+        ret = get_system_metrics( SM_CXSCREEN );
+        return ret ? ret : 640;
+    }
+    case VERTRES:
+    {
+        DC *dc = get_nulldrv_dc( dev );
+        RECT rect;
+        int ret;
+
+        if (dc->display[0])
+        {
+            rect = get_display_rect( dc->display );
+            if (!IsRectEmpty( &rect )) return rect.bottom - rect.top;
+        }
+
+        ret = get_system_metrics( SM_CYSCREEN );
+        return ret ? ret : 480;
+    }
+    case BITSPIXEL:
+    {
+        UNICODE_STRING display;
+        DC *dc;
+
+        if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
+        {
+            dc = get_nulldrv_dc( dev );
+            RtlInitUnicodeString( &display, dc->display );
+            return get_display_depth( &display );
+        }
+        return 32;
+    }
+    case PLANES:          return 1;
+    case NUMBRUSHES:      return -1;
+    case NUMPENS:         return -1;
+    case NUMMARKERS:      return 0;
+    case NUMFONTS:        return 0;
+    case PDEVICESIZE:     return 0;
+    case CURVECAPS:       return (CC_CIRCLES | CC_PIE | CC_CHORD | CC_ELLIPSES | CC_WIDE |
+                                  CC_STYLED | CC_WIDESTYLED | CC_INTERIORS | CC_ROUNDRECT);
+    case LINECAPS:        return (LC_POLYLINE | LC_MARKER | LC_POLYMARKER | LC_WIDE |
+                                  LC_STYLED | LC_WIDESTYLED | LC_INTERIORS);
+    case POLYGONALCAPS:   return (PC_POLYGON | PC_RECTANGLE | PC_WINDPOLYGON | PC_SCANLINE |
+                                  PC_WIDE | PC_STYLED | PC_WIDESTYLED | PC_INTERIORS);
+    case TEXTCAPS:        return (TC_OP_CHARACTER | TC_OP_STROKE | TC_CP_STROKE |
+                                  TC_CR_ANY | TC_SF_X_YINDEP | TC_SA_DOUBLE | TC_SA_INTEGER |
+                                  TC_SA_CONTIN | TC_UA_ABLE | TC_SO_ABLE | TC_RA_ABLE | TC_VA_ABLE);
+    case CLIPCAPS:        return CP_RECTANGLE;
+    case RASTERCAPS:      return (RC_BITBLT | RC_BITMAP64 | RC_GDI20_OUTPUT | RC_DI_BITMAP | RC_DIBTODEV |
+                                  RC_BIGFONT | RC_STRETCHBLT | RC_FLOODFILL | RC_STRETCHDIB | RC_DEVBITS |
+                                  (NtGdiGetDeviceCaps( dev->hdc, SIZEPALETTE ) ? RC_PALETTE : 0));
+    case ASPECTX:         return 36;
+    case ASPECTY:         return 36;
+    case ASPECTXY:        return (int)(hypot( NtGdiGetDeviceCaps( dev->hdc, ASPECTX ),
+                                              NtGdiGetDeviceCaps( dev->hdc, ASPECTY )) + 0.5);
+    case CAPS1:           return 0;
+    case SIZEPALETTE:     return 0;
+    case NUMRESERVED:     return 20;
+    case PHYSICALWIDTH:   return 0;
+    case PHYSICALHEIGHT:  return 0;
+    case PHYSICALOFFSETX: return 0;
+    case PHYSICALOFFSETY: return 0;
+    case SCALINGFACTORX:  return 0;
+    case SCALINGFACTORY:  return 0;
+    case VREFRESH:
+    {
+        UNICODE_STRING display;
+        DEVMODEW devmode;
+        DC *dc;
+
+        if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) != DT_RASDISPLAY)
+            return 0;
+
+        dc = get_nulldrv_dc( dev );
+
+        memset( &devmode, 0, sizeof(devmode) );
+        devmode.dmSize = sizeof(devmode);
+        RtlInitUnicodeString( &display, dc->display );
+        if (NtUserEnumDisplaySettings( &display, ENUM_CURRENT_SETTINGS, &devmode, 0 ) &&
+            devmode.dmDisplayFrequency)
+            return devmode.dmDisplayFrequency;
+        return 1;
+    }
+    case DESKTOPHORZRES:
+        if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
+        {
+            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+            return rect.right - rect.left;
+        }
+        return NtGdiGetDeviceCaps( dev->hdc, HORZRES );
+    case DESKTOPVERTRES:
+        if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
+        {
+            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+            return rect.bottom - rect.top;
+        }
+        return NtGdiGetDeviceCaps( dev->hdc, VERTRES );
+    case BLTALIGNMENT:    return 0;
+    case SHADEBLENDCAPS:  return 0;
+    case COLORMGMTCAPS:   return 0;
+    case LOGPIXELSX:
+    case LOGPIXELSY:      return get_system_dpi();
+    case NUMCOLORS:
+        bpp = NtGdiGetDeviceCaps( dev->hdc, BITSPIXEL );
+        /* Newer versions of Windows return -1 for 8-bit and higher */
+        return (bpp > 4) ? -1 : (1 << bpp);
+    case COLORRES:
+        /* The observed correspondence between BITSPIXEL and COLORRES is:
+         * BITSPIXEL: 8  -> COLORRES: 18
+         * BITSPIXEL: 16 -> COLORRES: 16
+         * BITSPIXEL: 24 -> COLORRES: 24
+         * BITSPIXEL: 32 -> COLORRES: 24 */
+        bpp = NtGdiGetDeviceCaps( dev->hdc, BITSPIXEL );
+        return (bpp <= 8) ? 18 : min( 24, bpp );
+    default:
+        FIXME("(%p): unsupported capability %d, will return 0\n", dev->hdc, cap );
+        return 0;
+    }
+}
+
+static UINT nulldrv_GetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+{
+    return -1; /* use default implementation */
+}
+
+static DWORD nulldrv_GetFontData( PHYSDEV dev, DWORD table, DWORD offset, LPVOID buffer, DWORD length )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetFontRealizationInfo( PHYSDEV dev, void *info )
+{
+    return FALSE;
+}
+
+static DWORD nulldrv_GetFontUnicodeRanges( PHYSDEV dev, LPGLYPHSET glyphs )
+{
+    return 0;
+}
+
+static DWORD nulldrv_GetGlyphIndices( PHYSDEV dev, LPCWSTR str, INT count, LPWORD indices, DWORD flags )
+{
+    return GDI_ERROR;
+}
+
+static DWORD nulldrv_GetGlyphOutline( PHYSDEV dev, UINT ch, UINT format, LPGLYPHMETRICS metrics,
+                                      DWORD size, LPVOID buffer, const MAT2 *mat )
+{
+    return GDI_ERROR;
+}
+
+static DWORD nulldrv_GetImage( PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bits,
+                               struct bitblt_coords *src )
+{
+    return ERROR_NOT_SUPPORTED;
+}
+
+static DWORD nulldrv_GetKerningPairs( PHYSDEV dev, DWORD count, LPKERNINGPAIR pairs )
+{
+    return 0;
+}
+
+static UINT nulldrv_GetOutlineTextMetrics( PHYSDEV dev, UINT size, LPOUTLINETEXTMETRICW otm )
+{
+    return 0;
+}
+
+static UINT nulldrv_GetTextCharsetInfo( PHYSDEV dev, LPFONTSIGNATURE fs, DWORD flags )
+{
+    return DEFAULT_CHARSET;
+}
+
+static BOOL nulldrv_GetTextExtentExPoint( PHYSDEV dev, LPCWSTR str, INT count, INT *dx )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetTextExtentExPointI( PHYSDEV dev, const WORD *indices, INT count, INT *dx )
+{
+    return FALSE;
+}
+
+static INT nulldrv_GetTextFace( PHYSDEV dev, INT size, LPWSTR name )
+{
+    INT ret = 0;
+    LOGFONTW font;
+    DC *dc = get_nulldrv_dc( dev );
+
+    if (NtGdiExtGetObjectW( dc->hFont, sizeof(font), &font ))
+    {
+        ret = lstrlenW( font.lfFaceName ) + 1;
+        if (name)
+        {
+            lstrcpynW( name, font.lfFaceName, size );
+            ret = min( size, ret );
+        }
+    }
+    return ret;
+}
+
+static BOOL nulldrv_GetTextMetrics( PHYSDEV dev, TEXTMETRICW *metrics )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_LineTo( PHYSDEV dev, INT x, INT y )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_MoveTo( PHYSDEV dev, INT x, INT y )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_PaintRgn( PHYSDEV dev, HRGN rgn )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_Pie( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
+                         INT xstart, INT ystart, INT xend, INT yend )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_PolyPolygon( PHYSDEV dev, const POINT *points, const INT *counts, UINT polygons )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_PolyPolyline( PHYSDEV dev, const POINT *points, const DWORD *counts, DWORD lines )
+{
+    return TRUE;
+}
+
+static DWORD nulldrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
+                               const struct gdi_image_bits *bits, struct bitblt_coords *src,
+                               struct bitblt_coords *dst, DWORD rop )
+{
+    return ERROR_SUCCESS;
+}
+
+static UINT nulldrv_RealizeDefaultPalette( PHYSDEV dev )
+{
+    return 0;
+}
+
+static UINT nulldrv_RealizePalette( PHYSDEV dev, HPALETTE palette, BOOL primary )
+{
+    return 0;
+}
+
+static BOOL nulldrv_Rectangle( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_ResetDC( PHYSDEV dev, const DEVMODEW *devmode )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
+                               INT ell_width, INT ell_height )
+{
+    return TRUE;
+}
+
+static HBITMAP nulldrv_SelectBitmap( PHYSDEV dev, HBITMAP bitmap )
+{
+    return bitmap;
+}
+
+static HBRUSH nulldrv_SelectBrush( PHYSDEV dev, HBRUSH brush, const struct brush_pattern *pattern )
+{
+    return brush;
+}
+
+static HFONT nulldrv_SelectFont( PHYSDEV dev, HFONT font, UINT *aa_flags )
+{
+    return font;
+}
+
+static HPEN nulldrv_SelectPen( PHYSDEV dev, HPEN pen, const struct brush_pattern *pattern )
+{
+    return pen;
+}
+
+static COLORREF nulldrv_SetBkColor( PHYSDEV dev, COLORREF color )
+{
+    return color;
+}
+
+static UINT nulldrv_SetBoundsRect( PHYSDEV dev, RECT *rect, UINT flags )
+{
+    return DCB_RESET;
+}
+
+static COLORREF nulldrv_SetDCBrushColor( PHYSDEV dev, COLORREF color )
+{
+    return color;
+}
+
+static COLORREF nulldrv_SetDCPenColor( PHYSDEV dev, COLORREF color )
+{
+    return color;
+}
+
+static void nulldrv_SetDeviceClipping( PHYSDEV dev, HRGN rgn, HRGN monitor_rgn )
+{
+}
+
+static UINT nulldrv_SetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+{
+    return -1; /* use default implementation */
+}
+
+static COLORREF nulldrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
+{
+    return color;
+}
+
+static COLORREF nulldrv_SetTextColor( PHYSDEV dev, COLORREF color )
+{
+    return color;
+}
+
+static INT nulldrv_StartDoc( PHYSDEV dev, const DOCINFOW *info )
+{
+    return 0;
+}
+
+static INT nulldrv_StartPage( PHYSDEV dev )
+{
+    return 1;
+}
+
+static BOOL nulldrv_UnrealizePalette( HPALETTE palette )
+{
+    return FALSE;
+}
+
+const struct gdi_dc_funcs null_driver =
+{
+    nulldrv_AbortDoc,                   /* pAbortDoc */
+    nulldrv_AbortPath,                  /* pAbortPath */
+    nulldrv_AlphaBlend,                 /* pAlphaBlend */
+    nulldrv_AngleArc,                   /* pAngleArc */
+    nulldrv_Arc,                        /* pArc */
+    nulldrv_ArcTo,                      /* pArcTo */
+    nulldrv_BeginPath,                  /* pBeginPath */
+    nulldrv_BlendImage,                 /* pBlendImage */
+    nulldrv_Chord,                      /* pChord */
+    nulldrv_CloseFigure,                /* pCloseFigure */
+    nulldrv_CreateCompatibleDC,         /* pCreateCompatibleDC */
+    nulldrv_CreateDC,                   /* pCreateDC */
+    nulldrv_DeleteDC,                   /* pDeleteDC */
+    nulldrv_DeleteObject,               /* pDeleteObject */
+    nulldrv_Ellipse,                    /* pEllipse */
+    nulldrv_EndDoc,                     /* pEndDoc */
+    nulldrv_EndPage,                    /* pEndPage */
+    nulldrv_EndPath,                    /* pEndPath */
+    nulldrv_EnumFonts,                  /* pEnumFonts */
+    nulldrv_ExtEscape,                  /* pExtEscape */
+    nulldrv_ExtFloodFill,               /* pExtFloodFill */
+    nulldrv_ExtTextOut,                 /* pExtTextOut */
+    nulldrv_FillPath,                   /* pFillPath */
+    nulldrv_FillRgn,                    /* pFillRgn */
+    nulldrv_FontIsLinked,               /* pFontIsLinked */
+    nulldrv_FrameRgn,                   /* pFrameRgn */
+    nulldrv_GetBoundsRect,              /* pGetBoundsRect */
+    nulldrv_GetCharABCWidths,           /* pGetCharABCWidths */
+    nulldrv_GetCharABCWidthsI,          /* pGetCharABCWidthsI */
+    nulldrv_GetCharWidth,               /* pGetCharWidth */
+    nulldrv_GetCharWidthInfo,           /* pGetCharWidthInfo */
+    nulldrv_GetDeviceCaps,              /* pGetDeviceCaps */
+    nulldrv_GetDeviceGammaRamp,         /* pGetDeviceGammaRamp */
+    nulldrv_GetFontData,                /* pGetFontData */
+    nulldrv_GetFontRealizationInfo,     /* pGetFontRealizationInfo */
+    nulldrv_GetFontUnicodeRanges,       /* pGetFontUnicodeRanges */
+    nulldrv_GetGlyphIndices,            /* pGetGlyphIndices */
+    nulldrv_GetGlyphOutline,            /* pGetGlyphOutline */
+    nulldrv_GetImage,                   /* pGetImage */
+    nulldrv_GetKerningPairs,            /* pGetKerningPairs */
+    nulldrv_GetNearestColor,            /* pGetNearestColor */
+    nulldrv_GetOutlineTextMetrics,      /* pGetOutlineTextMetrics */
+    nulldrv_GetPixel,                   /* pGetPixel */
+    nulldrv_GetSystemPaletteEntries,    /* pGetSystemPaletteEntries */
+    nulldrv_GetTextCharsetInfo,         /* pGetTextCharsetInfo */
+    nulldrv_GetTextExtentExPoint,       /* pGetTextExtentExPoint */
+    nulldrv_GetTextExtentExPointI,      /* pGetTextExtentExPointI */
+    nulldrv_GetTextFace,                /* pGetTextFace */
+    nulldrv_GetTextMetrics,             /* pGetTextMetrics */
+    nulldrv_GradientFill,               /* pGradientFill */
+    nulldrv_InvertRgn,                  /* pInvertRgn */
+    nulldrv_LineTo,                     /* pLineTo */
+    nulldrv_MoveTo,                     /* pMoveTo */
+    nulldrv_PaintRgn,                   /* pPaintRgn */
+    nulldrv_PatBlt,                     /* pPatBlt */
+    nulldrv_Pie,                        /* pPie */
+    nulldrv_PolyBezier,                 /* pPolyBezier */
+    nulldrv_PolyBezierTo,               /* pPolyBezierTo */
+    nulldrv_PolyDraw,                   /* pPolyDraw */
+    nulldrv_PolyPolygon,                /* pPolyPolygon */
+    nulldrv_PolyPolyline,               /* pPolyPolyline */
+    nulldrv_PolylineTo,                 /* pPolylineTo */
+    nulldrv_PutImage,                   /* pPutImage */
+    nulldrv_RealizeDefaultPalette,      /* pRealizeDefaultPalette */
+    nulldrv_RealizePalette,             /* pRealizePalette */
+    nulldrv_Rectangle,                  /* pRectangle */
+    nulldrv_ResetDC,                    /* pResetDC */
+    nulldrv_RoundRect,                  /* pRoundRect */
+    nulldrv_SelectBitmap,               /* pSelectBitmap */
+    nulldrv_SelectBrush,                /* pSelectBrush */
+    nulldrv_SelectFont,                 /* pSelectFont */
+    nulldrv_SelectPen,                  /* pSelectPen */
+    nulldrv_SetBkColor,                 /* pSetBkColor */
+    nulldrv_SetBoundsRect,              /* pSetBoundsRect */
+    nulldrv_SetDCBrushColor,            /* pSetDCBrushColor */
+    nulldrv_SetDCPenColor,              /* pSetDCPenColor */
+    nulldrv_SetDIBitsToDevice,          /* pSetDIBitsToDevice */
+    nulldrv_SetDeviceClipping,          /* pSetDeviceClipping */
+    nulldrv_SetDeviceGammaRamp,         /* pSetDeviceGammaRamp */
+    nulldrv_SetPixel,                   /* pSetPixel */
+    nulldrv_SetTextColor,               /* pSetTextColor */
+    nulldrv_StartDoc,                   /* pStartDoc */
+    nulldrv_StartPage,                  /* pStartPage */
+    nulldrv_StretchBlt,                 /* pStretchBlt */
+    nulldrv_StretchDIBits,              /* pStretchDIBits */
+    nulldrv_StrokeAndFillPath,          /* pStrokeAndFillPath */
+    nulldrv_StrokePath,                 /* pStrokePath */
+    nulldrv_UnrealizePalette,           /* pUnrealizePalette */
+
+    GDI_PRIORITY_NULL_DRV               /* priority */
+};
+
+
+/**********************************************************************
+ * Null user driver
+ *
+ * These are fallbacks for entry points that are not implemented in the real driver.
+ */
+
+static BOOL nulldrv_ActivateKeyboardLayout( HKL layout, UINT flags )
+{
+    return TRUE;
+}
+
+static void nulldrv_Beep(void)
+{
+}
+
+static UINT nulldrv_GetKeyboardLayoutList( INT size, HKL *layouts )
+{
+    return ~0; /* use default implementation */
+}
+
+static INT nulldrv_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size )
+{
+    return -1; /* use default implementation */
+}
+
+static UINT nulldrv_MapVirtualKeyEx( UINT code, UINT type, HKL layout )
+{
+    return -1; /* use default implementation */
+}
+
+static BOOL nulldrv_RegisterHotKey( HWND hwnd, UINT modifiers, UINT vk )
+{
+    return TRUE;
+}
+
+static INT nulldrv_ToUnicodeEx( UINT virt, UINT scan, const BYTE *state, LPWSTR str,
+                                int size, UINT flags, HKL layout )
+{
+    return -2; /* use default implementation */
+}
+
+static void nulldrv_UnregisterHotKey( HWND hwnd, UINT modifiers, UINT vk )
+{
+}
+
+static SHORT nulldrv_VkKeyScanEx( WCHAR ch, HKL layout )
+{
+    return -256; /* use default implementation */
+}
+
+static const KBDTABLES *nulldrv_KbdLayerDescriptor( HKL layout )
+{
+    return NULL;
+}
+
+static void nulldrv_ReleaseKbdTables( const KBDTABLES *tables )
+{
+}
+
+static UINT nulldrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
+{
+    return 0;
+}
+
+static void nulldrv_NotifyIMEStatus( HWND hwnd, UINT status )
+{
+}
+
+static BOOL nulldrv_SetIMECompositionRect( HWND hwnd, RECT rect )
+{
+    return FALSE;
+}
+
+static void nulldrv_SetTextInputFocus( HWND hwnd, BOOL focused )
+{
+}
+
+static LRESULT nulldrv_DesktopWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    return default_window_proc( hwnd, msg, wparam, lparam, FALSE );
+}
+
+static void nulldrv_DestroyCursorIcon( HCURSOR cursor )
+{
+}
+
+static void nulldrv_SetCursor( HWND hwnd, HCURSOR cursor )
+{
+}
+
+static BOOL nulldrv_GetCursorPos( LPPOINT pt )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_SetCursorPos( INT x, INT y )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_ClipCursor( const RECT *clip, BOOL reset )
+{
+    return TRUE;
+}
+
+static LRESULT nulldrv_NotifyIcon( HWND hwnd, UINT msg, NOTIFYICONDATAW *data )
+{
+    return -1;
+}
+
+static void nulldrv_CleanupIcons( HWND hwnd )
+{
+}
+
+static void nulldrv_SystrayDockInit( HWND hwnd )
+{
+}
+
+static BOOL nulldrv_SystrayDockInsert( HWND hwnd, UINT cx, UINT cy, void *icon )
+{
+    return FALSE;
+}
+
+static void nulldrv_SystrayDockClear( HWND hwnd )
+{
+}
+
+static BOOL nulldrv_SystrayDockRemove( HWND hwnd )
+{
+    return FALSE;
+}
+
+static void nulldrv_UpdateClipboard(void)
+{
+}
+
+static LONG nulldrv_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HWND hwnd,
+                                           DWORD flags, LPVOID lparam )
+{
+    return DISP_CHANGE_SUCCESSFUL;
+}
+
+static UINT nulldrv_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+static BOOL nulldrv_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+{
+    return TRUE;
+}
+
+static BOOL nodrv_CreateWindow( HWND hwnd )
+{
+    static int warned;
+    HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+
+    /* HWND_MESSAGE windows don't need a graphics driver */
+    if (!parent || parent == UlongToHandle( NtUserGetThreadInfo()->msg_window )) return TRUE;
+    if (warned++) return FALSE;
+
+    ERR_(winediag)( "Application tried to create a window, but no driver could be loaded.\n" );
+    if (driver_load_error[0]) ERR_(winediag)( "%s\n", debugstr_w(driver_load_error) );
+    return FALSE;
+}
+
+static BOOL nulldrv_CreateWindow( HWND hwnd )
+{
+    return TRUE;
+}
+
+static void nulldrv_DestroyWindow( HWND hwnd )
+{
+}
+
+static void nulldrv_FlashWindowEx( FLASHWINFO *info )
+{
+}
+
+static BOOL nulldrv_HasWindowManager( const char *name )
+{
+    return FALSE;
+}
+
+static void nulldrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rect,
+                           const RECT *top_rect, DWORD flags )
+{
+}
+
+#ifdef __PROSPERO__
+struct ps5_input_diagnostics
+{
+    LONG key_down, key_up, text, mouse_move, mouse_button, mouse_wheel, resets;
+    LONG succeeded, failed;
+    LONG text_delivered, text_failed;
+    NTSTATUS last_status;
+};
+
+static struct ps5_input_diagnostics ps5_input_diag;
+
+static NTSTATUS ps5_send_hardware_input( HWND hwnd, UINT flags, const INPUT *input, LPARAM lparam )
+{
+    NTSTATUS status = send_hardware_message( hwnd, flags | SEND_HWMSG_PS5_TITLE, input, lparam );
+
+    if (!status) InterlockedIncrement( &ps5_input_diag.succeeded );
+    else
+    {
+        InterlockedIncrement( &ps5_input_diag.failed );
+        InterlockedExchange( &ps5_input_diag.last_status, status );
+    }
+    return status;
+}
+
+static void ps5_post_text_chars( const struct ps5_desktop_text *text )
+{
+    HWND foreground = NtUserGetForegroundWindow(), target;
+    GUITHREADINFO info = {.cbSize = sizeof(info)};
+    DWORD thread = HandleToULong( NtUserQueryWindow( foreground, WindowThread ));
+    WCHAR class_buf[64] = {0};
+    UNICODE_STRING class_name = {.Buffer = class_buf, .MaximumLength = sizeof(class_buf)};
+    char target_class[64] = "-", line[256];
+    unsigned int i, count, delivered = 0;
+
+    /* The draining thread need not own the foreground window. WoW's glue
+     * edit boxes consume WM_CHAR, not VK_PACKET; packet input only becomes
+     * text when the application calls TranslateMessage on its key message.
+     * Post UTF-16 units to the foreground thread's focus queue instead.
+     * Do not also send packets, which would duplicate text in other apps. */
+    target = foreground && thread && NtUserGetGUIThreadInfo( thread, &info ) ? info.hwndFocus : 0;
+    for (i = 0; target && i < text->length; i++)
+        if (NtUserPostMessage( target, WM_CHAR, text->text[i], 1 )) delivered++;
+    InterlockedExchangeAdd( &ps5_input_diag.text_delivered, delivered );
+    InterlockedExchangeAdd( &ps5_input_diag.text_failed, text->length - delivered );
+
+    if ((count = NtUserGetClassName( target, FALSE, &class_name )))
+    {
+        for (i = 0; i < min( count, ARRAY_SIZE(target_class) - 1 ); i++)
+            target_class[i] = class_buf[i] >= 0x20 && class_buf[i] < 0x7f ? class_buf[i] : '?';
+        target_class[i] = 0;
+    }
+    /* Counts and window class only: never expose login text or key codes.
+     * "delivered" means queued successfully, not consumed by the edit box. */
+    snprintf( line, sizeof(line),
+              "wine: title input text delivered=%u failed=%u total_delivered=%d total_failed=%d via=wm_char target=%s\n",
+              delivered, text->length - delivered, (int)ps5_input_diag.text_delivered,
+              (int)ps5_input_diag.text_failed, target_class );
+    sceKernelDebugOutText( 0, line );
+}
+#endif
+
+static BOOL nulldrv_ProcessEvents( DWORD mask )
+{
+#ifdef __PROSPERO__
+    static LONG draining;
+    wine_ps5_read_input read_input;
+    union ps5_title_input event;
+    unsigned processed = 0;
+    POINT cursor;
+
+    /* As WoWPS5 does, inject only on a Wine thread. PeekMessage and
+     * MsgWaitForMultipleObjectsEx enter here through wait_message(). The
+     * callback exists only in the GPU parent; payload/product keep null
+     * driver behavior. Resolving beside Vulkan adds no native imports. */
+    if (!__wine_ps5_is_title() ||
+        !__wine_ps5_get_vulkan_proc( "vkGetInstanceProcAddr" ) ||
+        !(read_input = __wine_ps5_get_vulkan_proc( "wineReadInput" ))) return FALSE;
+    /* Keep FIFO delivery and pressed-key state ordered across GUI threads,
+     * without waiting for another thread's server calls. */
+    if (InterlockedCompareExchange( &draining, 1, 0 )) return FALSE;
+    while (processed < 64)
+    {
+        NtUserGetCursorPos( &cursor );
+        if (!read_input( &event, sizeof(event), cursor.x, cursor.y,
+                         NtUserGetSystemMetrics( SM_CXSCREEN ),
+                         NtUserGetSystemMetrics( SM_CYSCREEN ) )) break;
+        switch (event.header.type)
+        {
+        case PS5_TITLE_INPUT_RESET:
+        {
+            struct ps5_desktop_key key = {{PS5_DESKTOP_KEY, sizeof(key)}};
+            INPUT input = {.type = INPUT_MOUSE};
+            InterlockedIncrement( &ps5_input_diag.resets );
+            for (key.usage = 0; key.usage < ARRAY_SIZE(pressed_vkeys); key.usage++)
+                if (pressed_vkeys[key.usage]) send_key( &key );
+            input.mi.dwFlags = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP;
+            ps5_send_hardware_input( 0, 0, &input, 0 );
+            input.mi.dwFlags = MOUSEEVENTF_XUP;
+            input.mi.mouseData = XBUTTON1;
+            ps5_send_hardware_input( 0, 0, &input, 0 );
+            input.mi.mouseData = XBUTTON2;
+            ps5_send_hardware_input( 0, 0, &input, 0 );
+            break;
+        }
+        case PS5_DESKTOP_KEY:
+            InterlockedIncrement( event.key.down ? &ps5_input_diag.key_down : &ps5_input_diag.key_up );
+            send_key( &event.key );
+            break;
+        case PS5_DESKTOP_TEXT:
+        {
+            const struct ps5_desktop_text *text = (const struct ps5_desktop_text *)&event;
+            InterlockedExchangeAdd( &ps5_input_diag.text, text->length );
+            ps5_post_text_chars( text );
+            break;
+        }
+        case PS5_DESKTOP_MOUSE:
+        {
+            const struct ps5_desktop_mouse *mouse = &event.mouse;
+            BOOL relative = !!(mouse->kind & PS5_TITLE_MOUSE_RELATIVE);
+            INPUT input = {.type = INPUT_MOUSE};
+            unsigned kind = mouse->kind & ~PS5_TITLE_MOUSE_RELATIVE;
+            if (kind == PS5_DESKTOP_MOUSE_MOVE) InterlockedIncrement( &ps5_input_diag.mouse_move );
+            else if (kind == PS5_DESKTOP_MOUSE_BUTTON) InterlockedIncrement( &ps5_input_diag.mouse_button );
+            else if (kind == PS5_DESKTOP_MOUSE_WHEEL) InterlockedIncrement( &ps5_input_diag.mouse_wheel );
+            /* Equivalent to wineps5.drv's conversion for pad absolute
+             * pixels; USB movement carries unclamped relative raw deltas,
+             * as WoWPS5 does, so camera dragging survives cursor warps. */
+            if (!relative)
+            {
+                input.mi.dx = (int)((int64_t)mouse->x * NtUserGetSystemMetrics( SM_CXSCREEN ) / PS5_DESKTOP_WIDTH);
+                input.mi.dy = (int)((int64_t)mouse->y * NtUserGetSystemMetrics( SM_CYSCREEN ) / PS5_DESKTOP_HEIGHT);
+                input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            }
+            else if (kind == PS5_DESKTOP_MOUSE_MOVE)
+            {
+                input.mi.dx = mouse->x;
+                input.mi.dy = mouse->y;
+                input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+            }
+            if (kind == PS5_DESKTOP_MOUSE_BUTTON)
+            {
+                switch (mouse->button)
+                {
+                case PS5_DESKTOP_BUTTON_LEFT:
+                    input.mi.dwFlags |= mouse->down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; break;
+                case PS5_DESKTOP_BUTTON_RIGHT:
+                    input.mi.dwFlags |= mouse->down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; break;
+                case PS5_DESKTOP_BUTTON_MIDDLE:
+                    input.mi.dwFlags |= mouse->down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
+                case PS5_DESKTOP_BUTTON_X1:
+                case PS5_DESKTOP_BUTTON_X2:
+                    input.mi.dwFlags |= mouse->down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+                    input.mi.mouseData = mouse->button == PS5_DESKTOP_BUTTON_X1 ? XBUTTON1 : XBUTTON2;
+                    break;
+                }
+            }
+            else if (kind == PS5_DESKTOP_MOUSE_WHEEL)
+            {
+                if (mouse->wheel_y)
+                {
+                    input.mi.dwFlags |= MOUSEEVENTF_WHEEL;
+                    input.mi.mouseData = mouse->wheel_y;
+                    ps5_send_hardware_input( 0, relative ? 0 : SEND_HWMSG_NO_RAW, &input, 0 );
+                    input.mi.dwFlags &= ~MOUSEEVENTF_WHEEL;
+                }
+                if (!mouse->wheel_x) break;
+                input.mi.dwFlags |= MOUSEEVENTF_HWHEEL;
+                input.mi.mouseData = mouse->wheel_x;
+            }
+            /* Wine 11 derives RAWMOUSE directly from these deltas/flags in
+             * server/queue.c; unlike WoWPS5's older Wine, no raw_mouse
+             * payload is required (lparam is only for HID INPUT_HARDWARE). */
+            ps5_send_hardware_input( 0, relative ? 0 : SEND_HWMSG_NO_RAW, &input, 0 );
+            break;
+        }
+        }
+        processed++;
+    }
+    InterlockedExchange( &draining, 0 );
+    if (processed)
+    {
+        static LONG logged_events;
+        static DWORD logged_at;
+        DWORD now = NtGetTickCount();
+        LONG events = ps5_input_diag.key_down + ps5_input_diag.key_up + ps5_input_diag.text +
+                      ps5_input_diag.mouse_move + ps5_input_diag.mouse_button +
+                      ps5_input_diag.mouse_wheel + ps5_input_diag.resets;
+        if (events != logged_events && now - logged_at >= 10000)
+        {
+            HWND foreground = NtUserGetForegroundWindow();
+            GUITHREADINFO info = {.cbSize = sizeof(info)};
+            DWORD fg_pid = HandleToULong( NtUserQueryWindow( foreground, WindowProcess ));
+            DWORD fg_tid = HandleToULong( NtUserQueryWindow( foreground, WindowThread ));
+            WCHAR fg_buf[64] = {0}, focus_buf[64] = {0};
+            UNICODE_STRING fg_name = {.Buffer = fg_buf, .MaximumLength = sizeof(fg_buf)};
+            UNICODE_STRING focus_name = {.Buffer = focus_buf, .MaximumLength = sizeof(focus_buf)};
+            char fg_class[64] = "-", focus_class[64] = "-", line[512];
+            unsigned int i, count;
+
+            logged_at = now;
+            logged_events = events;
+            NtUserGetGUIThreadInfo( fg_tid, &info );
+            if ((count = NtUserGetClassName( foreground, FALSE, &fg_name )))
+                for (i = 0; i < min( count, ARRAY_SIZE(fg_class) - 1 ); i++)
+                    fg_class[i] = fg_buf[i] >= 0x20 && fg_buf[i] < 0x7f ? fg_buf[i] : '?';
+            if ((count = NtUserGetClassName( info.hwndFocus, FALSE, &focus_name )))
+                for (i = 0; i < min( count, ARRAY_SIZE(focus_class) - 1 ); i++)
+                    focus_class[i] = focus_buf[i] >= 0x20 && focus_buf[i] < 0x7f ? focus_buf[i] : '?';
+            snprintf( line, sizeof(line),
+                      "wine: title input route kd=%d ku=%d text=%d move=%d button=%d wheel=%d reset=%d send_ok=%d send_fail=%d last_status=%#x fg=%p fg_class=%s fg_pid=%04x fg_tid=%04x active=%p focus=%p focus_class=%s focus_pid=%04x focus_tid=%04x current_tid=%04x\n",
+                      (int)ps5_input_diag.key_down, (int)ps5_input_diag.key_up,
+                      (int)ps5_input_diag.text, (int)ps5_input_diag.mouse_move,
+                      (int)ps5_input_diag.mouse_button, (int)ps5_input_diag.mouse_wheel,
+                      (int)ps5_input_diag.resets, (int)ps5_input_diag.succeeded,
+                      (int)ps5_input_diag.failed, (unsigned int)ps5_input_diag.last_status,
+                      foreground, fg_class, (unsigned int)fg_pid, (unsigned int)fg_tid,
+                      info.hwndActive, info.hwndFocus, focus_class,
+                      HandleToULong( NtUserQueryWindow( info.hwndFocus, WindowProcess )),
+                      HandleToULong( NtUserQueryWindow( info.hwndFocus, WindowThread )),
+                      (unsigned int)GetCurrentThreadId() );
+            sceKernelDebugOutText( 0, line );
+        }
+    }
+    return processed != 0;
+#endif
+    return FALSE;
+}
+
+static void nulldrv_ReleaseDC( HWND hwnd, HDC hdc )
+{
+}
+
+static BOOL nulldrv_ScrollDC( HDC hdc, INT dx, INT dy, HRGN update )
+{
+    RECT rect;
+
+    NtGdiGetAppClipBox( hdc, &rect );
+    return NtGdiBitBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                        hdc, rect.left - dx, rect.top - dy, SRCCOPY, 0, 0 );
+}
+
+static void nulldrv_SetCapture( HWND hwnd, UINT flags )
+{
+}
+
+static void nulldrv_SetDesktopWindow( HWND hwnd )
+{
+}
+
+static void nulldrv_ActivateWindow( HWND hwnd, HWND previous )
+{
+}
+
+static void nulldrv_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
+{
+}
+
+static void nulldrv_SetParent( HWND hwnd, HWND parent, HWND old_parent )
+{
+}
+
+static void nulldrv_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
+{
+}
+
+static void nulldrv_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small )
+{
+}
+
+static void nulldrv_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
+{
+}
+
+static void nulldrv_SetWindowText( HWND hwnd, LPCWSTR text )
+{
+}
+
+static UINT nulldrv_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp )
+{
+    return ~0; /* use default implementation */
+}
+
+static LRESULT nulldrv_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos )
+{
+    return -1;
+}
+
+static void nulldrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
+{
+}
+
+static LRESULT nulldrv_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    return 0;
+}
+
+static BOOL nulldrv_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
+{
+    return TRUE;
+}
+
+static BOOL nulldrv_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground )
+{
+    return FALSE;
+}
+
+static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
+{
+    return FALSE;
+}
+
+static struct window_surface *nulldrv_GetForeignWindowSurface( HWND hwnd )
+{
+    return NULL;
+}
+
+static void nulldrv_MoveWindowBits( HWND hwnd, const struct window_rects *old_rects,
+                                    const struct window_rects *new_rects, const RECT *valid_rects )
+{
+}
+
+static void nulldrv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                      const struct window_rects *new_rects, struct window_surface *surface )
+{
+}
+
+static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
+{
+    return FALSE;
+}
+
+static LRESULT nulldrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer )
+{
+    return 0;
+}
+
+static UINT nulldrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+static UINT nulldrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+static void nulldrv_ThreadDetach( void )
+{
+}
+
+static const WCHAR guid_key_prefixW[] =
+{
+    '\\','R','e','g','i','s','t','r','y',
+    '\\','M','a','c','h','i','n','e',
+    '\\','S','y','s','t','e','m',
+    '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+    '\\','C','o','n','t','r','o','l',
+    '\\','V','i','d','e','o','\\','{'
+};
+static const WCHAR guid_key_suffixW[] = {'}','\\','0','0','0','0'};
+
+static BOOL load_desktop_driver( HWND hwnd )
+{
+    static const WCHAR guid_nullW[] = {'0','0','0','0','0','0','0','0','-','0','0','0','0','-','0','0','0','0','-',
+                                       '0','0','0','0','-','0','0','0','0','0','0','0','0','0','0','0','0',0};
+    WCHAR key[ARRAYSIZE(guid_key_prefixW) + 40 + ARRAYSIZE(guid_key_suffixW)], *ptr;
+    char buf[4096];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buf;
+    ATOM_BASIC_INFORMATION *abi = (ATOM_BASIC_INFORMATION *)buf;
+    BOOL ret = FALSE;
+    HKEY hkey;
+    DWORD size;
+    UINT guid_atom;
+
+    static const WCHAR prop_nameW[] =
+        {'_','_','w','i','n','e','_','d','i','s','p','l','a','y','_','d','e','v','i','c','e',
+         '_','g','u','i','d',0};
+
+    user_check_not_lock();
+#ifdef __PROSPERO__
+#ifdef WINE_PS5_TITLE_B1
+    if (__wine_ps5_is_title())
+    {
+        const char *headless = getenv( "WINEPS5_TITLE_HEADLESS" );
+        if (headless && !strcmp( headless, "1" ))
+        {
+            /* Headless CPU profiles keep the prefix's payload display cache.
+             * The GPU parent has a native output, so rebuild that cache once:
+             * this is where its current mode and synthetic HDR EDID are
+             * published. */
+            __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
+            if (__wine_ps5_get_vulkan_proc( "wineGetDisplayModes" ))
+            {
+                if (!update_display_cache( TRUE ))
+                {
+                    ERR( "Failed to publish the title GPU display cache.\n" );
+                    NtTerminateProcess( GetCurrentProcess(), STATUS_UNSUCCESSFUL );
+                    return FALSE;
+                }
+                sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_refreshed=1 native_gpu=1\n" );
+            }
+            else
+                sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_untouched=1\n" );
+            return TRUE;
+        }
+    }
+#endif
+    if (__wine_ps5_is_title())
+    {
+        static const WCHAR driverW[] = {'w','i','n','e','p','s','5','.','d','r','v',0};
+        void *ret_ptr;
+        ULONG ret_len;
+        NTSTATUS status;
+        char line[192];
+
+        /* Explorer normally publishes a volatile GraphicsDriver key and
+         * desktop GUID property. Neither exists in a single-client title.
+         * Keep the ordinary user32 loader callback and driver ABI check. */
+        if (user_driver != &lazy_load_driver) return TRUE;
+        guid_atom = hwnd ? HandleToULong( NtUserGetProp( hwnd, prop_nameW )) : 0;
+        status = hwnd ? KeUserModeCallback( NtUserLoadDriver, driverW, sizeof(driverW),
+                                           &ret_ptr, &ret_len ) : STATUS_INVALID_HANDLE;
+        ret = wine_ps5_title_driver_loaded( status, user_driver != &lazy_load_driver );
+        /* The prefix was initialized by payload Wine, so its persisted
+         * monitor cache can describe that runtime rather than native RADV. */
+        if (ret && !update_display_cache( TRUE ))
+        {
+            status = STATUS_UNSUCCESSFUL;
+            ret = FALSE;
+        }
+        snprintf( line, sizeof(line), "wine: title graphics wineps5.drv desktop=%p property_guid=%04x status=%08x installed=%u\n",
+                  hwnd, guid_atom, (unsigned int)status, ret );
+        sceKernelDebugOutText( 0, line );
+        if (!ret)
+        {
+            ERR( "title wineps5.drv load failed: callback %08x installed %u desktop %p\n",
+                 (unsigned int)status, ret, hwnd );
+            NtTerminateProcess( GetCurrentProcess(), status ? status : STATUS_DLL_INIT_FAILED );
+        }
+        return ret;
+    }
+#endif
+
+
+    asciiz_to_unicode( driver_load_error, "The explorer process failed to start." );  /* default error */
+    /* wait for graphics driver to be ready */
+    send_message( hwnd, WM_NULL, 0, 0 );
+
+    guid_atom = HandleToULong( NtUserGetProp( hwnd, prop_nameW ));
+    memcpy( key, guid_key_prefixW, sizeof(guid_key_prefixW) );
+    ptr = key + ARRAYSIZE(guid_key_prefixW);
+    if (NtQueryInformationAtom( guid_atom, AtomBasicInformation, buf, sizeof(buf), NULL ))
+    {
+        wcscpy( ptr, guid_nullW );
+        ptr += ARRAY_SIZE(guid_nullW) - 1;
+    }
+    else
+    {
+        memcpy( ptr, abi->Name, abi->NameLength );
+        ptr += abi->NameLength / sizeof(WCHAR);
+    }
+    memcpy( ptr, guid_key_suffixW, sizeof(guid_key_suffixW) );
+    ptr += ARRAY_SIZE(guid_key_suffixW);
+
+    if (!(hkey = reg_open_key( NULL, key, (ptr - key) * sizeof(WCHAR) ))) return FALSE;
+
+    if ((size = query_reg_ascii_value( hkey, "GraphicsDriver", info, sizeof(buf) )))
+    {
+        static const WCHAR nullW[] = {'n','u','l','l',0};
+        TRACE( "trying driver %s\n", debugstr_wn( (const WCHAR *)info->Data,
+                                                  info->DataLength / sizeof(WCHAR) ));
+        if (info->DataLength != sizeof(nullW) || memcmp( info->Data, nullW, sizeof(nullW) ))
+        {
+            void *ret_ptr;
+            ULONG ret_len;
+            ret = !KeUserModeCallback( NtUserLoadDriver, info->Data, info->DataLength, &ret_ptr, &ret_len );
+        }
+        else
+        {
+            __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
+            ret = TRUE;
+        }
+    }
+    else if ((size = query_reg_ascii_value( hkey, "DriverError", info, sizeof(buf) )))
+    {
+        memcpy( driver_load_error, info->Data, min( info->DataLength, sizeof(driver_load_error) ));
+        driver_load_error[ARRAYSIZE(driver_load_error) - 1] = 0;
+    }
+
+    NtClose( hkey );
+    return ret;
+}
+
+/**********************************************************************
+ * Lazy loading user driver
+ *
+ * Initial driver used before another driver is loaded.
+ * Each entry point simply loads the real driver and chains to it.
+ */
+
+static void load_display_driver(void)
+{
+    USEROBJECTFLAGS flags;
+    HWINSTA winstation;
+
+    if (is_service_process() || !load_desktop_driver( get_desktop_window() ) || user_driver == &lazy_load_driver)
+    {
+        winstation = NtUserGetProcessWindowStation();
+        if (!NtUserGetObjectInformation( winstation, UOI_FLAGS, &flags, sizeof(flags), NULL )
+            || (flags.dwFlags & WSF_VISIBLE))
+            null_user_driver.pCreateWindow = nodrv_CreateWindow;
+
+        __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
+    }
+}
+
+static const struct user_driver_funcs *load_driver(void)
+{
+    load_display_driver();
+    update_display_cache( FALSE );
+    return user_driver;
+}
+
+void init_display_driver(void)
+{
+    if (user_driver == &lazy_load_driver) load_display_driver();
+}
+
+/**********************************************************************
+ *           get_display_driver
+ */
+const struct gdi_dc_funcs *get_display_driver(void)
+{
+    if (user_driver == &lazy_load_driver) load_driver();
+    return &user_driver->dc_funcs;
+}
+
+static BOOL loaderdrv_ActivateKeyboardLayout( HKL layout, UINT flags )
+{
+    return load_driver()->pActivateKeyboardLayout( layout, flags );
+}
+
+static void loaderdrv_Beep(void)
+{
+    load_driver()->pBeep();
+}
+
+static INT loaderdrv_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size )
+{
+    return load_driver()->pGetKeyNameText( lparam, buffer, size );
+}
+
+static UINT loaderdrv_GetKeyboardLayoutList( INT size, HKL *layouts )
+{
+    return load_driver()->pGetKeyboardLayoutList( size, layouts );
+}
+
+static UINT loaderdrv_MapVirtualKeyEx( UINT code, UINT type, HKL layout )
+{
+    return load_driver()->pMapVirtualKeyEx( code, type, layout );
+}
+
+static INT loaderdrv_ToUnicodeEx( UINT virt, UINT scan, const BYTE *state, LPWSTR str,
+                                        int size, UINT flags, HKL layout )
+{
+    return load_driver()->pToUnicodeEx( virt, scan, state, str, size, flags, layout );
+}
+
+static BOOL loaderdrv_RegisterHotKey( HWND hwnd, UINT modifiers, UINT vk )
+{
+    return load_driver()->pRegisterHotKey( hwnd, modifiers, vk );
+}
+
+static void loaderdrv_UnregisterHotKey( HWND hwnd, UINT modifiers, UINT vk )
+{
+    load_driver()->pUnregisterHotKey( hwnd, modifiers, vk );
+}
+
+static SHORT loaderdrv_VkKeyScanEx( WCHAR ch, HKL layout )
+{
+    return load_driver()->pVkKeyScanEx( ch, layout );
+}
+
+static const KBDTABLES *loaderdrv_KbdLayerDescriptor( HKL layout )
+{
+    return load_driver()->pKbdLayerDescriptor( layout );
+}
+
+static void loaderdrv_ReleaseKbdTables( const KBDTABLES *tables )
+{
+    return load_driver()->pReleaseKbdTables( tables );
+}
+
+static UINT loaderdrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
+{
+    return load_driver()->pImeProcessKey( himc, wparam, lparam, state );
+}
+
+static void loaderdrv_NotifyIMEStatus( HWND hwnd, UINT status )
+{
+    return load_driver()->pNotifyIMEStatus( hwnd, status );
+}
+
+static BOOL loaderdrv_SetIMECompositionRect( HWND hwnd, RECT rect )
+{
+    return load_driver()->pSetIMECompositionRect( hwnd, rect );
+}
+
+static LONG loaderdrv_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HWND hwnd,
+                                             DWORD flags, LPVOID lparam )
+{
+    return load_driver()->pChangeDisplaySettings( displays, primary_name, hwnd, flags, lparam );
+}
+
+static void loaderdrv_SetCursor( HWND hwnd, HCURSOR cursor )
+{
+    load_driver()->pSetCursor( hwnd, cursor );
+}
+
+static BOOL loaderdrv_GetCursorPos( POINT *pt )
+{
+    return load_driver()->pGetCursorPos( pt );
+}
+
+static BOOL loaderdrv_SetCursorPos( INT x, INT y )
+{
+    return load_driver()->pSetCursorPos( x, y );
+}
+
+static BOOL loaderdrv_ClipCursor( const RECT *clip, BOOL reset )
+{
+    return load_driver()->pClipCursor( clip, reset );
+}
+
+static LRESULT loaderdrv_NotifyIcon( HWND hwnd, UINT msg, NOTIFYICONDATAW *data )
+{
+    return load_driver()->pNotifyIcon( hwnd, msg, data );
+}
+
+static void loaderdrv_CleanupIcons( HWND hwnd )
+{
+    load_driver()->pCleanupIcons( hwnd );
+}
+
+static void loaderdrv_SystrayDockInit( HWND hwnd )
+{
+    load_driver()->pSystrayDockInit( hwnd );
+}
+
+static BOOL loaderdrv_SystrayDockInsert( HWND hwnd, UINT cx, UINT cy, void *icon )
+{
+    return load_driver()->pSystrayDockInsert( hwnd, cx, cy, icon );
+}
+
+static void loaderdrv_SystrayDockClear( HWND hwnd )
+{
+    load_driver()->pSystrayDockClear( hwnd );
+}
+
+static BOOL loaderdrv_SystrayDockRemove( HWND hwnd )
+{
+    return load_driver()->pSystrayDockRemove( hwnd );
+}
+
+static LRESULT nulldrv_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    return 0;
+}
+
+static void loaderdrv_UpdateClipboard(void)
+{
+    load_driver()->pUpdateClipboard();
+}
+
+static UINT loaderdrv_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+{
+    return load_driver()->pUpdateDisplayDevices( manager, param );
+}
+
+static BOOL loaderdrv_CreateDesktop( const WCHAR *name, UINT width, UINT height )
+{
+    return load_driver()->pCreateDesktop( name, width, height );
+}
+
+static BOOL loaderdrv_CreateWindow( HWND hwnd )
+{
+    return load_driver()->pCreateWindow( hwnd );
+}
+
+static void loaderdrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rect,
+                             const RECT *top_rect, DWORD flags )
+{
+    load_driver()->pGetDC( hdc, hwnd, top_win, win_rect, top_rect, flags );
+}
+
+static void loaderdrv_FlashWindowEx( FLASHWINFO *info )
+{
+    load_driver()->pFlashWindowEx( info );
+}
+
+static BOOL loaderdrv_HasWindowManager( const char *name )
+{
+    return load_driver()->pHasWindowManager( name );
+}
+
+static void loaderdrv_SetDesktopWindow( HWND hwnd )
+{
+    load_driver()->pSetDesktopWindow( hwnd );
+}
+
+static void loaderdrv_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
+{
+    load_driver()->pSetLayeredWindowAttributes( hwnd, key, alpha, flags );
+}
+
+static void loaderdrv_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
+{
+    load_driver()->pSetWindowRgn( hwnd, hrgn, redraw );
+}
+
+static void loaderdrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
+{
+    load_driver()->pUpdateLayeredWindow( hwnd, alpha, flags );
+}
+
+static LRESULT loaderdrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer )
+{
+    return load_driver()->pWintabProc( hwnd, msg, wparam, lparam, buffer );
+}
+
+static UINT loaderdrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
+{
+    return load_driver()->pVulkanInit( version, vulkan_handle, driver_funcs );
+}
+
+static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
+{
+    return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
+}
+
+static const struct user_driver_funcs lazy_load_driver =
+{
+    { NULL },
+    /* keyboard functions */
+    loaderdrv_ActivateKeyboardLayout,
+    loaderdrv_Beep,
+    loaderdrv_GetKeyNameText,
+    loaderdrv_GetKeyboardLayoutList,
+    loaderdrv_MapVirtualKeyEx,
+    loaderdrv_RegisterHotKey,
+    loaderdrv_ToUnicodeEx,
+    loaderdrv_UnregisterHotKey,
+    loaderdrv_VkKeyScanEx,
+    loaderdrv_KbdLayerDescriptor,
+    loaderdrv_ReleaseKbdTables,
+    loaderdrv_ImeProcessKey,
+    loaderdrv_NotifyIMEStatus,
+    loaderdrv_SetIMECompositionRect,
+    nulldrv_SetTextInputFocus,
+    /* cursor/icon functions */
+    nulldrv_DestroyCursorIcon,
+    loaderdrv_SetCursor,
+    loaderdrv_GetCursorPos,
+    loaderdrv_SetCursorPos,
+    loaderdrv_ClipCursor,
+    /* systray functions */
+    loaderdrv_NotifyIcon,
+    loaderdrv_CleanupIcons,
+    loaderdrv_SystrayDockInit,
+    loaderdrv_SystrayDockInsert,
+    loaderdrv_SystrayDockClear,
+    loaderdrv_SystrayDockRemove,
+    /* clipboard functions */
+    nulldrv_ClipboardWindowProc,
+    loaderdrv_UpdateClipboard,
+    /* display modes */
+    loaderdrv_ChangeDisplaySettings,
+    loaderdrv_UpdateDisplayDevices,
+    /* windowing functions */
+    loaderdrv_CreateDesktop,
+    loaderdrv_CreateWindow,
+    nulldrv_DesktopWindowProc,
+    nulldrv_DestroyWindow,
+    loaderdrv_FlashWindowEx,
+    loaderdrv_HasWindowManager,
+    loaderdrv_GetDC,
+    nulldrv_ProcessEvents,
+    nulldrv_ReleaseDC,
+    nulldrv_ScrollDC,
+    nulldrv_SetCapture,
+    loaderdrv_SetDesktopWindow,
+    nulldrv_ActivateWindow,
+    loaderdrv_SetLayeredWindowAttributes,
+    nulldrv_SetParent,
+    loaderdrv_SetWindowRgn,
+    nulldrv_SetWindowIcons,
+    nulldrv_SetWindowStyle,
+    nulldrv_SetWindowText,
+    nulldrv_ShowWindow,
+    nulldrv_SysCommand,
+    loaderdrv_UpdateLayeredWindow,
+    nulldrv_WindowMessage,
+    nulldrv_WindowPosChanging,
+    nulldrv_GetWindowStyleMasks,
+    nulldrv_GetWindowStateUpdates,
+    nulldrv_CreateWindowSurface,
+    nulldrv_GetForeignWindowSurface,
+    nulldrv_MoveWindowBits,
+    nulldrv_WindowPosChanged,
+    /* system parameters */
+    nulldrv_SystemParametersInfo,
+    /* wintab support */
+    loaderdrv_WintabProc,
+    /* vulkan support */
+    loaderdrv_VulkanInit,
+    /* opengl support */
+    loaderdrv_OpenGLInit,
+    /* thread management */
+    nulldrv_ThreadDetach,
+};
+
+const struct user_driver_funcs *user_driver = &lazy_load_driver;
+
+/******************************************************************************
+ *	     __wine_set_user_driver   (win32u.so)
+ */
+void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version )
+{
+    struct user_driver_funcs *driver, *prev;
+
+    if (version != WINE_GDI_DRIVER_VERSION)
+    {
+        ERR( "version mismatch, driver wants %u but win32u has %u\n",
+             version, WINE_GDI_DRIVER_VERSION );
+        return;
+    }
+
+    if (!funcs)
+    {
+        prev = InterlockedExchangePointer( (void **)&user_driver, (void *)&lazy_load_driver );
+        if (prev != &lazy_load_driver)
+            free( prev );
+        return;
+    }
+
+    driver = malloc( sizeof(*driver) );
+    *driver = *funcs;
+
+#define SET_USER_FUNC(name) \
+    do { if (!driver->p##name) driver->p##name = nulldrv_##name; } while(0)
+
+    SET_USER_FUNC(ActivateKeyboardLayout);
+    SET_USER_FUNC(Beep);
+    SET_USER_FUNC(GetKeyNameText);
+    SET_USER_FUNC(GetKeyboardLayoutList);
+    SET_USER_FUNC(MapVirtualKeyEx);
+    SET_USER_FUNC(RegisterHotKey);
+    SET_USER_FUNC(ToUnicodeEx);
+    SET_USER_FUNC(UnregisterHotKey);
+    SET_USER_FUNC(VkKeyScanEx);
+    SET_USER_FUNC(KbdLayerDescriptor);
+    SET_USER_FUNC(ReleaseKbdTables);
+    SET_USER_FUNC(ImeProcessKey);
+    SET_USER_FUNC(NotifyIMEStatus);
+    SET_USER_FUNC(SetIMECompositionRect);
+    SET_USER_FUNC(SetTextInputFocus);
+    SET_USER_FUNC(DestroyCursorIcon);
+    SET_USER_FUNC(SetCursor);
+    SET_USER_FUNC(GetCursorPos);
+    SET_USER_FUNC(SetCursorPos);
+    SET_USER_FUNC(ClipCursor);
+    SET_USER_FUNC(NotifyIcon);
+    SET_USER_FUNC(CleanupIcons);
+    SET_USER_FUNC(SystrayDockInit);
+    SET_USER_FUNC(SystrayDockInsert);
+    SET_USER_FUNC(SystrayDockClear);
+    SET_USER_FUNC(SystrayDockRemove);
+    SET_USER_FUNC(ClipboardWindowProc);
+    SET_USER_FUNC(UpdateClipboard);
+    SET_USER_FUNC(ChangeDisplaySettings);
+    SET_USER_FUNC(UpdateDisplayDevices);
+    SET_USER_FUNC(CreateDesktop);
+    SET_USER_FUNC(CreateWindow);
+    SET_USER_FUNC(DesktopWindowProc);
+    SET_USER_FUNC(DestroyWindow);
+    SET_USER_FUNC(FlashWindowEx);
+    SET_USER_FUNC(HasWindowManager);
+    SET_USER_FUNC(GetDC);
+    SET_USER_FUNC(ProcessEvents);
+    SET_USER_FUNC(ReleaseDC);
+    SET_USER_FUNC(ScrollDC);
+    SET_USER_FUNC(SetCapture);
+    SET_USER_FUNC(SetDesktopWindow);
+    SET_USER_FUNC(ActivateWindow);
+    SET_USER_FUNC(SetLayeredWindowAttributes);
+    SET_USER_FUNC(SetParent);
+    SET_USER_FUNC(SetWindowRgn);
+    SET_USER_FUNC(SetWindowIcons);
+    SET_USER_FUNC(SetWindowStyle);
+    SET_USER_FUNC(SetWindowText);
+    SET_USER_FUNC(ShowWindow);
+    SET_USER_FUNC(SysCommand);
+    SET_USER_FUNC(UpdateLayeredWindow);
+    SET_USER_FUNC(WindowMessage);
+    SET_USER_FUNC(WindowPosChanging);
+    SET_USER_FUNC(GetWindowStyleMasks);
+    SET_USER_FUNC(GetWindowStateUpdates);
+    SET_USER_FUNC(CreateWindowSurface);
+    SET_USER_FUNC(GetForeignWindowSurface);
+    SET_USER_FUNC(MoveWindowBits);
+    SET_USER_FUNC(WindowPosChanged);
+    SET_USER_FUNC(SystemParametersInfo);
+    SET_USER_FUNC(WintabProc);
+    SET_USER_FUNC(VulkanInit);
+    SET_USER_FUNC(OpenGLInit);
+    SET_USER_FUNC(ThreadDetach);
+#undef SET_USER_FUNC
+
+    prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );
+    if (prev != &lazy_load_driver)
+    {
+        /* another thread beat us to it */
+        free( driver );
+        driver = prev;
+    }
+}
+
+/******************************************************************************
+ *		NtGdiExtEscape   (win32u.@)
+ *
+ * Access capabilities of a particular device that are not available through GDI.
+ */
+INT WINAPI NtGdiExtEscape( HDC hdc, WCHAR *driver, int driver_id, INT escape, INT input_size,
+                           const char *input, INT output_size, char *output )
+{
+    PHYSDEV physdev;
+    INT ret;
+    DC * dc = get_dc_ptr( hdc );
+
+    if (!dc) return 0;
+    update_dc( dc );
+    physdev = GET_DC_PHYSDEV( dc, pExtEscape );
+    ret = physdev->funcs->pExtEscape( physdev, escape, input_size, input, output_size, output );
+    release_dc_ptr( dc );
+    return ret;
+}
+
+static void nulldrv_surface_destroy( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_detach( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_update( struct client_surface *client )
+{
+}
+
+static void nulldrv_surface_present( struct client_surface *client, HDC hdc )
+{
+}
+
+static const struct client_surface_funcs nulldrv_surface_funcs =
+{
+    .destroy = nulldrv_surface_destroy,
+    .detach = nulldrv_surface_detach,
+    .update = nulldrv_surface_update,
+    .present = nulldrv_surface_present,
+};
+
+struct client_surface *nulldrv_client_surface_create( HWND hwnd )
+{
+    return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_funcs, hwnd );
+}

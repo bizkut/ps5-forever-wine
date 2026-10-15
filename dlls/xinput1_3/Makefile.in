@@ -1,0 +1,10 @@
+EXTRADEFS = -DXINPUT_VER=3
+MODULE    = xinput1_3.dll
+UNIXLIB   = xinput1_3.so
+IMPORTLIB = xinput
+IMPORTS   = hid setupapi advapi32 user32 ntdll
+
+SOURCES = \
+	main.c \
+	unixlib.c \
+	version.rc

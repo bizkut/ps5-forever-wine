@@ -1,0 +1,9 @@
+MODULE = wineps5.drv
+UNIXLIB = wineps5.so
+UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
+IMPORTS = ntdll
+
+SOURCES = \
+	dllmain.c \
+	init.c \
+	window.c

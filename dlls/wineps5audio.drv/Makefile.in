@@ -1,0 +1,7 @@
+MODULE = wineps5audio.drv
+UNIXLIB = wineps5audio.so
+UNIX_LIBS = $(PTHREAD_LIBS)
+
+SOURCES = \
+	mixer.c \
+	ps5audio.c

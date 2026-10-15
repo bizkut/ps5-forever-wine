@@ -1,0 +1,4777 @@
+/*
+ * x86-64 signal handling routines
+ *
+ * Copyright 1999, 2005 Alexandre Julliard
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#ifdef __x86_64__
+
+#include "config.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#ifdef __PROSPERO__
+# include <ps5platform/klog.h>
+#endif
+#ifdef HAVE_MACHINE_SYSARCH_H
+# include <machine/sysarch.h>
+#endif
+#ifdef HAVE_SYS_AUXV_H
+# include <sys/auxv.h>
+#endif
+#ifdef HAVE_SYS_PARAM_H
+# include <sys/param.h>
+#endif
+#ifdef HAVE_SYSCALL_H
+# include <syscall.h>
+#else
+# ifdef HAVE_SYS_SYSCALL_H
+#  include <sys/syscall.h>
+# endif
+#endif
+#ifdef HAVE_SYS_SIGNAL_H
+# include <sys/signal.h>
+#endif
+#ifdef HAVE_SYS_UCONTEXT_H
+# include <sys/ucontext.h>
+#endif
+#ifdef HAVE_LIBUNWIND
+# define UNW_LOCAL_ONLY
+# include <libunwind.h>
+#endif
+#ifdef __APPLE__
+# include <mach/mach.h>
+/* _thread_set_tsd_base is private API for setting GSBASE, added in macOS 10.12.
+ * It's a small thunk that sets %eax, zeroes %esi, and does the syscall (which clobbers
+ * %rcx and %r11).
+ * See https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/custom/custom.s
+ * or libsystem_kernel.dylib.
+ * Note that the dispatchers do the syscall directly to avoid using the stack.
+ */
+extern void _thread_set_tsd_base(uint64_t);
+#endif
+
+#if defined(HAVE_LINUX_FILTER_H) && defined(HAVE_LINUX_SECCOMP_H) && defined(HAVE_SYS_PRCTL_H)
+#define HAVE_SECCOMP 1
+# include <linux/filter.h>
+# include <linux/seccomp.h>
+# include <sys/prctl.h>
+# include <linux/audit.h>
+#endif
+
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
+#include "windef.h"
+#include "winternl.h"
+#include "ddk/wdm.h"
+#include "wine/list.h"
+#include "wine/asm.h"
+#include "unix_private.h"
+#include "wine/debug.h"
+#include "wine/ps5_wow.h"
+
+WINE_DEFAULT_DEBUG_CHANNEL(unwind);
+WINE_DECLARE_DEBUG_CHANNEL(seh);
+
+#include "dwarf.h"
+
+static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
+static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
+static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
+static USHORT fs32_sel;  /* selector for %fs in 32-bit mode */
+
+/***********************************************************************
+ * signal context platform-specific definitions
+ */
+#ifdef linux
+
+#include <asm/prctl.h>
+static inline int arch_prctl( int func, void *ptr ) { return syscall( __NR_arch_prctl, func, ptr ); }
+
+extern int alloc_fs_sel( int sel, void *base );
+__ASM_GLOBAL_FUNC( alloc_fs_sel,
+                   /* switch to 32-bit stack */
+                   "pushq %rbx\n\t"
+                   "pushq %r12\n\t"
+                   "movq %rsp,%r12\n\t"
+                   "movl 0x4(%rsi),%esp\n\t"  /* Tib.StackBase */
+                   "subl $0x20,%esp\n\t"
+                   /* setup modify_ldt struct on 32-bit stack */
+                   "movl %edi,(%rsp)\n\t"     /* entry_number */
+                   "movl %esi,4(%rsp)\n\t"    /* base */
+                   "movl $~0,8(%rsp)\n\t"     /* limit */
+                   "movl $0x41,12(%rsp)\n\t"  /* seg_32bit | usable */
+                   /* invoke 32-bit syscall */
+                   "movl %esp,%ebx\n\t"
+                   "movl $0xf3,%eax\n\t"      /* SYS_set_thread_area */
+                   "int $0x80\n\t"
+                   /* restore stack */
+                   "movl (%rsp),%eax\n\t"     /* entry_number */
+                   "leal 0x3(,%eax,8),%eax\n\t"  /* make GDT selector */
+                   "movq %r12,%rsp\n\t"
+                   "popq %r12\n\t"
+                   "popq %rbx\n\t"
+                   "ret" );
+
+struct modify_ldt_s
+{
+    unsigned int  entry_number;
+    unsigned int  base_addr;
+    unsigned int  limit;
+    unsigned int  seg_32bit : 1;
+    unsigned int  contents : 2;
+    unsigned int  read_exec_only : 1;
+    unsigned int  limit_in_pages : 1;
+    unsigned int  seg_not_present : 1;
+    unsigned int  usable : 1;
+    unsigned int  garbage : 25;
+};
+
+extern int modify_ldt( struct modify_ldt_s *ldt );
+__ASM_GLOBAL_FUNC( modify_ldt,
+                   /* switch to 32-bit stack */
+                   "pushq %rbx\n\t"
+                   "pushq %r12\n\t"
+                   "movq %rsp,%r12\n\t"
+                   "movq %gs:0x30,%rax\n\t"
+                   "leal 0x2000(%eax),%esp\n\t"  /* teb32 */
+                   /* copy modify_ldt struct to 32-bit stack */
+                   "pushq 8(%rdi)\n\t"
+                   "pushq 0(%rdi)\n\t"
+                   /* invoke 32-bit syscall */
+                   "movl $0x7b,%eax\n\t"  /* SYS_modify_ldt */
+                   "movl $0x11,%ebx\n\t"  /* func */
+                   "movl %esp,%ecx\n\t"   /* ldt_ptr */
+                   "movl $0x10,%edx\n\t"  /* sizeof(*ldt_ptr) */
+                   "int $0x80\n\t"
+                   /* restore stack */
+                   "movq %r12,%rsp\n\t"
+                   "popq %r12\n\t"
+                   "popq %rbx\n\t"
+                   "ret" );
+
+#ifndef FP_XSTATE_MAGIC1
+#define FP_XSTATE_MAGIC1 0x46505853
+#endif
+
+#define RAX_sig(context)     ((context)->uc_mcontext.gregs[REG_RAX])
+#define RBX_sig(context)     ((context)->uc_mcontext.gregs[REG_RBX])
+#define RCX_sig(context)     ((context)->uc_mcontext.gregs[REG_RCX])
+#define RDX_sig(context)     ((context)->uc_mcontext.gregs[REG_RDX])
+#define RSI_sig(context)     ((context)->uc_mcontext.gregs[REG_RSI])
+#define RDI_sig(context)     ((context)->uc_mcontext.gregs[REG_RDI])
+#define RBP_sig(context)     ((context)->uc_mcontext.gregs[REG_RBP])
+#define R8_sig(context)      ((context)->uc_mcontext.gregs[REG_R8])
+#define R9_sig(context)      ((context)->uc_mcontext.gregs[REG_R9])
+#define R10_sig(context)     ((context)->uc_mcontext.gregs[REG_R10])
+#define R11_sig(context)     ((context)->uc_mcontext.gregs[REG_R11])
+#define R12_sig(context)     ((context)->uc_mcontext.gregs[REG_R12])
+#define R13_sig(context)     ((context)->uc_mcontext.gregs[REG_R13])
+#define R14_sig(context)     ((context)->uc_mcontext.gregs[REG_R14])
+#define R15_sig(context)     ((context)->uc_mcontext.gregs[REG_R15])
+#define CS_sig(context)      (*((WORD *)&(context)->uc_mcontext.gregs[REG_CSGSFS] + 0))
+#define GS_sig(context)      (*((WORD *)&(context)->uc_mcontext.gregs[REG_CSGSFS] + 1))
+#define FS_sig(context)      (*((WORD *)&(context)->uc_mcontext.gregs[REG_CSGSFS] + 2))
+#define SS_sig(context)      (*((WORD *)&(context)->uc_mcontext.gregs[REG_CSGSFS] + 3))
+#define RSP_sig(context)     ((context)->uc_mcontext.gregs[REG_RSP])
+#define RIP_sig(context)     ((context)->uc_mcontext.gregs[REG_RIP])
+#define EFL_sig(context)     ((context)->uc_mcontext.gregs[REG_EFL])
+#define TRAP_sig(context)    ((context)->uc_mcontext.gregs[REG_TRAPNO])
+#define ERROR_sig(context)   ((context)->uc_mcontext.gregs[REG_ERR])
+#define FPU_sig(context)     ((void *)((context)->uc_mcontext.fpregs))
+#define XState_sig(fpu)      (((unsigned int *)((XMM_SAVE_AREA32 *)fpu)->Reserved4)[12] == FP_XSTATE_MAGIC1 ? (XSAVE_AREA_HEADER *)(((XMM_SAVE_AREA32 *)fpu) + 1) : NULL)
+
+#elif defined(__FreeBSD__) || defined (__FreeBSD_kernel__)
+
+#include <machine/trap.h>
+
+#define RAX_sig(context)     ((context)->uc_mcontext.mc_rax)
+#define RBX_sig(context)     ((context)->uc_mcontext.mc_rbx)
+#define RCX_sig(context)     ((context)->uc_mcontext.mc_rcx)
+#define RDX_sig(context)     ((context)->uc_mcontext.mc_rdx)
+#define RSI_sig(context)     ((context)->uc_mcontext.mc_rsi)
+#define RDI_sig(context)     ((context)->uc_mcontext.mc_rdi)
+#define RBP_sig(context)     ((context)->uc_mcontext.mc_rbp)
+#define R8_sig(context)      ((context)->uc_mcontext.mc_r8)
+#define R9_sig(context)      ((context)->uc_mcontext.mc_r9)
+#define R10_sig(context)     ((context)->uc_mcontext.mc_r10)
+#define R11_sig(context)     ((context)->uc_mcontext.mc_r11)
+#define R12_sig(context)     ((context)->uc_mcontext.mc_r12)
+#define R13_sig(context)     ((context)->uc_mcontext.mc_r13)
+#define R14_sig(context)     ((context)->uc_mcontext.mc_r14)
+#define R15_sig(context)     ((context)->uc_mcontext.mc_r15)
+#define CS_sig(context)      ((context)->uc_mcontext.mc_cs)
+#define DS_sig(context)      ((context)->uc_mcontext.mc_ds)
+#define ES_sig(context)      ((context)->uc_mcontext.mc_es)
+#define FS_sig(context)      ((context)->uc_mcontext.mc_fs)
+#define GS_sig(context)      ((context)->uc_mcontext.mc_gs)
+#define SS_sig(context)      ((context)->uc_mcontext.mc_ss)
+#define EFL_sig(context)     ((context)->uc_mcontext.mc_rflags)
+#define RIP_sig(context)     ((context)->uc_mcontext.mc_rip)
+#define RSP_sig(context)     ((context)->uc_mcontext.mc_rsp)
+#define TRAP_sig(context)    ((context)->uc_mcontext.mc_trapno)
+#define ERROR_sig(context)   ((context)->uc_mcontext.mc_err)
+#ifdef __PROSPERO__
+/* The console's mcontext has 32 extra bytes before its FXSAVE area compared
+ * with the SDK's FreeBSD layout (ps5/probes/fpcontext): MXCSR and XMM7 were
+ * measured at 0x118 and 0x210. All earlier register fields match the SDK.
+ * The XSAVE header follows the FXSAVE area at 0x300 in standard (not
+ * compacted) layout when mc_flags has _MC_HASFPXSTATE, with the YMM upper
+ * halves at 0x340 (ps5/probes/avxframe, mc_len 0x480, XSTATE_BV 7). */
+#define FPU_sig(context)     ((void *)((char *)&(context)->uc_mcontext + 0x100))
+#define XState_sig(fpu)      ((((const mcontext_t *)((const char *)(fpu) - 0x100))->mc_flags & _MC_HASFPXSTATE) \
+                              ? (XSAVE_AREA_HEADER *)((XMM_SAVE_AREA32 *)(fpu) + 1) : NULL)
+#else
+#define FPU_sig(context)     ((void *)((context)->uc_mcontext.mc_fpstate))
+#define XState_sig(context)  NULL
+#endif
+
+#elif defined(__NetBSD__)
+
+#define RAX_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RAX])
+#define RBX_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RBX])
+#define RCX_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RCX])
+#define RDX_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RDX])
+#define RSI_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RSI])
+#define RDI_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RDI])
+#define RBP_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RBP])
+#define R8_sig(context)     ((context)->uc_mcontext.__gregs[_REG_R8])
+#define R9_sig(context)     ((context)->uc_mcontext.__gregs[_REG_R9])
+#define R10_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R10])
+#define R11_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R11])
+#define R12_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R12])
+#define R13_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R13])
+#define R14_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R14])
+#define R15_sig(context)    ((context)->uc_mcontext.__gregs[_REG_R15])
+#define CS_sig(context)     ((context)->uc_mcontext.__gregs[_REG_CS])
+#define DS_sig(context)     ((context)->uc_mcontext.__gregs[_REG_DS])
+#define ES_sig(context)     ((context)->uc_mcontext.__gregs[_REG_ES])
+#define FS_sig(context)     ((context)->uc_mcontext.__gregs[_REG_FS])
+#define GS_sig(context)     ((context)->uc_mcontext.__gregs[_REG_GS])
+#define SS_sig(context)     ((context)->uc_mcontext.__gregs[_REG_SS])
+#define EFL_sig(context)    ((context)->uc_mcontext.__gregs[_REG_RFL])
+#define RIP_sig(context)    (*((unsigned long*)&(context)->uc_mcontext.__gregs[_REG_RIP]))
+#define RSP_sig(context)    (*((unsigned long*)&(context)->uc_mcontext.__gregs[_REG_URSP]))
+#define TRAP_sig(context)   ((context)->uc_mcontext.__gregs[_REG_TRAPNO])
+#define ERROR_sig(context)  ((context)->uc_mcontext.__gregs[_REG_ERR])
+#define FPU_sig(context)    ((void *)((context)->uc_mcontext.__fpregs))
+#define XState_sig(context) NULL
+
+#elif defined (__APPLE__)
+
+#include <i386/user_ldt.h>
+
+/* The 'full' structs were added in the macOS 10.14.6 SDK/Xcode 10.3. */
+#ifndef _STRUCT_X86_THREAD_FULL_STATE64
+#define _STRUCT_X86_THREAD_FULL_STATE64 struct __darwin_x86_thread_full_state64
+_STRUCT_X86_THREAD_FULL_STATE64
+{
+        _STRUCT_X86_THREAD_STATE64      __ss64;
+        __uint64_t                      __ds;
+        __uint64_t                      __es;
+        __uint64_t                      __ss;
+        __uint64_t                      __gsbase;
+};
+#endif
+
+#ifndef _STRUCT_MCONTEXT64_FULL
+#define _STRUCT_MCONTEXT64_FULL      struct __darwin_mcontext64_full
+_STRUCT_MCONTEXT64_FULL
+{
+        _STRUCT_X86_EXCEPTION_STATE64   __es;
+        _STRUCT_X86_THREAD_FULL_STATE64 __ss;
+        _STRUCT_X86_FLOAT_STATE64       __fs;
+};
+#endif
+
+#ifndef _STRUCT_MCONTEXT_AVX64_FULL
+#define _STRUCT_MCONTEXT_AVX64_FULL  struct __darwin_mcontext_avx64_full
+_STRUCT_MCONTEXT_AVX64_FULL
+{
+        _STRUCT_X86_EXCEPTION_STATE64   __es;
+        _STRUCT_X86_THREAD_FULL_STATE64 __ss;
+        _STRUCT_X86_AVX_STATE64         __fs;
+};
+#endif
+
+/* AVX512 structs were added in the macOS 10.13 SDK/Xcode 9. */
+#ifdef _STRUCT_MCONTEXT_AVX512_64_FULL
+#define SIZEOF_STRUCT_MCONTEXT_AVX512_64_FULL sizeof(_STRUCT_MCONTEXT_AVX512_64_FULL)
+#else
+#define SIZEOF_STRUCT_MCONTEXT_AVX512_64_FULL 2664
+#endif
+
+#define RAX_sig(context)     ((context)->uc_mcontext->__ss.__rax)
+#define RBX_sig(context)     ((context)->uc_mcontext->__ss.__rbx)
+#define RCX_sig(context)     ((context)->uc_mcontext->__ss.__rcx)
+#define RDX_sig(context)     ((context)->uc_mcontext->__ss.__rdx)
+#define RSI_sig(context)     ((context)->uc_mcontext->__ss.__rsi)
+#define RDI_sig(context)     ((context)->uc_mcontext->__ss.__rdi)
+#define RBP_sig(context)     ((context)->uc_mcontext->__ss.__rbp)
+#define R8_sig(context)      ((context)->uc_mcontext->__ss.__r8)
+#define R9_sig(context)      ((context)->uc_mcontext->__ss.__r9)
+#define R10_sig(context)     ((context)->uc_mcontext->__ss.__r10)
+#define R11_sig(context)     ((context)->uc_mcontext->__ss.__r11)
+#define R12_sig(context)     ((context)->uc_mcontext->__ss.__r12)
+#define R13_sig(context)     ((context)->uc_mcontext->__ss.__r13)
+#define R14_sig(context)     ((context)->uc_mcontext->__ss.__r14)
+#define R15_sig(context)     ((context)->uc_mcontext->__ss.__r15)
+#define CS_sig(context)      ((context)->uc_mcontext->__ss.__cs)
+#define FS_sig(context)      ((context)->uc_mcontext->__ss.__fs)
+#define GS_sig(context)      ((context)->uc_mcontext->__ss.__gs)
+#define EFL_sig(context)     ((context)->uc_mcontext->__ss.__rflags)
+#define RIP_sig(context)     ((context)->uc_mcontext->__ss.__rip)
+#define RSP_sig(context)     ((context)->uc_mcontext->__ss.__rsp)
+#define TRAP_sig(context)    ((context)->uc_mcontext->__es.__trapno)
+#define ERROR_sig(context)   ((context)->uc_mcontext->__es.__err)
+
+/* Once a custom LDT is installed (i.e. Wow64), mcontext will point to a
+ * larger '_full' struct which includes DS, ES, SS, and GSbase.
+ * This changes the offset of the FPU state.
+ * Checking mcsize is the only way to determine which mcontext is in use.
+ */
+static inline void *FPU_sig( const ucontext_t *context )
+{
+    if (context->uc_mcsize == sizeof(_STRUCT_MCONTEXT64_FULL) ||
+        context->uc_mcsize == sizeof(_STRUCT_MCONTEXT_AVX64_FULL) ||
+        context->uc_mcsize == SIZEOF_STRUCT_MCONTEXT_AVX512_64_FULL)
+    {
+        return &((_STRUCT_MCONTEXT64_FULL *)context->uc_mcontext)->__fs.__fpu_fcw;
+    }
+    return &(context)->uc_mcontext->__fs.__fpu_fcw;
+}
+
+static inline const WORD *SS_sig_ptr( const ucontext_t *context )
+{
+    if (context->uc_mcsize == sizeof(_STRUCT_MCONTEXT64_FULL) ||
+        context->uc_mcsize == sizeof(_STRUCT_MCONTEXT_AVX64_FULL) ||
+        context->uc_mcsize == SIZEOF_STRUCT_MCONTEXT_AVX512_64_FULL)
+    {
+        return (WORD *)&((_STRUCT_MCONTEXT64_FULL *)context->uc_mcontext)->__ss.__ss;
+    }
+    return &ds64_sel;
+}
+#define SS_sig(context) (*SS_sig_ptr(context))
+
+#define XState_sig(context)  NULL
+
+#else
+#error You must define the signal context functions for your platform
+#endif
+
+enum i386_trap_code
+{
+#if defined(__FreeBSD__) || defined (__FreeBSD_kernel__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    TRAP_x86_DIVIDE     = T_DIVIDE,     /* Division by zero exception */
+    TRAP_x86_TRCTRAP    = T_TRCTRAP,    /* Single-step exception */
+    TRAP_x86_NMI        = T_NMI,        /* NMI interrupt */
+    TRAP_x86_BPTFLT     = T_BPTFLT,     /* Breakpoint exception */
+    TRAP_x86_OFLOW      = T_OFLOW,      /* Overflow exception */
+    TRAP_x86_BOUND      = T_BOUND,      /* Bound range exception */
+    TRAP_x86_PRIVINFLT  = T_PRIVINFLT,  /* Invalid opcode exception */
+    TRAP_x86_DNA        = T_DNA,        /* Device not available exception */
+    TRAP_x86_DOUBLEFLT  = T_DOUBLEFLT,  /* Double fault exception */
+    TRAP_x86_FPOPFLT    = T_FPOPFLT,    /* Coprocessor segment overrun */
+    TRAP_x86_TSSFLT     = T_TSSFLT,     /* Invalid TSS exception */
+    TRAP_x86_SEGNPFLT   = T_SEGNPFLT,   /* Segment not present exception */
+    TRAP_x86_STKFLT     = T_STKFLT,     /* Stack fault */
+    TRAP_x86_PROTFLT    = T_PROTFLT,    /* General protection fault */
+    TRAP_x86_PAGEFLT    = T_PAGEFLT,    /* Page fault */
+    TRAP_x86_ARITHTRAP  = T_ARITHTRAP,  /* Floating point exception */
+    TRAP_x86_ALIGNFLT   = T_ALIGNFLT,   /* Alignment check exception */
+    TRAP_x86_MCHK       = T_MCHK,       /* Machine check exception */
+    TRAP_x86_CACHEFLT   = T_XMMFLT      /* Cache flush exception */
+#else
+    TRAP_x86_DIVIDE     = 0,   /* Division by zero exception */
+    TRAP_x86_TRCTRAP    = 1,   /* Single-step exception */
+    TRAP_x86_NMI        = 2,   /* NMI interrupt */
+    TRAP_x86_BPTFLT     = 3,   /* Breakpoint exception */
+    TRAP_x86_OFLOW      = 4,   /* Overflow exception */
+    TRAP_x86_BOUND      = 5,   /* Bound range exception */
+    TRAP_x86_PRIVINFLT  = 6,   /* Invalid opcode exception */
+    TRAP_x86_DNA        = 7,   /* Device not available exception */
+    TRAP_x86_DOUBLEFLT  = 8,   /* Double fault exception */
+    TRAP_x86_FPOPFLT    = 9,   /* Coprocessor segment overrun */
+    TRAP_x86_TSSFLT     = 10,  /* Invalid TSS exception */
+    TRAP_x86_SEGNPFLT   = 11,  /* Segment not present exception */
+    TRAP_x86_STKFLT     = 12,  /* Stack fault */
+    TRAP_x86_PROTFLT    = 13,  /* General protection fault */
+    TRAP_x86_PAGEFLT    = 14,  /* Page fault */
+    TRAP_x86_ARITHTRAP  = 16,  /* Floating point exception */
+    TRAP_x86_ALIGNFLT   = 17,  /* Alignment check exception */
+    TRAP_x86_MCHK       = 18,  /* Machine check exception */
+    TRAP_x86_CACHEFLT   = 19   /* Cache flush exception */
+#endif
+};
+
+struct machine_frame
+{
+    ULONG64 rip;
+    ULONG64 cs;
+    ULONG64 eflags;
+    ULONG64 rsp;
+    ULONG64 ss;
+};
+
+/* stack layout when calling KiUserExceptionDispatcher */
+struct exc_stack_layout
+{
+    CONTEXT              context;        /* 000 */
+    CONTEXT_EX           context_ex;     /* 4d0 */
+    EXCEPTION_RECORD     rec;            /* 4f0 */
+    ULONG64              align;          /* 588 */
+    struct machine_frame machine_frame;  /* 590 */
+    ULONG64              align2;         /* 5b8 */
+};
+C_ASSERT( offsetof(struct exc_stack_layout, rec) == 0x4f0 );
+C_ASSERT( offsetof(struct exc_stack_layout, machine_frame) == 0x590 );
+C_ASSERT( sizeof(struct exc_stack_layout) == 0x5c0 );
+
+/* stack layout when calling KiUserApcDispatcher */
+struct apc_stack_layout
+{
+    CONTEXT              context;        /* 000 */
+    CONTEXT_EX           context_ex;     /* 4d0 */
+    KCONTINUE_ARGUMENT   continue_arg;   /* 4f0 */
+    ULONG64              align1;         /* 508 */
+    APC_CALLBACK_DATA    callback_data;  /* 510 */
+    struct machine_frame machine_frame;  /* 530 */
+    ULONG64              align2;         /* 558 */
+};
+C_ASSERT( offsetof(struct apc_stack_layout, continue_arg) == 0x4f0 );
+C_ASSERT( offsetof(struct apc_stack_layout, machine_frame) == 0x530 );
+C_ASSERT( sizeof(struct apc_stack_layout) == 0x560 );
+
+/* stack layout when calling KiUserCallbackDispatcher */
+struct callback_stack_layout
+{
+    ULONG64              padding[4];     /* 000 parameter space for called function */
+    void                *args;           /* 020 arguments */
+    ULONG                len;            /* 028 arguments len */
+    ULONG                id;             /* 02c function id */
+    struct machine_frame machine_frame;  /* 030 machine frame */
+    BYTE                 args_data[0];   /* 058 copied argument data */
+};
+C_ASSERT( offsetof(struct callback_stack_layout, machine_frame) == 0x30 );
+C_ASSERT( sizeof(struct callback_stack_layout) == 0x58 );
+
+#define RESTORE_FLAGS_INSTRUMENTATION          0x00010000
+#define RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT 0x00020000
+#ifdef WINE_PS5_TITLE
+C_ASSERT( RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT == WINE_PS5_PROFILE_UNIX_CALL_FRAME );
+#endif
+
+struct syscall_frame
+{
+    ULONG64               rax;           /* 0000 */
+    ULONG64               rbx;           /* 0008 */
+    ULONG64               rcx;           /* 0010 */
+    ULONG64               rdx;           /* 0018 */
+    ULONG64               rsi;           /* 0020 */
+    ULONG64               rdi;           /* 0028 */
+    ULONG64               r8;            /* 0030 */
+    ULONG64               r9;            /* 0038 */
+    ULONG64               r10;           /* 0040 */
+    ULONG64               r11;           /* 0048 */
+    ULONG64               r12;           /* 0050 */
+    ULONG64               r13;           /* 0058 */
+    ULONG64               r14;           /* 0060 */
+    ULONG64               r15;           /* 0068 */
+    ULONG64               rip;           /* 0070 */
+    ULONG64               cs;            /* 0078 */
+    ULONG64               eflags;        /* 0080 */
+    ULONG64               rsp;           /* 0088 */
+    ULONG64               ss;            /* 0090 */
+    ULONG64               rbp;           /* 0098 */
+    struct syscall_frame *prev_frame;    /* 00a0 */
+    void                 *syscall_cfa;   /* 00a8 */
+    DWORD                 syscall_id;    /* 00b0 */
+    DWORD                 restore_flags; /* 00b4 */
+    DWORD                 align[2];      /* 00b8 */
+    XSAVE_FORMAT          xsave;         /* 00c0 */
+    DECLSPEC_ALIGN(64) XSAVE_AREA_HEADER xstate;    /* 02c0 */
+};
+
+C_ASSERT( offsetof( struct syscall_frame, xsave ) == 0xc0 );
+C_ASSERT( offsetof( struct syscall_frame, xstate ) == 0x2c0 );
+C_ASSERT( sizeof( struct syscall_frame ) == 0x300);
+
+#ifdef __PROSPERO__
+BOOL ps5_title_get_syscall_user_stack( ULONG_PTR *stack )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+
+    if (!frame) return FALSE;
+    *stack = frame->rsp;
+    return TRUE;
+}
+#endif
+
+struct amd64_thread_data
+{
+    DWORD_PTR             dr0;           /* 02f0 debug registers */
+    DWORD_PTR             dr1;           /* 02f8 */
+    DWORD_PTR             dr2;           /* 0300 */
+    DWORD_PTR             dr3;           /* 0308 */
+    DWORD_PTR             dr6;           /* 0310 */
+    DWORD_PTR             dr7;           /* 0318 */
+    void                 *pthread_teb;   /* 0320 thread data for pthread */
+    DWORD_PTR             frame_size;    /* 0328 syscall frame size including xstate */
+    void                **instrumentation_callback; /* 0330 */
+    DWORD                 fs;            /* 0338 WOW TEB selector */
+    DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+    void                 *wow_fsbase;    /* 0340 WOW TEB as the %fs base (PS5) */
+    DWORD                 wow_fiber_data; /* 0348 real WOW NT_TIB FiberData */
+    DWORD                 wow_arbitrary_user; /* 034c real ArbitraryUserPointer */
+    UINT64                wow_libkernel_10; /* 0350 libkernel thread pointer shadow */
+    UINT64                wow_teb_28;     /* 0358 stable WOW TEB bytes 28-2f */
+    BOOL                  wow_shadowed;   /* 0360 libkernel shadow currently installed */
+    DWORD                 wow_pad;
+};
+
+C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_teb ) == 0x320 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_fsbase ) == 0x340 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_fiber_data ) == 0x348 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_arbitrary_user ) == 0x34c );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_libkernel_10 ) == 0x350 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_teb_28 ) == 0x358 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_shadowed ) == 0x360 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_fiber_data ) == WINE_PS5_WOW_FIBER_DATA_OFFSET );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, wow_shadowed ) == WINE_PS5_WOW_SHADOWED_OFFSET );
+
+#ifdef __PROSPERO__
+/* WoW64 on the PS5 (ps5/probes/wow64fs). There is no LDT and no selector
+ * of our own: %fs stays the GDT's 0x13, and its base is moved between the C
+ * library's thread data (pthread_teb) and the WOW TEB (wow_fsbase) by
+ * sysarch(AMD64_SET_FSBASE), as wrfsbase faults there.
+ *
+ * Payload builds make the system call directly: it may clobber %rdx and
+ * %r8-%r10 as well as %rcx and %r11. A title may not run a system call from
+ * its own code (WINE_PS5_TITLE), so there the base moves through libkernel's
+ * sysarch(), a stub (libkernel+0xde0 on 5.50) that clobbers the same
+ * registers and %r10, and touches no memory but the return address. It runs
+ * with the WOW TEB in %fs (ps5/probes/p1w32 S7). */
+#ifdef WINE_PS5_TITLE
+#define PS5_SET_FSBASE_CALL "call " __ASM_NAME("ps5_title_sysarch") "\n\t"
+static int ps5_title_exception_logged;
+
+/* Keep the genuine Windows NT_TIB bytes outside the slot libkernel needs
+ * while 32-bit code is running. This function deliberately uses GS rather
+ * than NtCurrentTeb(), and does no libc work before changing %fs. */
+static int __attribute__((used,noinline)) ps5_title_sysarch( int op, void *arg )
+{
+    struct amd64_thread_data *thread_data;
+    BOOL to_native = FALSE, to_wow = FALSE;
+    sigset_t old_set;
+    WOW_TEB *wow_teb;
+    TEB *teb;
+    void *base;
+    UINT64 current;
+    int ret;
+
+    __asm__( "movq %%gs:0x30,%0" : "=r" (teb) );
+    thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    wow_teb = thread_data->wow_fsbase;
+    base = *(void **)arg;
+
+    if (op == AMD64_SET_FSBASE && wow_teb)
+    {
+        to_native = base == thread_data->pthread_teb && thread_data->wow_shadowed;
+        to_wow = base == wow_teb && !thread_data->wow_shadowed;
+    }
+    if ((to_native || to_wow) &&
+        sigprocmask( SIG_BLOCK, &server_block_set, &old_set )) __builtin_trap();
+
+    if (to_native)
+    {
+        /* Keep the shadow coherent until %fs is native. A guest write can
+         * change either 32-bit half independently; never persist the other
+         * half of the libkernel pointer as Windows FiberData/TIB data. */
+        current = *(UINT64 *)((char *)wow_teb + 0x10);
+        if ((DWORD)current != (DWORD)thread_data->wow_libkernel_10)
+            thread_data->wow_fiber_data = (DWORD)current;
+        if ((DWORD)(current >> 32) != (DWORD)(thread_data->wow_libkernel_10 >> 32))
+            thread_data->wow_arbitrary_user = (DWORD)(current >> 32);
+        thread_data->wow_teb_28 = *(UINT64 *)((char *)wow_teb + 0x28);
+    }
+    else if (to_wow)
+    {
+        thread_data->wow_fiber_data = *(DWORD *)((char *)wow_teb + 0x10);
+        thread_data->wow_arbitrary_user = *(DWORD *)((char *)wow_teb + 0x14);
+        thread_data->wow_teb_28 = *(UINT64 *)((char *)wow_teb + 0x28);
+        if (*(UINT64 *)((char *)wow_teb + 0x38)) __builtin_trap();
+        *(UINT64 *)((char *)wow_teb + 0x10) = thread_data->wow_libkernel_10;
+        *(UINT64 *)((char *)wow_teb + 0x28) = thread_data->wow_teb_28;
+        thread_data->wow_shadowed = TRUE;
+    }
+
+    ret = sysarch( op, arg );
+    if (!ret && to_native)
+    {
+        *(DWORD *)((char *)wow_teb + 0x10) = thread_data->wow_fiber_data;
+        *(DWORD *)((char *)wow_teb + 0x14) = thread_data->wow_arbitrary_user;
+        *(UINT64 *)((char *)wow_teb + 0x28) = thread_data->wow_teb_28;
+        thread_data->wow_shadowed = FALSE;
+    }
+    else if (ret && to_wow)
+    {
+        *(DWORD *)((char *)wow_teb + 0x10) = thread_data->wow_fiber_data;
+        *(DWORD *)((char *)wow_teb + 0x14) = thread_data->wow_arbitrary_user;
+        *(UINT64 *)((char *)wow_teb + 0x28) = thread_data->wow_teb_28;
+        thread_data->wow_shadowed = FALSE;
+    }
+
+    if ((to_native || to_wow) &&
+        sigprocmask( SIG_SETMASK, &old_set, NULL )) __builtin_trap();
+    if (ret) __builtin_trap();
+    return ret;
+}
+
+static void ps5_title_init_wow_shadow( struct amd64_thread_data *thread_data, WOW_TEB *wow_teb )
+{
+    thread_data->wow_fiber_data = *(DWORD *)((char *)wow_teb + 0x10);
+    thread_data->wow_arbitrary_user = *(DWORD *)((char *)wow_teb + 0x14);
+    thread_data->wow_libkernel_10 = *(UINT64 *)((char *)thread_data->pthread_teb + 0x10);
+    thread_data->wow_teb_28 = *(UINT64 *)((char *)wow_teb + 0x28);
+    thread_data->wow_shadowed = FALSE;
+    if (*(UINT64 *)((char *)wow_teb + 0x38)) __builtin_trap();
+}
+
+static void ps5_title_restore_wow_shadow( struct amd64_thread_data *thread_data )
+{
+    WOW_TEB *wow_teb = thread_data->wow_fsbase;
+    UINT64 current;
+
+    if (!wow_teb || !thread_data->wow_shadowed) return;
+    current = *(UINT64 *)((char *)wow_teb + 0x10);
+    if ((DWORD)current != (DWORD)thread_data->wow_libkernel_10)
+        thread_data->wow_fiber_data = (DWORD)current;
+    if ((DWORD)(current >> 32) != (DWORD)(thread_data->wow_libkernel_10 >> 32))
+        thread_data->wow_arbitrary_user = (DWORD)(current >> 32);
+    thread_data->wow_teb_28 = *(UINT64 *)((char *)wow_teb + 0x28);
+    *(DWORD *)((char *)wow_teb + 0x10) = thread_data->wow_fiber_data;
+    *(DWORD *)((char *)wow_teb + 0x14) = thread_data->wow_arbitrary_user;
+    *(UINT64 *)((char *)wow_teb + 0x28) = thread_data->wow_teb_28;
+    thread_data->wow_shadowed = FALSE;
+}
+
+static inline void ps5_set_fsbase( void *base )
+{
+    ps5_title_sysarch( AMD64_SET_FSBASE, &base );
+}
+
+/* The current %fs base, 0 if the call fails. */
+static inline void *ps5_get_fsbase(void)
+{
+    void *base = NULL;
+
+    if (sysarch( AMD64_GET_FSBASE, &base )) return NULL;
+    return base;
+}
+#else
+#define PS5_SET_FSBASE_CALL "movl $165,%eax\n\t" /* SYS_sysarch */ \
+                            "syscall\n\t"
+
+static inline void ps5_set_fsbase( void *base )
+{
+    long nr = 165;  /* SYS_sysarch */
+    long op = 129;  /* AMD64_SET_FSBASE */
+    void **arg = &base;
+
+    __asm__ volatile( "syscall" : "+a" (nr), "+D" (op), "+S" (arg)
+                      :: "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc" );
+}
+
+/* The current %fs base (sysarch(AMD64_GET_FSBASE)), 0 if the call fails. */
+static inline void *ps5_get_fsbase(void)
+{
+    long nr = 165;  /* SYS_sysarch */
+    long op = 128;  /* AMD64_GET_FSBASE */
+    void *base = NULL, **arg = &base;
+
+    __asm__ volatile( "syscall" : "+a" (nr), "+D" (op), "+S" (arg)
+                      :: "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc" );
+    return base;
+}
+
+/* libkernel's sigaction runs handlers through a wrapper that reads its
+ * thread data through %fs, which holds the WOW TEB in 32-bit code: Wine's
+ * handlers are registered with the system call, so that the kernel calls
+ * them directly and init_handler() moves %fs back first. A title registers
+ * them with sigaction() and keeps that thread data reachable instead (see
+ * init_syscall_frame). */
+static int ps5_sigaction( int sig, const struct sigaction *act )
+{
+    long nr = 416;  /* SYS_sigaction */
+    long arg1 = sig, arg3 = 0;
+    const struct sigaction *arg2 = act;
+    char failed;
+
+    __asm__ volatile( "syscall; setc %1" : "+a" (nr), "=q" (failed), "+D" (arg1), "+S" (arg2), "+d" (arg3)
+                      :: "rcx", "r8", "r9", "r10", "r11", "memory", "cc" );
+    return failed ? -1 : 0;
+}
+#endif
+#endif
+
+/* Registers one of Wine's signal handlers. */
+static int set_handler( int sig, const struct sigaction *act )
+{
+#if defined(__PROSPERO__) && !defined(WINE_PS5_TITLE)
+    if (fs32_sel) return ps5_sigaction( sig, act );
+#endif
+    return sigaction( sig, act, NULL );
+}
+
+static inline struct amd64_thread_data *amd64_thread_data(void)
+{
+    return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+}
+
+static unsigned int frame_size;
+static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
+static UINT64 xstate_extended_features;
+#ifdef __PROSPERO__
+static BOOL ps5_mxcsr_trace_enabled;
+static unsigned int ps5_mxcsr_trace_count;
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+static inline TEB *get_current_teb(void)
+{
+    unsigned long rsp;
+    __asm__( "movq %%rsp,%0" : "=r" (rsp) );
+    return (TEB *)(rsp & ~signal_stack_mask);
+}
+#elif defined(__PROSPERO__)
+/* NtCurrentTeb() is pthread_getspecific() here, which reads libkernel's
+ * thread data through %fs: in a signal handler %fs may still hold the WOW
+ * TEB, so read the TEB's self pointer through %gs, as the dispatchers do. */
+static inline TEB *get_current_teb(void)
+{
+    TEB *teb;
+    __asm__( "movq %%gs:0x30,%0" : "=r" (teb) );
+    return teb;
+}
+#endif
+
+extern void __wine_syscall_dispatcher_instrumentation(void);
+static void *instrumentation_callback;
+static pthread_mutex_t instrumentation_callback_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* where the syscall thunks find the dispatcher (include/wine/asm.h): the first
+ * 16 KiB boundary past the user shared data, so that it has its own host page
+ * on the PS5 too; mapped 16 KiB long, a whole host page on either */
+#ifdef __PROSPERO__
+#define SYSCALL_DISPATCHER_PTR ((void *)0x7ffe4000)
+#define SYSCALL_DISPATCHER_PAGE 0x4000
+#else
+#define SYSCALL_DISPATCHER_PTR ((char *)user_shared_data + page_size)
+#define SYSCALL_DISPATCHER_PAGE page_size
+#endif
+
+void set_process_instrumentation_callback( void *callback )
+{
+    void *ptr = SYSCALL_DISPATCHER_PTR;
+    sigset_t sigset;
+    void *old;
+
+    server_enter_uninterrupted_section( &instrumentation_callback_mutex, &sigset );
+    old = InterlockedExchangePointer( &instrumentation_callback, callback );
+    if (!old && callback)      InterlockedExchangePointer( ptr, virtual_readable_entry( __wine_syscall_dispatcher_instrumentation ));
+    else if (old && !callback) InterlockedExchangePointer( ptr, virtual_readable_entry( __wine_syscall_dispatcher ));
+    server_leave_uninterrupted_section( &instrumentation_callback_mutex, &sigset );
+}
+
+struct xcontext
+{
+    CONTEXT c;
+    CONTEXT_EX c_ex;
+#ifdef __PROSPERO__
+    BOOL mxcsr_trace;
+    DWORD mxcsr_raw, mxcsr_live, mxcsr_context, mxcsr_flt;
+#endif
+};
+
+static inline XSAVE_AREA_HEADER *xstate_from_context( const CONTEXT *context )
+{
+    CONTEXT_EX *xctx = (CONTEXT_EX *)(context + 1);
+
+    if ((context->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) return NULL;
+    return (XSAVE_AREA_HEADER *)((char *)xctx + xctx->XState.Offset);
+}
+
+static inline void context_init_xstate( CONTEXT *context, void *xstate_buffer )
+{
+    CONTEXT_EX *xctx;
+
+    xctx = (CONTEXT_EX *)(context + 1);
+    xctx->Legacy.Length = sizeof(CONTEXT);
+    xctx->Legacy.Offset = -(LONG)sizeof(CONTEXT);
+
+    if (xstate_buffer)
+    {
+        xctx->XState.Length = xstate_size;
+        xctx->XState.Offset = (BYTE *)xstate_buffer - (BYTE *)xctx;
+        context->ContextFlags |= CONTEXT_XSTATE;
+
+        xctx->All.Length = sizeof(CONTEXT) + xctx->XState.Offset + xctx->XState.Length;
+    }
+    else
+    {
+        xctx->XState.Length = 25;
+        xctx->XState.Offset = 0;
+
+        xctx->All.Length = sizeof(CONTEXT) + 24; /* sizeof(CONTEXT_EX) minus 8 alignment bytes on x64. */
+    }
+
+    xctx->All.Offset = -(LONG)sizeof(CONTEXT);
+}
+
+
+/***********************************************************************
+ *           dwarf_virtual_unwind
+ *
+ * Equivalent of RtlVirtualUnwind for builtin modules.
+ */
+static NTSTATUS dwarf_virtual_unwind( ULONG64 ip, ULONG64 *frame,CONTEXT *context,
+                                      const struct dwarf_fde *fde, const struct dwarf_eh_bases *bases,
+                                      PEXCEPTION_ROUTINE *handler, void **handler_data )
+{
+    const struct dwarf_cie *cie;
+    const unsigned char *ptr, *augmentation, *end;
+    ULONG_PTR len, code_end;
+    struct frame_info info;
+    struct frame_state state_stack[MAX_SAVED_STATES];
+    int aug_z_format = 0;
+    unsigned char lsda_encoding = DW_EH_PE_omit;
+
+    memset( &info, 0, sizeof(info) );
+    info.state_stack = state_stack;
+    info.ip = (ULONG_PTR)bases->func;
+    *handler = NULL;
+
+    cie = (const struct dwarf_cie *)((const char *)&fde->cie_offset - fde->cie_offset);
+
+    /* parse the CIE first */
+
+    if (cie->version != 1 && cie->version != 3)
+    {
+        FIXME( "unknown CIE version %u at %p\n", cie->version, cie );
+        return STATUS_INVALID_DISPOSITION;
+    }
+    ptr = cie->augmentation + strlen((const char *)cie->augmentation) + 1;
+
+    info.code_align = dwarf_get_uleb128( &ptr );
+    info.data_align = dwarf_get_sleb128( &ptr );
+    if (cie->version == 1)
+        info.retaddr_reg = *ptr++;
+    else
+        info.retaddr_reg = dwarf_get_uleb128( &ptr );
+    info.state.cfa_rule = RULE_CFA_OFFSET;
+
+    TRACE( "function %lx base %p cie %p len %x id %x version %x aug '%s' code_align %lu data_align %ld retaddr %s\n",
+           ip, bases->func, cie, cie->length, cie->id, cie->version, cie->augmentation,
+           info.code_align, info.data_align, dwarf_reg_names[info.retaddr_reg] );
+    WINE_BACKTRACE_LOG( "%s.\n", wine_debuginfostr_pc((void *)context->Rip) );
+
+    end = NULL;
+    for (augmentation = cie->augmentation; *augmentation; augmentation++)
+    {
+        switch (*augmentation)
+        {
+        case 'z':
+            len = dwarf_get_uleb128( &ptr );
+            end = ptr + len;
+            aug_z_format = 1;
+            continue;
+        case 'L':
+            lsda_encoding = *ptr++;
+            continue;
+        case 'P':
+        {
+            unsigned char encoding = *ptr++;
+            *handler = (void *)dwarf_get_ptr( &ptr, encoding, bases );
+            continue;
+        }
+        case 'R':
+            info.fde_encoding = *ptr++;
+            continue;
+        case 'S':
+            info.signal_frame = 1;
+            continue;
+        }
+        FIXME( "unknown augmentation '%c'\n", *augmentation );
+        if (!end) return STATUS_INVALID_DISPOSITION;  /* cannot continue */
+        break;
+    }
+    if (end) ptr = end;
+
+    end = (const unsigned char *)(&cie->length + 1) + cie->length;
+    execute_cfa_instructions( ptr, end, ip, &info, bases );
+
+    ptr = (const unsigned char *)(fde + 1);
+    info.ip = dwarf_get_ptr( &ptr, info.fde_encoding, bases );  /* fde code start */
+    code_end = info.ip + dwarf_get_ptr( &ptr, info.fde_encoding & 0x0f, bases );  /* fde code length */
+
+    if (aug_z_format)  /* get length of augmentation data */
+    {
+        len = dwarf_get_uleb128( &ptr );
+        end = ptr + len;
+    }
+    else end = NULL;
+
+    *handler_data = (void *)dwarf_get_ptr( &ptr, lsda_encoding, bases );
+    if (end) ptr = end;
+
+    end = (const unsigned char *)(&fde->length + 1) + fde->length;
+    TRACE( "fde %p len %x personality %p lsda %p code %lx-%lx\n",
+           fde, fde->length, *handler, *handler_data, info.ip, code_end );
+    execute_cfa_instructions( ptr, end, ip, &info, bases );
+    *frame = context->Rsp;
+    apply_frame_state( context, &info.state, bases );
+
+    TRACE( "next function rip=%016lx\n", context->Rip );
+    TRACE( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+           context->Rax, context->Rbx, context->Rcx, context->Rdx );
+    TRACE( "  rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+           context->Rsi, context->Rdi, context->Rbp, context->Rsp );
+    TRACE( "   r8=%016lx  r9=%016lx r10=%016lx r11=%016lx\n",
+           context->R8, context->R9, context->R10, context->R11 );
+    TRACE( "  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+           context->R12, context->R13, context->R14, context->R15 );
+
+    return STATUS_SUCCESS;
+}
+
+
+#ifdef HAVE_LIBUNWIND
+/***********************************************************************
+ *           libunwind_virtual_unwind
+ *
+ * Equivalent of RtlVirtualUnwind for builtin modules.
+ */
+static NTSTATUS libunwind_virtual_unwind( ULONG64 ip, ULONG64 *frame, CONTEXT *context,
+                                          PEXCEPTION_ROUTINE *handler, void **handler_data )
+{
+    unw_context_t unw_context;
+    unw_cursor_t cursor;
+    unw_proc_info_t info;
+    int rc;
+
+#ifdef __APPLE__
+    rc = unw_getcontext( &unw_context );
+    if (rc == UNW_ESUCCESS)
+        rc = unw_init_local( &cursor, &unw_context );
+    if (rc == UNW_ESUCCESS)
+    {
+        unw_set_reg( &cursor, UNW_REG_IP,     context->Rip );
+        unw_set_reg( &cursor, UNW_REG_SP,     context->Rsp );
+        unw_set_reg( &cursor, UNW_X86_64_RAX, context->Rax );
+        unw_set_reg( &cursor, UNW_X86_64_RDX, context->Rdx );
+        unw_set_reg( &cursor, UNW_X86_64_RCX, context->Rcx );
+        unw_set_reg( &cursor, UNW_X86_64_RBX, context->Rbx );
+        unw_set_reg( &cursor, UNW_X86_64_RSI, context->Rsi );
+        unw_set_reg( &cursor, UNW_X86_64_RDI, context->Rdi );
+        unw_set_reg( &cursor, UNW_X86_64_RBP, context->Rbp );
+        unw_set_reg( &cursor, UNW_X86_64_R8,  context->R8 );
+        unw_set_reg( &cursor, UNW_X86_64_R9,  context->R9 );
+        unw_set_reg( &cursor, UNW_X86_64_R10, context->R10 );
+        unw_set_reg( &cursor, UNW_X86_64_R11, context->R11 );
+        unw_set_reg( &cursor, UNW_X86_64_R12, context->R12 );
+        unw_set_reg( &cursor, UNW_X86_64_R13, context->R13 );
+        unw_set_reg( &cursor, UNW_X86_64_R14, context->R14 );
+        unw_set_reg( &cursor, UNW_X86_64_R15, context->R15 );
+    }
+#else
+    RAX_sig(&unw_context) = context->Rax;
+    RCX_sig(&unw_context) = context->Rcx;
+    RDX_sig(&unw_context) = context->Rdx;
+    RBX_sig(&unw_context) = context->Rbx;
+    RSP_sig(&unw_context) = context->Rsp;
+    RBP_sig(&unw_context) = context->Rbp;
+    RSI_sig(&unw_context) = context->Rsi;
+    RDI_sig(&unw_context) = context->Rdi;
+    R8_sig(&unw_context)  = context->R8;
+    R9_sig(&unw_context)  = context->R9;
+    R10_sig(&unw_context) = context->R10;
+    R11_sig(&unw_context) = context->R11;
+    R12_sig(&unw_context) = context->R12;
+    R13_sig(&unw_context) = context->R13;
+    R14_sig(&unw_context) = context->R14;
+    R15_sig(&unw_context) = context->R15;
+    RIP_sig(&unw_context) = context->Rip;
+    CS_sig(&unw_context)  = context->SegCs;
+    FS_sig(&unw_context)  = context->SegFs;
+    GS_sig(&unw_context)  = context->SegGs;
+    EFL_sig(&unw_context) = context->EFlags;
+    rc = unw_init_local( &cursor, &unw_context );
+#endif
+    if (rc != UNW_ESUCCESS)
+    {
+        WARN( "setup failed: %d\n", rc );
+        return STATUS_INVALID_DISPOSITION;
+    }
+
+    *handler = NULL;
+    *frame = context->Rsp;
+
+    rc = unw_get_proc_info(&cursor, &info);
+    if (UNW_ENOINFO < 0) rc = -rc;  /* LLVM libunwind has negative error codes */
+    if (rc != UNW_ESUCCESS && rc != -UNW_ENOINFO)
+    {
+        WARN( "failed to get info: %d\n", rc );
+        return STATUS_INVALID_DISPOSITION;
+    }
+    if (rc == -UNW_ENOINFO || ip < info.start_ip || ip > info.end_ip || info.end_ip == info.start_ip + 1)
+        return STATUS_UNSUCCESSFUL;
+
+    TRACE( "ip %#lx function %#lx-%#lx personality %#lx lsda %#lx fde %#lx\n",
+           ip, (unsigned long)info.start_ip, (unsigned long)info.end_ip, (unsigned long)info.handler,
+           (unsigned long)info.lsda, (unsigned long)info.unwind_info );
+
+    if (!(rc = unw_step( &cursor )))
+    {
+        WARN( "last frame\n" );
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (rc < 0)
+    {
+        WARN( "failed to unwind: %d\n", rc );
+        return STATUS_INVALID_DISPOSITION;
+    }
+
+    unw_get_reg( &cursor, UNW_REG_IP,     (unw_word_t *)&context->Rip );
+    unw_get_reg( &cursor, UNW_REG_SP,     (unw_word_t *)&context->Rsp );
+    unw_get_reg( &cursor, UNW_X86_64_RAX, (unw_word_t *)&context->Rax );
+    unw_get_reg( &cursor, UNW_X86_64_RDX, (unw_word_t *)&context->Rdx );
+    unw_get_reg( &cursor, UNW_X86_64_RCX, (unw_word_t *)&context->Rcx );
+    unw_get_reg( &cursor, UNW_X86_64_RBX, (unw_word_t *)&context->Rbx );
+    unw_get_reg( &cursor, UNW_X86_64_RSI, (unw_word_t *)&context->Rsi );
+    unw_get_reg( &cursor, UNW_X86_64_RDI, (unw_word_t *)&context->Rdi );
+    unw_get_reg( &cursor, UNW_X86_64_RBP, (unw_word_t *)&context->Rbp );
+    unw_get_reg( &cursor, UNW_X86_64_R8,  (unw_word_t *)&context->R8 );
+    unw_get_reg( &cursor, UNW_X86_64_R9,  (unw_word_t *)&context->R9 );
+    unw_get_reg( &cursor, UNW_X86_64_R10, (unw_word_t *)&context->R10 );
+    unw_get_reg( &cursor, UNW_X86_64_R11, (unw_word_t *)&context->R11 );
+    unw_get_reg( &cursor, UNW_X86_64_R12, (unw_word_t *)&context->R12 );
+    unw_get_reg( &cursor, UNW_X86_64_R13, (unw_word_t *)&context->R13 );
+    unw_get_reg( &cursor, UNW_X86_64_R14, (unw_word_t *)&context->R14 );
+    unw_get_reg( &cursor, UNW_X86_64_R15, (unw_word_t *)&context->R15 );
+    *handler = (void*)info.handler;
+    *handler_data = (void*)info.lsda;
+
+    TRACE( "next function rip=%016lx\n", context->Rip );
+    TRACE( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+           context->Rax, context->Rbx, context->Rcx, context->Rdx );
+    TRACE( "  rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+           context->Rsi, context->Rdi, context->Rbp, context->Rsp );
+    TRACE( "   r8=%016lx  r9=%016lx r10=%016lx r11=%016lx\n",
+           context->R8, context->R9, context->R10, context->R11 );
+    TRACE( "  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+           context->R12, context->R13, context->R14, context->R15 );
+
+    return STATUS_SUCCESS;
+}
+#endif
+
+
+/***********************************************************************
+ *           unwind_builtin_dll
+ */
+NTSTATUS unwind_builtin_dll( void *args )
+{
+    struct unwind_builtin_dll_params *params = args;
+    DISPATCHER_CONTEXT *dispatch = params->dispatch;
+    CONTEXT *context = params->context;
+    struct dwarf_eh_bases bases;
+    const struct dwarf_fde *fde = _Unwind_Find_FDE( (void *)(context->Rip - 1), &bases );
+
+    if (fde)
+        return dwarf_virtual_unwind( context->Rip, &dispatch->EstablisherFrame, context, fde,
+                                     &bases, &dispatch->LanguageHandler, &dispatch->HandlerData );
+#ifdef HAVE_LIBUNWIND
+    return libunwind_virtual_unwind( context->Rip, &dispatch->EstablisherFrame, context,
+                                     &dispatch->LanguageHandler, &dispatch->HandlerData );
+#endif
+    return STATUS_UNSUCCESSFUL;
+}
+
+
+static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontext )
+{
+    RAX_sig(sigcontext) = context->Rax;
+    RCX_sig(sigcontext) = context->Rcx;
+    RDX_sig(sigcontext) = context->Rdx;
+    RBX_sig(sigcontext) = context->Rbx;
+    RSP_sig(sigcontext) = context->Rsp;
+    RBP_sig(sigcontext) = context->Rbp;
+    RSI_sig(sigcontext) = context->Rsi;
+    RDI_sig(sigcontext) = context->Rdi;
+    R8_sig(sigcontext)  = context->R8;
+    R9_sig(sigcontext)  = context->R9;
+    R10_sig(sigcontext) = context->R10;
+    R11_sig(sigcontext) = context->R11;
+    R12_sig(sigcontext) = context->R12;
+    R13_sig(sigcontext) = context->R13;
+    R14_sig(sigcontext) = context->R14;
+    R15_sig(sigcontext) = context->R15;
+    RIP_sig(sigcontext) = context->Rip;
+    CS_sig(sigcontext)  = context->SegCs;
+    FS_sig(sigcontext)  = context->SegFs;
+    EFL_sig(sigcontext) = context->EFlags;
+}
+
+
+static inline BOOL is_16bit( const ucontext_t *sigcontext )
+{
+    return SS_sig(sigcontext) != ds64_sel;
+}
+
+
+extern void clear_alignment_flag(void);
+__ASM_GLOBAL_FUNC( clear_alignment_flag,
+                   "pushfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "andl $~0x40000,(%rsp)\n\t"
+                   "popfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "ret" )
+
+
+/***********************************************************************
+ *           init_handler
+ */
+static inline ucontext_t *init_handler( void *sigcontext )
+{
+    clear_alignment_flag();
+#ifdef __linux__
+    if (fs32_sel)
+    {
+        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&get_current_teb()->GdiTebBatch;
+        if (((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb)
+            arch_prctl( ARCH_SET_FS, ((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb );
+    }
+#elif defined __APPLE__
+    {
+        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&get_current_teb()->GdiTebBatch;
+        _thread_set_tsd_base( (uint64_t)((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb );
+
+        /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
+         * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
+         * Fix up sigcontext so later code can compare it to cs64_sel.
+         *
+         * Only applies on Intel, not under Rosetta.
+         */
+        if (CS_sig((ucontext_t *)sigcontext) == 0x07 /* SYSCALL_CS */)
+            CS_sig((ucontext_t *)sigcontext) = cs64_sel;
+    }
+#elif defined(__PROSPERO__)
+    /* A title enters through libkernel's wrapper with %fs on the WOW TEB.
+     * Record that fact outside fields later rewritten for exception dispatch,
+     * then restore the C library's %fs before any Wine C code runs. The
+     * kernel ignores mc_fsbase without _MC_HASBASES on PS5 (p1w32 S8/S9). */
+    if (fs32_sel)
+    {
+        struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_teb()->GdiTebBatch;
+
+#ifdef WINE_PS5_TITLE
+        ucontext_t *context = sigcontext;
+        context->uc_mcontext.mc_fsbase =
+            thread_data->wow_shadowed ? (ULONG_PTR)thread_data->wow_fsbase : 0;
+#endif
+        if (thread_data->pthread_teb) ps5_set_fsbase( thread_data->pthread_teb );
+    }
+#endif
+    return sigcontext;
+}
+
+
+/***********************************************************************
+ *           leave_handler
+ */
+static inline void leave_handler( ucontext_t *sigcontext )
+{
+#ifdef __linux__
+    if (fs32_sel &&
+        !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+        !is_inside_syscall( RSP_sig(sigcontext) ))
+        __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
+#elif defined __APPLE__
+    if (!is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+        !is_inside_syscall( RSP_sig(sigcontext) ))
+        _thread_set_tsd_base( (uint64_t)NtCurrentTeb() );
+#elif defined(__PROSPERO__) && defined(WINE_PS5_TITLE)
+    /* Return to libkernel's wrapper with the same WOW shadow it entered
+     * with; sigreturn restores the interrupted base afterwards. */
+    if (sigcontext->uc_mcontext.mc_fsbase)
+        ps5_set_fsbase( (void *)(ULONG_PTR)sigcontext->uc_mcontext.mc_fsbase );
+#endif
+    if (is_16bit( sigcontext )) return;
+#ifdef DS_sig
+    DS_sig(sigcontext) = ds64_sel;
+#else
+    __asm__ volatile( "movw %0,%%ds" :: "r" (ds64_sel) );
+#endif
+#ifdef ES_sig
+    ES_sig(sigcontext) = ds64_sel;
+#else
+    __asm__ volatile( "movw %0,%%es" :: "r" (ds64_sel) );
+#endif
+}
+
+
+/***********************************************************************
+ *           save_context
+ *
+ * Set the register values from a sigcontext.
+ */
+static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontext )
+{
+    CONTEXT *context = &xcontext->c;
+#ifdef __PROSPERO__
+    xcontext->mxcsr_trace = FALSE;
+#endif
+
+    context->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_DEBUG_REGISTERS;
+    context->Rax    = RAX_sig(sigcontext);
+    context->Rcx    = RCX_sig(sigcontext);
+    context->Rdx    = RDX_sig(sigcontext);
+    context->Rbx    = RBX_sig(sigcontext);
+    context->Rsp    = RSP_sig(sigcontext);
+    context->Rbp    = RBP_sig(sigcontext);
+    context->Rsi    = RSI_sig(sigcontext);
+    context->Rdi    = RDI_sig(sigcontext);
+    context->R8     = R8_sig(sigcontext);
+    context->R9     = R9_sig(sigcontext);
+    context->R10    = R10_sig(sigcontext);
+    context->R11    = R11_sig(sigcontext);
+    context->R12    = R12_sig(sigcontext);
+    context->R13    = R13_sig(sigcontext);
+    context->R14    = R14_sig(sigcontext);
+    context->R15    = R15_sig(sigcontext);
+    context->Rip    = RIP_sig(sigcontext);
+    context->SegCs  = CS_sig(sigcontext);
+    context->SegFs  = FS_sig(sigcontext);
+    context->EFlags = EFL_sig(sigcontext);
+    context->SegDs  = ds64_sel;
+    context->SegEs  = ds64_sel;
+    context->SegGs  = ds64_sel;
+    context->SegSs  = ds64_sel;
+    context->Dr0    = amd64_thread_data()->dr0;
+    context->Dr1    = amd64_thread_data()->dr1;
+    context->Dr2    = amd64_thread_data()->dr2;
+    context->Dr3    = amd64_thread_data()->dr3;
+    context->Dr6    = amd64_thread_data()->dr6;
+    context->Dr7    = amd64_thread_data()->dr7;
+    if (FPU_sig(sigcontext))
+    {
+        XSAVE_AREA_HEADER *xs;
+
+        context->ContextFlags |= CONTEXT_FLOATING_POINT;
+        memcpy( &context->FltSave, FPU_sig(sigcontext), sizeof(context->FltSave) );
+        context->MxCsr = context->FltSave.MxCsr;
+        if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext))))
+        {
+            /* xcontext and sigcontext are both on the signal stack, so we can
+             * just reference sigcontext without overflowing 32 bit XState.Offset */
+            context_init_xstate( context, xs );
+            assert( xcontext->c_ex.XState.Offset == (BYTE *)xs - (BYTE *)&xcontext->c_ex );
+        }
+    }
+    if (is_16bit( sigcontext ))  /* get the actual selector values */
+    {
+        context->SegSs = SS_sig(sigcontext);
+#ifdef DS_sig
+        context->SegDs = DS_sig(sigcontext);
+#else
+        __asm__( "movw %%ds,%0" : "=r" (context->SegDs) );
+#endif
+#ifdef ES_sig
+        context->SegEs = ES_sig(sigcontext);
+#else
+        __asm__( "movw %%es,%0" : "=r" (context->SegEs) );
+#endif
+    }
+}
+
+
+/***********************************************************************
+ *           fixup_frame_fpu_state
+ *
+ * Set FP frame state not saved in __wine_unix_call_dispatcher from sigcontext.
+ */
+static void fixup_frame_fpu_state( struct syscall_frame *frame, const ucontext_t *sigcontext )
+{
+    XSAVE_FORMAT xsave;
+
+    memset( &frame->xstate, 0, sizeof(frame->xstate) );
+    if (user_shared_data->XState.CompactionEnabled)
+        frame->xstate.CompactionMask = 0x8000000000000000 | user_shared_data->XState.EnabledFeatures;
+
+    if (!FPU_sig(sigcontext)) return;
+    memcpy( &xsave, FPU_sig(sigcontext), sizeof(xsave) );
+    memcpy( &xsave.XmmRegisters[6], &frame->xsave.XmmRegisters[6], 10 * sizeof(*xsave.XmmRegisters) );
+    xsave.MxCsr = frame->xsave.MxCsr;
+    frame->xsave = xsave;
+    frame->xstate.Mask = XSTATE_MASK_LEGACY;
+}
+
+
+/***********************************************************************
+ *           restore_context
+ *
+ * Build a sigcontext from the register values.
+ */
+static void restore_context( const struct xcontext *xcontext, ucontext_t *sigcontext )
+{
+    const CONTEXT *context = &xcontext->c;
+
+    amd64_thread_data()->dr0 = context->Dr0;
+    amd64_thread_data()->dr1 = context->Dr1;
+    amd64_thread_data()->dr2 = context->Dr2;
+    amd64_thread_data()->dr3 = context->Dr3;
+    amd64_thread_data()->dr6 = context->Dr6;
+    amd64_thread_data()->dr7 = context->Dr7;
+    set_sigcontext( context, sigcontext );
+    if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
+    leave_handler( sigcontext );
+}
+
+
+/***********************************************************************
+ *           signal_set_full_context
+ */
+NTSTATUS signal_set_full_context( CONTEXT *context )
+{
+    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+
+    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+        get_syscall_frame()->restore_flags |= CONTEXT_INTEGER;
+    return status;
+}
+
+
+/***********************************************************************
+ *              get_native_context
+ */
+void *get_native_context( CONTEXT *context )
+{
+    return context;
+}
+
+
+/***********************************************************************
+ *              get_wow_context
+ */
+void *get_wow_context( CONTEXT *context )
+{
+    if (context->SegCs != cs64_sel) return NULL;
+    return get_cpu_area( IMAGE_FILE_MACHINE_I386 );
+}
+
+
+/***********************************************************************
+ *              NtSetContextThread  (NTDLL.@)
+ *              ZwSetContextThread  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+{
+    NTSTATUS ret = STATUS_SUCCESS;
+    DWORD flags = context->ContextFlags & ~CONTEXT_AMD64;
+    BOOL self = (handle == GetCurrentThread());
+    struct syscall_frame *frame = get_syscall_frame();
+
+    if ((flags & CONTEXT_XSTATE) && xstate_extended_features)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSAVE_AREA_HEADER *xs = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) ||
+            context_ex->XState.Length > xstate_size)
+            return STATUS_INVALID_PARAMETER;
+        if ((xs->Mask & xstate_extended_features)
+            && (context_ex->XState.Length < xstate_get_size( xs->CompactionMask, xs->Mask )))
+            return STATUS_BUFFER_OVERFLOW;
+    }
+    else flags &= ~CONTEXT_XSTATE;
+
+    /* debug registers require a server call */
+    if (self && (flags & CONTEXT_DEBUG_REGISTERS))
+        self = (amd64_thread_data()->dr0 == context->Dr0 &&
+                amd64_thread_data()->dr1 == context->Dr1 &&
+                amd64_thread_data()->dr2 == context->Dr2 &&
+                amd64_thread_data()->dr3 == context->Dr3 &&
+                amd64_thread_data()->dr6 == context->Dr6 &&
+                amd64_thread_data()->dr7 == context->Dr7);
+
+    if (!self)
+    {
+        ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
+#ifdef __APPLE__
+        if ((flags & CONTEXT_DEBUG_REGISTERS) && (ret == STATUS_UNSUCCESSFUL))
+            WARN_(seh)( "Setting debug registers is not supported under Rosetta\n" );
+#endif
+        if (ret || !self) return ret;
+        if (flags & CONTEXT_DEBUG_REGISTERS)
+        {
+            amd64_thread_data()->dr0 = context->Dr0;
+            amd64_thread_data()->dr1 = context->Dr1;
+            amd64_thread_data()->dr2 = context->Dr2;
+            amd64_thread_data()->dr3 = context->Dr3;
+            amd64_thread_data()->dr6 = context->Dr6;
+            amd64_thread_data()->dr7 = context->Dr7;
+        }
+    }
+
+    if (flags & CONTEXT_INTEGER)
+    {
+        frame->rax = context->Rax;
+        frame->rbx = context->Rbx;
+        frame->rcx = context->Rcx;
+        frame->rdx = context->Rdx;
+        frame->rbp = context->Rbp;
+        frame->rsi = context->Rsi;
+        frame->rdi = context->Rdi;
+        frame->r8  = context->R8;
+        frame->r9  = context->R9;
+        frame->r10 = context->R10;
+        frame->r11 = context->R11;
+        frame->r12 = context->R12;
+        frame->r13 = context->R13;
+        frame->r14 = context->R14;
+        frame->r15 = context->R15;
+    }
+    if (flags & CONTEXT_CONTROL)
+    {
+        frame->rsp    = context->Rsp;
+        frame->rip    = context->Rip;
+        frame->eflags = context->EFlags;
+    }
+    if (flags & CONTEXT_FLOATING_POINT)
+    {
+        frame->xsave = context->FltSave;
+        frame->xsave.MxCsr = context->MxCsr;
+        frame->xstate.Mask |= XSTATE_MASK_LEGACY;
+    }
+    if (flags & CONTEXT_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSAVE_AREA_HEADER *xs = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+        UINT64 mask = frame->xstate.Mask;
+
+        if (user_shared_data->XState.CompactionEnabled)
+            frame->xstate.CompactionMask |= xstate_extended_features;
+        copy_xstate( &frame->xstate, xs, xs->Mask );
+        if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+    }
+
+    frame->restore_flags |= flags & ~CONTEXT_INTEGER;
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *              NtGetContextThread  (NTDLL.@)
+ *              ZwGetContextThread  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    DWORD needed_flags = context->ContextFlags & ~CONTEXT_AMD64;
+    BOOL use_cached_debug_regs = FALSE;
+    BOOL self = (handle == GetCurrentThread());
+
+    if (self && needed_flags & CONTEXT_DEBUG_REGISTERS)
+    {
+        /* debug registers require a server call if hw breakpoints are enabled */
+        if (amd64_thread_data()->dr7 & 0xff) self = FALSE;
+        else use_cached_debug_regs = TRUE;
+    }
+
+    if (!self)
+    {
+        NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
+        if (ret || !self) return ret;
+    }
+
+    if (needed_flags & CONTEXT_INTEGER)
+    {
+        context->Rax = frame->rax;
+        context->Rbx = frame->rbx;
+        context->Rcx = frame->rcx;
+        context->Rdx = frame->rdx;
+        context->Rbp = frame->rbp;
+        context->Rsi = frame->rsi;
+        context->Rdi = frame->rdi;
+        context->R8  = frame->r8;
+        context->R9  = frame->r9;
+        context->R10 = frame->r10;
+        context->R11 = frame->r11;
+        context->R12 = frame->r12;
+        context->R13 = frame->r13;
+        context->R14 = frame->r14;
+        context->R15 = frame->r15;
+        context->ContextFlags |= CONTEXT_INTEGER;
+    }
+    if (needed_flags & CONTEXT_CONTROL)
+    {
+        context->Rsp    = frame->rsp;
+        context->Rip    = frame->rip;
+        context->EFlags = frame->eflags;
+        context->SegCs  = cs64_sel;
+        context->SegSs  = ds64_sel;
+        context->ContextFlags |= CONTEXT_CONTROL;
+    }
+    if (needed_flags & CONTEXT_SEGMENTS)
+    {
+        context->SegDs  = ds64_sel;
+        context->SegEs  = ds64_sel;
+        context->SegFs  = amd64_thread_data()->fs;
+        context->SegGs  = ds64_sel;
+        context->ContextFlags |= CONTEXT_SEGMENTS;
+    }
+    if (needed_flags & CONTEXT_FLOATING_POINT)
+    {
+        if (!user_shared_data->XState.CompactionEnabled ||
+            (frame->xstate.Mask & XSTATE_MASK_LEGACY_FLOATING_POINT))
+        {
+            memcpy( &context->FltSave, &frame->xsave, FIELD_OFFSET( XSAVE_FORMAT, MxCsr ));
+            memcpy( context->FltSave.FloatRegisters, frame->xsave.FloatRegisters,
+                    sizeof( context->FltSave.FloatRegisters ));
+        }
+        else
+        {
+            memset( &context->FltSave, 0, FIELD_OFFSET( XSAVE_FORMAT, MxCsr ));
+            memset( context->FltSave.FloatRegisters, 0,
+                    sizeof( context->FltSave.FloatRegisters ));
+            context->FltSave.ControlWord = 0x37f;
+        }
+
+        if (!user_shared_data->XState.CompactionEnabled || (frame->xstate.Mask & XSTATE_MASK_LEGACY_SSE))
+        {
+            memcpy( context->FltSave.XmmRegisters, frame->xsave.XmmRegisters,
+                    sizeof( context->FltSave.XmmRegisters ));
+            context->FltSave.MxCsr      = frame->xsave.MxCsr;
+            context->FltSave.MxCsr_Mask = frame->xsave.MxCsr_Mask;
+        }
+        else
+        {
+            memset( context->FltSave.XmmRegisters, 0,
+                    sizeof( context->FltSave.XmmRegisters ));
+            context->FltSave.MxCsr      = 0x1f80;
+            context->FltSave.MxCsr_Mask = 0x2ffff;
+        }
+
+        context->MxCsr = context->FltSave.MxCsr;
+        context->ContextFlags |= CONTEXT_FLOATING_POINT;
+    }
+    if ((needed_flags & CONTEXT_XSTATE) && xstate_extended_features)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSAVE_AREA_HEADER *xstate = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+        UINT64 mask;
+
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) ||
+            context_ex->XState.Length > xstate_size)
+            return STATUS_INVALID_PARAMETER;
+
+        if (user_shared_data->XState.CompactionEnabled)
+        {
+            frame->xstate.CompactionMask |= xstate_extended_features;
+            mask = xstate->CompactionMask & xstate_extended_features;
+            xstate->Mask = frame->xstate.Mask & mask;
+            xstate->CompactionMask = 0x8000000000000000 | mask;
+        }
+        else
+        {
+            mask = xstate->Mask & xstate_extended_features;
+            xstate->Mask = frame->xstate.Mask & mask;
+            xstate->CompactionMask = 0;
+        }
+        memset( xstate->Reserved2, 0, sizeof(xstate->Reserved2) );
+        if (xstate->Mask)
+        {
+            if (context_ex->XState.Length < xstate_get_size( xstate->CompactionMask, xstate->Mask ))
+                return STATUS_BUFFER_OVERFLOW;
+            copy_xstate( xstate, &frame->xstate, xstate->Mask );
+            /* copy_xstate may use avx in memcpy, restore xstate not to break the tests. */
+            frame->restore_flags |= CONTEXT_XSTATE;
+        }
+    }
+    if (context->ContextFlags & (CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64))
+    {
+        if (use_cached_debug_regs)
+        {
+            context->Dr0 = amd64_thread_data()->dr0;
+            context->Dr1 = amd64_thread_data()->dr1;
+            context->Dr2 = amd64_thread_data()->dr2;
+            context->Dr3 = amd64_thread_data()->dr3;
+            context->Dr6 = amd64_thread_data()->dr6;
+            context->Dr7 = amd64_thread_data()->dr7;
+        }
+        else
+        {
+            /* update the cached version of the debug registers */
+            amd64_thread_data()->dr0 = context->Dr0;
+            amd64_thread_data()->dr1 = context->Dr1;
+            amd64_thread_data()->dr2 = context->Dr2;
+            amd64_thread_data()->dr3 = context->Dr3;
+            amd64_thread_data()->dr6 = context->Dr6;
+            amd64_thread_data()->dr7 = context->Dr7;
+        }
+    }
+    set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *              set_thread_wow64_context
+ */
+NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+{
+    BOOL self = (handle == GetCurrentThread());
+    struct syscall_frame *frame = get_syscall_frame();
+    I386_CONTEXT *wow_frame;
+    const I386_CONTEXT *context = ctx;
+    DWORD flags = context->ContextFlags & ~CONTEXT_i386;
+
+    if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+
+    /* debug registers require a server call */
+    if (self && (flags & CONTEXT_I386_DEBUG_REGISTERS))
+        self = (amd64_thread_data()->dr0 == context->Dr0 &&
+                amd64_thread_data()->dr1 == context->Dr1 &&
+                amd64_thread_data()->dr2 == context->Dr2 &&
+                amd64_thread_data()->dr3 == context->Dr3 &&
+                amd64_thread_data()->dr6 == context->Dr6 &&
+                amd64_thread_data()->dr7 == context->Dr7);
+
+    if (!self)
+    {
+        NTSTATUS ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
+        if (ret || !self) return ret;
+        if (flags & CONTEXT_I386_DEBUG_REGISTERS)
+        {
+            amd64_thread_data()->dr0 = context->Dr0;
+            amd64_thread_data()->dr1 = context->Dr1;
+            amd64_thread_data()->dr2 = context->Dr2;
+            amd64_thread_data()->dr3 = context->Dr3;
+            amd64_thread_data()->dr6 = context->Dr6;
+            amd64_thread_data()->dr7 = context->Dr7;
+        }
+        if (!(flags & ~CONTEXT_I386_DEBUG_REGISTERS)) return ret;
+    }
+
+    if (!(wow_frame = get_cpu_area( IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
+
+    if (flags & CONTEXT_I386_INTEGER)
+    {
+        wow_frame->Eax = context->Eax;
+        wow_frame->Ebx = context->Ebx;
+        wow_frame->Ecx = context->Ecx;
+        wow_frame->Edx = context->Edx;
+        wow_frame->Esi = context->Esi;
+        wow_frame->Edi = context->Edi;
+    }
+    if (flags & CONTEXT_I386_CONTROL)
+    {
+        WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+
+        wow_frame->Esp    = context->Esp;
+        wow_frame->Ebp    = context->Ebp;
+        wow_frame->Eip    = context->Eip;
+        wow_frame->EFlags = context->EFlags;
+        wow_frame->SegCs  = context->SegCs;
+        wow_frame->SegSs  = context->SegSs;
+        cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
+    }
+    if (flags & CONTEXT_I386_SEGMENTS)
+    {
+        wow_frame->SegDs = ds64_sel;
+        wow_frame->SegEs = ds64_sel;
+        wow_frame->SegFs = amd64_thread_data()->fs;
+        wow_frame->SegGs = ds64_sel;
+    }
+    if (flags & CONTEXT_I386_DEBUG_REGISTERS)
+    {
+        wow_frame->Dr0 = context->Dr0;
+        wow_frame->Dr1 = context->Dr1;
+        wow_frame->Dr2 = context->Dr2;
+        wow_frame->Dr3 = context->Dr3;
+        wow_frame->Dr6 = context->Dr6;
+        wow_frame->Dr7 = context->Dr7;
+    }
+    if (flags & CONTEXT_I386_EXTENDED_REGISTERS)
+    {
+        memcpy( &frame->xsave, context->ExtendedRegisters, sizeof(frame->xsave) );
+        frame->restore_flags |= CONTEXT_FLOATING_POINT;
+    }
+    else if (flags & CONTEXT_I386_FLOATING_POINT)
+    {
+        fpu_to_fpux( &frame->xsave, &context->FloatSave );
+        frame->restore_flags |= CONTEXT_FLOATING_POINT;
+    }
+    if (flags & CONTEXT_I386_XSTATE)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSAVE_AREA_HEADER *xs = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+        UINT64 mask = frame->xstate.Mask;
+
+        if (user_shared_data->XState.CompactionEnabled)
+            frame->xstate.CompactionMask |= xstate_extended_features;
+        copy_xstate( &frame->xstate, xs, xs->Mask );
+        if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+        frame->restore_flags |= CONTEXT_XSTATE;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *              get_thread_wow64_context
+ */
+NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+{
+    DWORD needed_flags;
+    struct syscall_frame *frame = get_syscall_frame();
+    I386_CONTEXT *wow_frame, *context = ctx;
+    BOOL self = (handle == GetCurrentThread());
+
+    if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+
+    needed_flags = context->ContextFlags & ~CONTEXT_i386;
+
+    /* debug registers require a server call */
+    if (needed_flags & CONTEXT_I386_DEBUG_REGISTERS) self = FALSE;
+
+    if (!self)
+    {
+        NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
+        if (ret || !self) return ret;
+        /* update the cached version of the debug registers */
+        if (needed_flags & CONTEXT_I386_DEBUG_REGISTERS)
+        {
+            amd64_thread_data()->dr0 = context->Dr0;
+            amd64_thread_data()->dr1 = context->Dr1;
+            amd64_thread_data()->dr2 = context->Dr2;
+            amd64_thread_data()->dr3 = context->Dr3;
+            amd64_thread_data()->dr6 = context->Dr6;
+            amd64_thread_data()->dr7 = context->Dr7;
+        }
+        if (!(needed_flags & ~CONTEXT_I386_DEBUG_REGISTERS)) return ret;
+    }
+
+    if (!(wow_frame = get_cpu_area( IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
+
+    if (needed_flags & CONTEXT_I386_INTEGER)
+    {
+        context->Eax = wow_frame->Eax;
+        context->Ebx = wow_frame->Ebx;
+        context->Ecx = wow_frame->Ecx;
+        context->Edx = wow_frame->Edx;
+        context->Esi = wow_frame->Esi;
+        context->Edi = wow_frame->Edi;
+        context->ContextFlags |= CONTEXT_I386_INTEGER;
+    }
+    if (needed_flags & CONTEXT_I386_CONTROL)
+    {
+        context->Esp    = wow_frame->Esp;
+        context->Ebp    = wow_frame->Ebp;
+        context->Eip    = wow_frame->Eip;
+        context->EFlags = wow_frame->EFlags;
+        context->SegCs  = LOWORD(wow_frame->SegCs);
+        context->SegSs  = LOWORD(wow_frame->SegSs);
+        context->ContextFlags |= CONTEXT_I386_CONTROL;
+    }
+    if (needed_flags & CONTEXT_I386_SEGMENTS)
+    {
+        context->SegDs = ds64_sel;
+        context->SegEs = ds64_sel;
+        context->SegFs = amd64_thread_data()->fs;
+        context->SegGs = ds64_sel;
+        context->ContextFlags |= CONTEXT_I386_SEGMENTS;
+    }
+    if (needed_flags & CONTEXT_I386_EXTENDED_REGISTERS)
+    {
+        memcpy( context->ExtendedRegisters, &frame->xsave, sizeof(context->ExtendedRegisters) );
+        context->ContextFlags |= CONTEXT_I386_EXTENDED_REGISTERS;
+    }
+    if (needed_flags & CONTEXT_I386_FLOATING_POINT)
+    {
+        fpux_to_fpu( &context->FloatSave, &frame->xsave );
+        context->ContextFlags |= CONTEXT_I386_FLOATING_POINT;
+    }
+    if ((needed_flags & CONTEXT_I386_XSTATE) && xstate_extended_features)
+    {
+        CONTEXT_EX *context_ex = (CONTEXT_EX *)(context + 1);
+        XSAVE_AREA_HEADER *xstate = (XSAVE_AREA_HEADER *)((char *)context_ex + context_ex->XState.Offset);
+        UINT64 mask;
+
+        if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) ||
+            context_ex->XState.Length > xstate_size)
+            return STATUS_INVALID_PARAMETER;
+
+        if (user_shared_data->XState.CompactionEnabled)
+        {
+            frame->xstate.CompactionMask |= xstate_extended_features;
+            mask = xstate->CompactionMask & xstate_extended_features;
+            xstate->Mask = frame->xstate.Mask & mask;
+            xstate->CompactionMask = 0x8000000000000000 | mask;
+        }
+        else
+        {
+            mask = xstate->Mask & xstate_extended_features;
+            xstate->Mask = frame->xstate.Mask & mask;
+            xstate->CompactionMask = 0;
+        }
+        memset( xstate->Reserved2, 0, sizeof(xstate->Reserved2) );
+        if (xstate->Mask)
+        {
+            if (context_ex->XState.Length < xstate_get_size( xstate->CompactionMask, xstate->Mask ))
+                return STATUS_BUFFER_OVERFLOW;
+            copy_xstate( xstate, &frame->xstate, xstate->Mask );
+            /* copy_xstate may use avx in memcpy, restore xstate not to break the tests. */
+            frame->restore_flags |= CONTEXT_XSTATE;
+        }
+    }
+    set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
+    return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           setup_raise_exception
+ */
+static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, struct xcontext *xcontext )
+{
+    ULONG_PTR rsp;
+    CONTEXT *context = &xcontext->c;
+    struct exc_stack_layout *stack;
+    size_t stack_size;
+    NTSTATUS status;
+    XSAVE_AREA_HEADER *src_xs;
+    void *callback;
+#ifdef WINE_PS5_TITLE
+    if (!__atomic_exchange_n( &ps5_title_exception_logged, 1, __ATOMIC_RELAXED ))
+    {
+        char line[160];
+        snprintf( line, sizeof(line), "wine: title first exception code=%08x address=%p cs=%x\n",
+                  rec->ExceptionCode, rec->ExceptionAddress, (unsigned int)context->SegCs );
+        sceKernelDebugOutText( 0, line );
+    }
+#endif
+
+    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP)
+    {
+        /* when single stepping can't tell whether this is a hw bp or a
+         * single step interrupt. try to avoid as much overhead as possible
+         * and only do a server call if there is any hw bp enabled. */
+
+        if (!(context->EFlags & 0x100) || (context->Dr7 & 0xff))
+        {
+            /* (possible) hardware breakpoint, fetch the debug registers */
+            DWORD saved_flags = context->ContextFlags;
+            context->ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            NtGetContextThread(GetCurrentThread(), context);
+            context->ContextFlags |= saved_flags;  /* restore flags */
+        }
+        context->EFlags &= ~0x100;  /* clear single-step flag */
+    }
+
+    status = send_debug_event( rec, context, TRUE, TRUE );
+    if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+    {
+        restore_context( xcontext, sigcontext );
+        leave_handler( sigcontext );
+        return;
+    }
+
+    /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Rip--;
+
+    rsp = is_16bit(sigcontext) ? get_wow_teb( NtCurrentTeb() )->SystemReserved1[0] : RSP_sig(sigcontext);
+    rsp &= ~(ULONG_PTR)15;
+    stack_size = rsp - ((rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
+    stack = virtual_setup_exception( (void *)rsp, stack_size, rec );
+    stack->rec               = *rec;
+    stack->context           = *context;
+    stack->machine_frame.rip = context->Rip;
+    stack->machine_frame.rsp = context->Rsp;
+
+    if ((src_xs = xstate_from_context( context )))
+    {
+        XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)(stack + 1);
+        assert( !((ULONG_PTR)dst_xs & 63) );
+        context_init_xstate( &stack->context, dst_xs );
+        memset( dst_xs, 0, sizeof(*dst_xs) );
+        dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000000 | xstate_extended_features : 0;
+        copy_xstate( dst_xs, src_xs, src_xs->Mask );
+    }
+    else
+    {
+        context_init_xstate( &stack->context, NULL );
+    }
+
+    CS_sig(sigcontext)  = cs64_sel;
+    RIP_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+    RSP_sig(sigcontext) = (ULONG_PTR)stack;
+    /* clear single-step, direction, and align check flag */
+    EFL_sig(sigcontext) &= ~(0x100|0x400|0x40000);
+    if ((callback = instrumentation_callback))
+    {
+        R10_sig(sigcontext) = RIP_sig(sigcontext);
+        RIP_sig(sigcontext) = (ULONG64)callback;
+    }
+#ifdef __PROSPERO__
+    if (xcontext->mxcsr_trace && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        unsigned int n = __atomic_fetch_add( &ps5_mxcsr_trace_count, 1, __ATOMIC_RELAXED );
+
+        if (n < 4)
+        {
+            DWORD stack_mxcsr = stack->context.MxCsr;
+            DWORD stack_flt = stack->context.FltSave.MxCsr;
+            char line[256];
+
+            snprintf( line, sizeof(line),
+                      "wine: title mxcsr trace n=%u raw=%08x live=%08x ctx=%08x flt=%08x "
+                      "stack_ctx=%08x stack_flt=%08x rip=%p\n",
+                      n + 1, xcontext->mxcsr_raw, xcontext->mxcsr_live,
+                      xcontext->mxcsr_context, xcontext->mxcsr_flt,
+                      stack_mxcsr, stack_flt, rec->ExceptionAddress );
+            sceKernelDebugOutText( 0, line );
+        }
+    }
+#endif
+    leave_handler( sigcontext );
+}
+
+
+/***********************************************************************
+ *           setup_exception
+ *
+ * Setup a proper stack frame for the raise function, and modify the
+ * sigcontext so that the return from the signal handler will call
+ * the raise function.
+ */
+static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
+{
+    struct xcontext context;
+
+    rec->ExceptionAddress = (void *)RIP_sig(sigcontext);
+    save_context( &context, sigcontext );
+    setup_raise_exception( sigcontext, rec, &context );
+}
+
+
+/***********************************************************************
+ *           call_user_apc_dispatcher
+ */
+NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
+                                   PNTAPCFUNC func, NTSTATUS status )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    ULONG64 rsp = context ? context->Rsp : frame->rsp;
+    struct apc_stack_layout *stack;
+
+    if (flags & ~SERVER_USER_APC_CALLBACK_DATA_CONTEXT) FIXME( "flags %#x are not supported.\n", flags );
+
+    rsp &= ~15;
+    stack = (struct apc_stack_layout *)rsp - 1;
+    if (context)
+    {
+        memmove( &stack->context, context, sizeof(stack->context) );
+        NtSetContextThread( GetCurrentThread(), &stack->context );
+    }
+    else
+    {
+        stack->context.ContextFlags = CONTEXT_FULL;
+        NtGetContextThread( GetCurrentThread(), &stack->context );
+        stack->context.Rax = status;
+    }
+    memset( &stack->continue_arg, 0, sizeof(stack->continue_arg) );
+    stack->continue_arg.ContinueType = KCONTINUE_RESUME;
+    stack->continue_arg.ContinueFlags = KCONTINUE_FLAG_TEST_ALERT | KCONTINUE_FLAG_DELIVER_APC;
+    stack->context.P1Home    = arg1;
+    if (flags & SERVER_USER_APC_CALLBACK_DATA_CONTEXT)
+    {
+        stack->callback_data.ContextRecord = &stack->context;
+        stack->callback_data.Parameter = arg2;
+        stack->callback_data.Reserved0 = 0;
+        stack->callback_data.Reserved1 = 0;
+        stack->context.P2Home = (ULONG_PTR)&stack->callback_data;
+    }
+    else stack->context.P2Home = arg2;
+    stack->context.P3Home    = arg3;
+    stack->context.P4Home    = (ULONG64)func;
+    stack->machine_frame.rip = stack->context.Rip;
+    stack->machine_frame.rsp = stack->context.Rsp;
+    frame->rbp = stack->context.Rbp;
+    frame->rsp = (ULONG64)stack;
+    frame->rip = (ULONG64)pKiUserApcDispatcher;
+    frame->restore_flags |= CONTEXT_CONTROL;
+    return status;
+}
+
+
+/***********************************************************************
+ *           call_raise_user_exception_dispatcher
+ */
+void call_raise_user_exception_dispatcher(void)
+{
+    get_syscall_frame()->rip = (UINT64)pKiRaiseUserExceptionDispatcher;
+}
+
+
+/***********************************************************************
+ *           call_user_exception_dispatcher
+ */
+NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    struct exc_stack_layout *stack;
+    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+
+    if (status) return status;
+    stack = (struct exc_stack_layout *)((context->Rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
+    memmove( &stack->context, context, sizeof(*context) );
+
+    if ((context->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE)
+    {
+        XSAVE_AREA_HEADER *dst_xs = (XSAVE_AREA_HEADER *)(stack + 1);
+        assert( !((ULONG_PTR)dst_xs & 63) );
+        context_init_xstate( &stack->context, dst_xs );
+        memcpy( dst_xs, &frame->xstate, xstate_size );
+    }
+    else context_init_xstate( &stack->context, NULL );
+
+    stack->rec = *rec;
+    /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
+    if (stack->rec.ExceptionCode == EXCEPTION_BREAKPOINT) stack->context.Rip--;
+    stack->machine_frame.rip = stack->context.Rip;
+    stack->machine_frame.rsp = stack->context.Rsp;
+    frame->rbp = stack->context.Rbp;
+    frame->rsp = (ULONG64)stack;
+    frame->rip = (ULONG64)pKiUserExceptionDispatcher;
+    frame->restore_flags |= CONTEXT_CONTROL;
+    return status;
+}
+
+
+/***********************************************************************
+ *           call_user_mode_callback
+ */
+extern NTSTATUS call_user_mode_callback( ULONG64 user_rsp, void **ret_ptr, ULONG *ret_len, void *func, TEB *teb );
+__ASM_GLOBAL_FUNC( call_user_mode_callback,
+                   "subq $0x58,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0x58\n\t")
+                   "movq %rbp,0x50(%rsp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %rbp,0x50\n\t")
+                   "leaq 0x50(%rsp),%rbp\n\t"
+                   __ASM_CFI(".cfi_def_cfa_register %rbp\n\t")
+                   "movq %rbx,-0x08(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %rbx,-0x08\n\t")
+                   "movq %r12,-0x10(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r12,-0x10\n\t")
+                   "movq %r13,-0x18(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r13,-0x18\n\t")
+                   "movq %r14,-0x20(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r14,-0x20\n\t")
+                   "movq %r15,-0x28(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r15,-0x28\n\t")
+                   "stmxcsr -0x30(%rbp)\n\t"
+                   "fnstcw -0x2c(%rbp)\n\t"
+                   "movq %r8,%r13\n\t"         /* teb */
+                   "movq %rsi,-0x38(%rbp)\n\t" /* ret_ptr */
+                   "movq %rdx,-0x40(%rbp)\n\t" /* ret_len */
+                   "movq (%r13),%rax\n\t"      /* NtCurrentTeb()->Tib.ExceptionList */
+                   "movq %rax,-0x48(%rbp)\n\t"
+                   "subq 0x328(%r13),%rsp\n\t" /* amd64_thread_data()->frame_size */
+                   "andq $~63,%rsp\n\t"
+                   "leaq 0x10(%rbp),%rax\n\t"
+                   "movq %rax,0xa8(%rsp)\n\t"  /* frame->syscall_cfa */
+                   "movw %cs,0x78(%rsp)\n\t"   /* frame->cs */
+                   "movw %ss,0x90(%rsp)\n\t"   /* frame->ss */
+                   "movq 0x378(%r13),%r14\n\t" /* thread_data->syscall_frame */
+                   "movq %r14,0xa0(%rsp)\n\t"  /* frame->prev_frame */
+                   "movq %rsp,0x378(%r13)\n\t" /* thread_data->syscall_frame */
+                   "testl $1,0x380(%r13)\n\t"  /* thread_data->syscall_trace */
+                   "jz 1f\n\t"
+                   "movq %rdi,%r12\n\t"        /* user_rsp */
+                   "movl 0x2c(%r12),%edi\n\t"  /* id */
+                   "movq %rdi,-0x50(%rbp)\n\t"
+                   "movq %rcx,%r15\n\t"        /* func */
+                   "movq 0x20(%r12),%rsi\n\t"  /* args */
+                   "movl 0x28(%r12),%edx\n\t"  /* len */
+                   "call " __ASM_NAME("trace_usercall") "\n\t"
+                   "movq %r12,%rdi\n\t"        /* user_rsp */
+                   "movq %r15,%rcx\n"          /* func */
+                   /* Preserve the user stack while the title's public
+                    * sysarch helper uses this aligned kernel stack. */
+                   "1:\tmovq %rdi,%r15\n\t"    /* user_rsp */
+#ifdef __linux__
+                   "movw 0x338(%r13),%ax\n"    /* amd64_thread_data()->fs */
+                   "testw %ax,%ax\n\t"
+                   "jz 1f\n\t"
+                   "movw %ax,%fs\n"
+                   "1:\n\t"
+#elif defined __APPLE__
+                   "movq %rcx,%r10\n\t"
+                   "movq %r13,%rdi\n\t"
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t"  /* _thread_set_tsd_base */
+                   "syscall\n\t"
+                   "movq %r10,%rcx\n\t"
+#elif defined(__PROSPERO__)
+                   "cmpq $0,0x340(%r13)\n\t"   /* amd64_thread_data()->wow_fsbase */
+                   "jz 1f\n\t"
+                   "movq %rcx,%r12\n\t"        /* func; %r12 is cleared below */
+                   "leaq 0x340(%r13),%rsi\n\t"
+                   "movl $129,%edi\n\t"        /* AMD64_SET_FSBASE */
+                   PS5_SET_FSBASE_CALL
+                   "movq %r12,%rcx\n"
+                   "1:\n\t"
+#endif
+                   "movq 0x98(%r14),%rbp\n\t"  /* prev_frame->rbp */
+                   "ldmxcsr 0xd8(%r14)\n\t"    /* prev_frame->xsave.MxCsr */
+                   "movq %r15,%rsp\n\t"        /* switch to user stack */
+                   "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                   "movq (%r10),%r10\n\t"
+                   "test %r10,%r10\n\t"
+                   "jz 1f\n\t"
+                   "xchgq %rcx,%r10\n"
+                   "1:\n\t"
+                   "xor %rbx,%rbx\n\t"
+                   "xor %r12,%r12\n\t"
+                   "xor %r13,%r13\n\t"
+                   "xor %r14,%r14\n\t"
+                   "xor %r15,%r15\n\t"
+                   "jmpq *%rcx" )          /* func */
+
+
+/***********************************************************************
+ *           user_mode_callback_return
+ */
+extern void DECLSPEC_NORETURN user_mode_callback_return( void *ret_ptr, ULONG ret_len,
+                                                         NTSTATUS status, TEB *teb );
+__ASM_GLOBAL_FUNC( user_mode_callback_return,
+                   "movq 0x378(%rcx),%r10\n\t" /* thread_data->syscall_frame */
+                   "movq 0xa0(%r10),%r11\n\t"  /* frame->prev_frame */
+                   "movq %r11,0x378(%rcx)\n\t" /* syscall_frame = prev_frame */
+                   "movq 0xa8(%r10),%rbp\n\t"  /* frame->syscall_cfa */
+                   "subq $0x10,%rbp\n\t"
+                   __ASM_CFI(".cfi_def_cfa_register %rbp\n\t")
+                   __ASM_CFI(".cfi_rel_offset %rbx,-0x08\n\t")
+                   __ASM_CFI(".cfi_rel_offset %r12,-0x10\n\t")
+                   __ASM_CFI(".cfi_rel_offset %r13,-0x18\n\t")
+                   __ASM_CFI(".cfi_rel_offset %r14,-0x20\n\t")
+                   __ASM_CFI(".cfi_rel_offset %r15,-0x28\n\t")
+                   "movq -0x48(%rbp),%rax\n\t"
+                   "movq %rax,(%rcx)\n\t"      /* teb->Tib.ExceptionList */
+                   "movq -0x38(%rbp),%r10\n\t" /* ret_ptr */
+                   "movq -0x40(%rbp),%r11\n\t" /* ret_len */
+                   "movq %rdi,(%r10)\n\t"
+                   "movl %esi,(%r11)\n\t"
+                   "testl $1,0x380(%rcx)\n\t"  /* thread_data->syscall_trace */
+                   "jz 1f\n\t"
+                   "leaq -0x50(%rbp),%rsp\n\t"
+                   "movq %rdx,%r15\n\t"        /* status */
+                   "movq -0x50(%rbp),%rcx\n\t" /* id */
+                   "call " __ASM_NAME("trace_userret") "\n\t"
+                   "movq %r15,%rdx\n"
+                   "1:\tldmxcsr -0x30(%rbp)\n\t"
+                   "fnclex\n\t"
+                   "fldcw -0x2c(%rbp)\n\t"
+                   "movq -0x28(%rbp),%r15\n\t"
+                   __ASM_CFI(".cfi_same_value %r15\n\t")
+                   "movq -0x20(%rbp),%r14\n\t"
+                   __ASM_CFI(".cfi_same_value %r14\n\t")
+                   "movq -0x18(%rbp),%r13\n\t"
+                   __ASM_CFI(".cfi_same_value %r13\n\t")
+                   "movq -0x10(%rbp),%r12\n\t"
+                   __ASM_CFI(".cfi_same_value %r12\n\t")
+                   "movq -0x08(%rbp),%rbx\n\t"
+                   __ASM_CFI(".cfi_same_value %rbx\n\t")
+                   "leave\n"
+                   __ASM_CFI(".cfi_def_cfa %rsp,8\n\t")
+                   __ASM_CFI(".cfi_same_value %rbp\n\t")
+                   "movq %rdx,%rax\n\t"
+                   "retq" )
+
+
+/***********************************************************************
+ *           user_mode_abort_thread
+ */
+extern void DECLSPEC_NORETURN user_mode_abort_thread( NTSTATUS status, struct syscall_frame *frame );
+__ASM_GLOBAL_FUNC( user_mode_abort_thread,
+                   "movq 0xa8(%rsi),%rbp\n\t"  /* frame->syscall_cfa */
+                   "subq $0x10,%rbp\n\t"
+                   /* switch to kernel stack */
+                   "movq %rbp,%rsp\n\t"
+                   __ASM_CFI(".cfi_def_cfa %rbp,0x10\n\t")
+                   __ASM_CFI(".cfi_offset %rip,-0x08\n\t")
+                   __ASM_CFI(".cfi_offset %rbp,-0x10\n\t")
+                   __ASM_CFI(".cfi_offset %rbx,-0x18\n\t")
+                   __ASM_CFI(".cfi_offset %r12,-0x20\n\t")
+                   __ASM_CFI(".cfi_offset %r13,-0x28\n\t")
+                   __ASM_CFI(".cfi_offset %r14,-0x30\n\t")
+                   __ASM_CFI(".cfi_offset %r15,-0x38\n\t")
+                   "call " __ASM_NAME("abort_thread") )
+
+
+/***********************************************************************
+ *           KeUserModeCallback
+ */
+NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    ULONG64 rsp = (frame->rsp - offsetof( struct callback_stack_layout, args_data[len] )) & ~15;
+    struct callback_stack_layout *stack = (struct callback_stack_layout *)rsp;
+
+    if ((char *)ntdll_get_thread_data()->kernel_stack + min_kernel_stack > (char *)&frame)
+        return STATUS_STACK_OVERFLOW;
+
+    stack->args              = stack->args_data;
+    stack->len               = len;
+    stack->id                = id;
+    stack->machine_frame.rip = frame->rip;
+    stack->machine_frame.rsp = frame->rsp;
+    memcpy( stack->args_data, args, len );
+    return call_user_mode_callback( rsp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
+}
+
+
+/***********************************************************************
+ *           NtCallbackReturn  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
+{
+    if (!get_syscall_frame()->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
+    user_mode_callback_return( ret_ptr, ret_len, status, NtCurrentTeb() );
+}
+
+
+/***********************************************************************
+ *           is_privileged_instr
+ *
+ * Check if the fault location is a privileged instruction.
+ */
+static inline DWORD is_privileged_instr( CONTEXT *context )
+{
+    BYTE instr[16];
+    unsigned int i, prefix_count = 0;
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    for (i = 0; i < len; i++) switch (instr[i])
+    {
+    /* instruction prefixes */
+    case 0x2e:  /* %cs: */
+    case 0x36:  /* %ss: */
+    case 0x3e:  /* %ds: */
+    case 0x26:  /* %es: */
+    case 0x40:  /* rex */
+    case 0x41:  /* rex */
+    case 0x42:  /* rex */
+    case 0x43:  /* rex */
+    case 0x44:  /* rex */
+    case 0x45:  /* rex */
+    case 0x46:  /* rex */
+    case 0x47:  /* rex */
+    case 0x48:  /* rex */
+    case 0x49:  /* rex */
+    case 0x4a:  /* rex */
+    case 0x4b:  /* rex */
+    case 0x4c:  /* rex */
+    case 0x4d:  /* rex */
+    case 0x4e:  /* rex */
+    case 0x4f:  /* rex */
+    case 0x64:  /* %fs: */
+    case 0x65:  /* %gs: */
+    case 0x66:  /* opcode size */
+    case 0x67:  /* addr size */
+    case 0xf0:  /* lock */
+    case 0xf2:  /* repne */
+    case 0xf3:  /* repe */
+        if (++prefix_count >= 15) return EXCEPTION_ILLEGAL_INSTRUCTION;
+        continue;
+
+    case 0x0f: /* extended instruction */
+        if (i == len - 1) return 0;
+        switch (instr[i + 1])
+        {
+        case 0x06: /* clts */
+        case 0x08: /* invd */
+        case 0x09: /* wbinvd */
+        case 0x20: /* mov crX, reg */
+        case 0x21: /* mov drX, reg */
+        case 0x22: /* mov reg, crX */
+        case 0x23: /* mov reg drX */
+            return EXCEPTION_PRIV_INSTRUCTION;
+        }
+        return 0;
+    case 0x6c: /* insb (%dx) */
+    case 0x6d: /* insl (%dx) */
+    case 0x6e: /* outsb (%dx) */
+    case 0x6f: /* outsl (%dx) */
+    case 0xcd: /* int $xx */
+    case 0xe4: /* inb al,XX */
+    case 0xe5: /* in (e)ax,XX */
+    case 0xe6: /* outb XX,al */
+    case 0xe7: /* out XX,(e)ax */
+    case 0xec: /* inb (%dx),%al */
+    case 0xed: /* inl (%dx),%eax */
+    case 0xee: /* outb %al,(%dx) */
+    case 0xef: /* outl %eax,(%dx) */
+    case 0xf4: /* hlt */
+    case 0xfa: /* cli */
+    case 0xfb: /* sti */
+        return EXCEPTION_PRIV_INSTRUCTION;
+    default:
+        return 0;
+    }
+    return 0;
+}
+
+#ifdef HAVE_SECCOMP
+static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
+    ucontext_t *ucontext = init_handler( sigcontext );
+    struct syscall_frame *frame = get_syscall_frame();
+
+    TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
+
+    if (RAX_sig(ucontext) == 0xffff)
+    {
+        /* Test syscall from the Unix side (install_bpf). */
+        RAX_sig(ucontext) = STATUS_INVALID_PARAMETER;
+        return;
+    }
+
+    frame->rip = RIP_sig(ucontext) + 0xb;
+    frame->rcx = RIP_sig(ucontext);
+    frame->eflags = EFL_sig(ucontext);
+    frame->restore_flags = 0;
+    if (instrumentation_callback) frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION;
+    RCX_sig(ucontext) = (ULONG_PTR)frame;
+    R11_sig(ucontext) = frame->eflags;
+    if (EFL_sig(ucontext) & 0x100)
+    {
+        EFL_sig(ucontext) &= ~0x100;  /* clear single-step flag */
+        frame->restore_flags |= CONTEXT_CONTROL;
+    }
+    RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
+}
+#endif
+
+#ifdef HAVE_SECCOMP
+static int sc_seccomp(unsigned int operation, unsigned int flags, void *args)
+{
+#ifndef __NR_seccomp
+#   define __NR_seccomp 317
+#endif
+    return syscall(__NR_seccomp, operation, flags, args);
+}
+#endif
+
+static void check_bpf_jit_enable(void)
+{
+    char enabled;
+    int fd;
+
+    fd = open("/proc/sys/net/core/bpf_jit_enable", O_RDONLY);
+    if (fd == -1)
+    {
+        WARN_(seh)("Could not open /proc/sys/net/core/bpf_jit_enable.\n");
+        return;
+    }
+
+    if (read(fd, &enabled, sizeof(enabled)) == sizeof(enabled))
+    {
+        TRACE_(seh)("enabled %#x.\n", enabled);
+
+        if (enabled != '1')
+            ERR_(seh)("BPF JIT is not enabled in the kernel, enable it to reduce syscall emulation overhead.\n");
+    }
+    else
+    {
+        WARN_(seh)("Could not read /proc/sys/net/core/bpf_jit_enable.\n");
+    }
+    close(fd);
+}
+
+static void install_bpf(struct sigaction *sig_act)
+{
+#ifdef HAVE_SECCOMP
+#   ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+#       define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1UL << 2)
+#   endif
+
+#   ifndef SECCOMP_SET_MODE_FILTER
+#       define SECCOMP_SET_MODE_FILTER 1
+#   endif
+    static const BYTE syscall_trap_test[] =
+    {
+        0x48, 0x89, 0xf8,   /* mov %rdi, %rax */
+        0x0f, 0x05,         /* syscall */
+        0xc3,               /* retq */
+    };
+    static const unsigned int flags = SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+
+#define NATIVE_SYSCALL_ADDRESS_START 0x700000000000
+
+    static struct sock_filter filter[] =
+    {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        /* Native libs are loaded at high addresses. */
+        BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K, NATIVE_SYSCALL_ADDRESS_START >> 32, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Allow i386. */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP (BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* Allow wine64-preloader */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d400000, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x7d402000, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    long (*test_syscall)(long sc_number);
+    struct sock_fprog prog;
+    NTSTATUS status;
+
+    if ((ULONG_PTR)sc_seccomp < NATIVE_SYSCALL_ADDRESS_START
+            || (ULONG_PTR)syscall < NATIVE_SYSCALL_ADDRESS_START)
+    {
+        ERR_(seh)("Native libs are being loaded in low addresses, sc_seccomp %p, syscall %p, not installing seccomp.\n",
+                sc_seccomp, syscall);
+        ERR_(seh)("The known reasons are /proc/sys/vm/legacy_va_layout set to 1 or 'ulimit -s' being 'unlimited'.\n");
+        return;
+    }
+
+    sig_act->sa_sigaction = sigsys_handler;
+    memset(&prog, 0, sizeof(prog));
+
+    sigaction(SIGSYS, sig_act, NULL);
+
+    test_syscall = mmap((void *)0x600000000000, 0x1000, PROT_EXEC | PROT_READ | PROT_WRITE,
+            MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (test_syscall != (void *)0x600000000000)
+    {
+        int ret;
+
+        ERR("Could not allocate test syscall, falling back to seccomp presence check, test_syscall %p, errno %d.\n",
+                test_syscall, errno);
+        if (test_syscall != MAP_FAILED) munmap(test_syscall, 0x1000);
+
+        if ((ret = prctl(PR_GET_SECCOMP, 0, NULL, 0, 0)))
+        {
+            if (ret == 2)
+                TRACE_(seh)("Seccomp filters already installed.\n");
+            else
+                ERR_(seh)("Seccomp filters cannot be installed, ret %d, error %s.\n", ret, strerror(errno));
+            return;
+        }
+    }
+    else
+    {
+        memcpy(test_syscall, syscall_trap_test, sizeof(syscall_trap_test));
+        status = test_syscall(0xffff);
+        munmap(test_syscall, 0x1000);
+        if (status == STATUS_INVALID_PARAMETER)
+        {
+            TRACE_(seh)("Seccomp filters already installed.\n");
+            return;
+        }
+        if (status != -ENOSYS && (status != -1 || errno != ENOSYS))
+        {
+            ERR_(seh)("Unexpected status %#x, errno %d.\n", status, errno);
+            return;
+        }
+    }
+
+    TRACE_(seh)("Installing seccomp filters.\n");
+
+    prog.len = ARRAY_SIZE(filter);
+    prog.filter = filter;
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+    {
+        ERR_(seh)("prctl(PR_SET_NO_NEW_PRIVS, ...): %s.\n", strerror(errno));
+        return;
+    }
+    if (sc_seccomp(SECCOMP_SET_MODE_FILTER, flags, &prog))
+    {
+        ERR_(seh)("prctl(PR_SET_SECCOMP, ...): %s.\n", strerror(errno));
+        return;
+    }
+    check_bpf_jit_enable();
+#else
+    WARN_(seh)("Built without seccomp.\n");
+#endif
+}
+
+/***********************************************************************
+ *           handle_interrupt
+ *
+ * Handle an interrupt.
+ */
+static inline BOOL handle_interrupt( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, struct xcontext *xcontext )
+{
+    CONTEXT *context = &xcontext->c;
+
+    switch (ERROR_sig(sigcontext) >> 3)
+    {
+    case 0x29:
+        /* __fastfail: process state is corrupted */
+        rec->ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
+        rec->ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+        rec->NumberParameters = 1;
+        rec->ExceptionInformation[0] = context->Rcx;
+        NtRaiseException( rec, context, FALSE );
+        return TRUE;
+    case 0x2c:
+        rec->ExceptionCode = STATUS_ASSERTION_FAILURE;
+        break;
+    case 0x2d:
+        if (CS_sig(sigcontext) == cs64_sel)
+        {
+            switch (context->Rax)
+            {
+            case 1: /* BREAKPOINT_PRINT */
+            case 3: /* BREAKPOINT_LOAD_SYMBOLS */
+            case 4: /* BREAKPOINT_UNLOAD_SYMBOLS */
+            case 5: /* BREAKPOINT_COMMAND_STRING (>= Win2003) */
+                RIP_sig(sigcontext) += 3;
+                leave_handler( sigcontext );
+                return TRUE;
+            }
+        }
+        context->Rip += 3;
+        rec->ExceptionCode = EXCEPTION_BREAKPOINT;
+        rec->ExceptionAddress = (void *)context->Rip;
+        rec->NumberParameters = 1;
+        rec->ExceptionInformation[0] = context->Rax;
+        break;
+    default:
+        return FALSE;
+    }
+    setup_raise_exception( sigcontext, rec, xcontext );
+    return TRUE;
+}
+
+void dump_syscall_fault_return( struct syscall_frame *frame, DWORD exc_code, void *teb, void *syscall_dispatcher_return );
+
+__ASM_GLOBAL_FUNC( dump_syscall_fault_return,
+                   "movq %rdi,%rsp\n\t"
+                   "movq %rsi,%rax\n\t"
+                   "movq %rdx,%r13\n\t"
+                   "jmp *%rcx")
+
+
+static void dump_syscall_fault( CONTEXT *context, DWORD exc_code )
+{
+    extern const void *__wine_unix_call_dispatcher_end_ptr;
+    struct syscall_frame *frame = get_syscall_frame();
+    struct unwind_builtin_dll_params params;
+
+    __TRY
+    {
+        DISPATCHER_CONTEXT dispatch;
+
+        context->ContextFlags &= ~0x40;
+
+        dispatch.EstablisherFrame = context->Rsp;
+        dispatch.TargetIp         = 0;
+        dispatch.ContextRecord    = context;
+        dispatch.HistoryTable     = NULL;
+
+        params.type = UNW_FLAG_UHANDLER;
+        params.dispatch = &dispatch;
+        params.context = context;
+
+        while (1)
+        {
+            if (context->Rip >= (ULONG_PTR)__wine_syscall_dispatcher
+                && context->Rip <= (ULONG_PTR)__wine_syscall_dispatcher_return)
+            {
+                WINE_BACKTRACE_LOG( "__wine_syscall_dispatcher.\n" );
+                break;
+            }
+            if (context->Rip >= (ULONG_PTR)__wine_unix_call_dispatcher
+                && context->Rip <= (ULONG_PTR)__wine_unix_call_dispatcher_end_ptr)
+            {
+                WINE_BACKTRACE_LOG( "__wine_unix_call_dispatcher.\n" );
+                break;
+            }
+
+            if (unwind_builtin_dll( &params ))
+                break;
+        }
+    }
+    __EXCEPT
+    {
+        WINE_BACKTRACE_LOG( "Fault during unwind.\n" );
+    }
+    __ENDTRY
+
+    WINE_BACKTRACE_LOG( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, exc_code );
+    dump_syscall_fault_return( frame, exc_code, NtCurrentTeb(), __wine_syscall_dispatcher_return );
+}
+
+#pragma pack(push,1)
+union atl_thunk
+{
+    struct
+    {
+        UINT  movl;  /* movl this,4(%esp) */
+        UINT  this;
+        BYTE  jmp;   /* jmp func */
+        int   func;
+    } t1;
+    struct
+    {
+        BYTE  movl;  /* movl this,ecx */
+        UINT  this;
+        BYTE  jmp;   /* jmp func */
+        int   func;
+    } t2;
+    struct
+    {
+        BYTE  movl1; /* movl this,edx */
+        UINT  this;
+        BYTE  movl2; /* movl func,ecx */
+        UINT  func;
+        WORD  jmp;   /* jmp ecx */
+    } t3;
+    struct
+    {
+        BYTE  movl1; /* movl this,ecx */
+        UINT  this;
+        BYTE  movl2; /* movl func,eax */
+        UINT  func;
+        WORD  jmp;   /* jmp eax */
+    } t4;
+    struct
+    {
+        UINT  inst1; /* pop ecx
+                      * pop eax
+                      * push ecx
+                      * jmp 4(%eax) */
+        WORD  inst2;
+    } t5;
+};
+#pragma pack(pop)
+
+/**********************************************************************
+ *		check_atl_thunk
+ *
+ * Check if code destination is an ATL thunk, and emulate it if so.
+ */
+static BOOL check_atl_thunk( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
+{
+    const union atl_thunk *thunk = (const union atl_thunk *)rec->ExceptionInformation[1];
+    union atl_thunk thunk_copy;
+    SIZE_T thunk_len;
+
+    if (CS_sig(sigcontext) == cs64_sel) return FALSE;
+
+    thunk_len = virtual_uninterrupted_read_memory( thunk, &thunk_copy, sizeof(*thunk) );
+    if (!thunk_len) return FALSE;
+
+    if (thunk_len >= sizeof(thunk_copy.t1) &&
+        thunk_copy.t1.movl == 0x042444c7 &&
+        thunk_copy.t1.jmp == 0xe9)
+    {
+        if (!virtual_uninterrupted_write_memory( (DWORD *)context->Rsp + 1,
+                                                 &thunk_copy.t1.this, sizeof(DWORD) ))
+        {
+            RIP_sig(sigcontext) = (DWORD_PTR)(&thunk->t1.func + 1) + thunk_copy.t1.func;
+            TRACE( "emulating ATL thunk type 1 at %p, func=%p arg=%08x\n",
+                   thunk, (void *)RIP_sig(sigcontext), thunk_copy.t1.this );
+            goto done;
+        }
+    }
+    else if (thunk_len >= sizeof(thunk_copy.t2) &&
+             thunk_copy.t2.movl == 0xb9 &&
+             thunk_copy.t2.jmp == 0xe9)
+    {
+        RCX_sig(sigcontext) = thunk_copy.t2.this;
+        RIP_sig(sigcontext) = (DWORD_PTR)(&thunk->t2.func + 1) + thunk_copy.t2.func;
+        TRACE( "emulating ATL thunk type 2 at %p, func=%p ecx=%p\n", thunk,
+               (void *)RIP_sig(sigcontext), (void *)RCX_sig(sigcontext) );
+        goto done;
+    }
+    else if (thunk_len >= sizeof(thunk_copy.t3) &&
+             thunk_copy.t3.movl1 == 0xba &&
+             thunk_copy.t3.movl2 == 0xb9 &&
+             thunk_copy.t3.jmp == 0xe1ff)
+    {
+        RDX_sig(sigcontext) = thunk_copy.t3.this;
+        RCX_sig(sigcontext) = thunk_copy.t3.func;
+        RIP_sig(sigcontext) = thunk_copy.t3.func;
+        TRACE( "emulating ATL thunk type 3 at %p, func=%p ecx=%p edx=%p\n", thunk,
+               (void *)RIP_sig(sigcontext), (void *)RCX_sig(sigcontext), (void *)RDX_sig(sigcontext) );
+        goto done;
+    }
+    else if (thunk_len >= sizeof(thunk_copy.t4) &&
+             thunk_copy.t4.movl1 == 0xb9 &&
+             thunk_copy.t4.movl2 == 0xb8 &&
+             thunk_copy.t4.jmp == 0xe0ff)
+    {
+        RCX_sig(sigcontext) = thunk_copy.t4.this;
+        RAX_sig(sigcontext) = thunk_copy.t4.func;
+        RIP_sig(sigcontext) = thunk_copy.t4.func;
+        TRACE( "emulating ATL thunk type 4 at %p, func=%p eax=%p ecx=%p\n", thunk,
+               (void *)RIP_sig(sigcontext), (void *)RAX_sig(sigcontext), (void *)RCX_sig(sigcontext) );
+        goto done;
+    }
+    else if (thunk_len >= sizeof(thunk_copy.t5) &&
+             thunk_copy.t5.inst1 == 0xff515859 &&
+             thunk_copy.t5.inst2 == 0x0460)
+    {
+        DWORD func, sp[2];
+        if (virtual_uninterrupted_read_memory( (DWORD *)context->Rsp, sp, sizeof(sp) ) == sizeof(sp) &&
+            virtual_uninterrupted_read_memory( (DWORD *)(ULONG_PTR)sp[1] + 1, &func, sizeof(DWORD) ) == sizeof(DWORD) &&
+            !virtual_uninterrupted_write_memory( (DWORD *)context->Rsp + 1, &sp[0], sizeof(sp[0]) ))
+        {
+            RCX_sig(sigcontext) = sp[0];
+            RAX_sig(sigcontext) = sp[1];
+            RSP_sig(sigcontext) += sizeof(DWORD);
+            RIP_sig(sigcontext) = func;
+            TRACE( "emulating ATL thunk type 5 at %p, func=%p eax=%p ecx=%p esp=%p\n",
+                   thunk, (void *)RIP_sig(sigcontext), (void *)RAX_sig(sigcontext),
+                   (void *)RCX_sig(sigcontext), (void *)RSP_sig(sigcontext) );
+            goto done;
+        }
+    }
+    return FALSE;
+
+ done:
+    leave_handler( sigcontext );
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           handle_syscall_fault
+ *
+ * Handle a page fault during a system call, or a guarded PS5 title Unix copy.
+ */
+static BOOL handle_syscall_fault( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    DWORD i;
+
+#ifdef __PROSPERO__
+    /* A SIGURG diagnostic can interrupt an unrelated syscall fault guard.
+     * Only jump to a guard established on this signal stack; jumping to the
+     * interrupted syscall's guard would abandon the diagnostic's locks. */
+    if (__wine_ps5_is_title() && !is_inside_syscall( RSP_sig(sigcontext) ) &&
+        ntdll_get_thread_data()->jmp_buf && ntdll_get_thread_data()->jmp_stack &&
+        wine_ps5_title_use_signal_fault_guard(
+            is_inside_signal_stack( (void *)RSP_sig(sigcontext) ),
+            is_inside_signal_stack( ntdll_get_thread_data()->jmp_stack ) ))
+    {
+        TRACE_(seh)( "returning to title signal-stack fault guard\n" );
+        RDI_sig(sigcontext) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+        RSI_sig(sigcontext) = 1;
+        RIP_sig(sigcontext) = (ULONG_PTR)longjmp;
+        ntdll_get_thread_data()->jmp_buf = NULL;
+        ntdll_get_thread_data()->jmp_stack = NULL;
+        return TRUE;
+    }
+#endif
+    if (!is_inside_syscall( RSP_sig(sigcontext) )) return FALSE;
+
+    TRACE_(seh)( "code=%x flags=%x addr=%p ip=%lx tid=%04x\n",
+                 rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
+                 context->Rip, GetCurrentThreadId() );
+    for (i = 0; i < rec->NumberParameters; i++)
+        TRACE_(seh)( " info[%d]=%016lx\n", i, rec->ExceptionInformation[i] );
+    TRACE_(seh)( " rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+                 context->Rax, context->Rbx, context->Rcx, context->Rdx );
+    TRACE_(seh)( " rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+                 context->Rsi, context->Rdi, context->Rbp, context->Rsp );
+    TRACE_(seh)( "  r8=%016lx  r9=%016lx r10=%016lx r11=%016lx\n",
+                 context->R8, context->R9, context->R10, context->R11 );
+    TRACE_(seh)( " r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+                 context->R12, context->R13, context->R14, context->R15 );
+
+    if (terminate_process_running)
+    {
+        FIXME_(seh)( "Process is terminating, aborting.\n" );
+        abort_process( terminate_process_exit_code );
+    }
+
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION
+            && is_inside_syscall_stack_guard( (char *)rec->ExceptionInformation[1] ))
+        ERR_(seh)( "Syscall stack overrun.\n ");
+
+    if (ntdll_get_thread_data()->jmp_buf)
+    {
+        TRACE_(seh)( "returning to handler\n" );
+        RDI_sig(sigcontext) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+        RSI_sig(sigcontext) = 1;
+        RIP_sig(sigcontext) = (ULONG_PTR)longjmp;
+        ntdll_get_thread_data()->jmp_buf = NULL;
+#ifdef __PROSPERO__
+        ntdll_get_thread_data()->jmp_stack = NULL;
+        ntdll_get_thread_data()->read_sample = NULL; /* A fault guard can abandon a profiled read scope. */
+        ntdll_get_thread_data()->wait_scope = NULL;
+        ntdll_get_thread_data()->wait_block_started = 0;
+        ntdll_get_thread_data()->map_sample = NULL;
+#endif
+    }
+    else
+    {
+        const char *kernel_stack = ntdll_get_thread_data()->kernel_stack;
+        char *stack = (char *)RSP_sig(sigcontext);
+
+#ifdef __PROSPERO__
+        ntdll_get_thread_data()->read_sample = NULL; /* Direct syscall-fault return abandons its stack. */
+        ntdll_get_thread_data()->wait_scope = NULL;
+        ntdll_get_thread_data()->wait_block_started = 0;
+        ntdll_get_thread_data()->map_sample = NULL;
+        if (__wine_ps5_is_title()) virtual_restore_title_mutex_depth( 0, "syscall-fault-return" );
+#endif
+
+        WINE_BACKTRACE_LOG( "--- Exception %#x at %s.\n", rec->ExceptionCode,
+                            wine_debuginfostr_pc( rec->ExceptionAddress ));
+
+        if (!process_exiting && WINE_BACKTRACE_LOG_ON() && stack > kernel_stack + kernel_stack_guard_size + 4096)
+        {
+            stack = (char *)((ULONG_PTR)stack & ~(ULONG_PTR)15);
+            stack -= sizeof(*context);
+            RDI_sig(sigcontext) = (ULONG_PTR)stack;
+            RSI_sig(sigcontext) = rec->ExceptionCode;
+            memcpy( stack, context, sizeof(*context) );
+            stack -= 0x28;
+            RIP_sig(sigcontext) = (ULONG_PTR)dump_syscall_fault;
+            RSP_sig(sigcontext) = (ULONG_PTR)stack;
+            return TRUE;
+        }
+
+        TRACE_(seh)( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, rec->ExceptionCode );
+        RAX_sig(sigcontext) = rec->ExceptionCode;
+        R13_sig(sigcontext) = (ULONG_PTR)NtCurrentTeb();
+        RSP_sig(sigcontext) = (ULONG_PTR)frame;
+        RIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return;
+    }
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           handle_syscall_trap
+ *
+ * Handle a trap exception during a system call.
+ */
+static BOOL handle_syscall_trap( ucontext_t *sigcontext, siginfo_t *siginfo )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+
+    /* disallow single-stepping through a syscall */
+
+    if ((void *)RIP_sig( sigcontext ) == __wine_syscall_dispatcher
+        || (void *)RIP_sig( sigcontext ) == __wine_syscall_dispatcher_instrumentation)
+    {
+        extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
+
+        RIP_sig( sigcontext ) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
+    }
+    else if ((void *)RIP_sig( sigcontext ) == __wine_unix_call_dispatcher)
+    {
+        extern const void *__wine_unix_call_dispatcher_prolog_end_ptr;
+
+        RIP_sig( sigcontext ) = (ULONG64)__wine_unix_call_dispatcher_prolog_end_ptr;
+        R10_sig( sigcontext ) = RCX_sig( sigcontext );
+        fixup_frame_fpu_state( frame, sigcontext );
+    }
+    else if (siginfo->si_code == 4 /* TRAP_HWBKPT */ && is_inside_syscall( RSP_sig(sigcontext) ))
+    {
+        TRACE_(seh)( "ignoring HWBKPT in syscall rip=%p\n", (void *)RIP_sig(sigcontext) );
+        return TRUE;
+    }
+    else return FALSE;
+
+    TRACE_(seh)( "ignoring trap in syscall rip=%p eflags=%08x\n",
+                 (void *)RIP_sig(sigcontext), (ULONG)EFL_sig(sigcontext) );
+
+    frame->rip = *(ULONG64 *)RSP_sig( sigcontext );
+    frame->eflags = EFL_sig(sigcontext);
+    frame->restore_flags = CONTEXT_CONTROL;
+    if (instrumentation_callback) frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION;
+
+    RCX_sig( sigcontext ) = (ULONG64)frame;
+    RSP_sig( sigcontext ) += sizeof(ULONG64);
+    EFL_sig( sigcontext ) &= ~0x100;  /* clear single-step flag */
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           check_invalid_gsbase
+ *
+ * Check for fault caused by invalid %gs value (some copy protection schemes mess with it).
+ */
+static inline BOOL check_invalid_gsbase( ucontext_t *ucontext )
+{
+    extern const void *__wine_syscall_dispatcher_gs_load_ptr;
+    extern const void *__wine_unix_call_dispatcher_gs_load_ptr;
+
+    const void *rip = (void *)RIP_sig(ucontext);
+    BYTE instr[16];
+    unsigned int i, len, prefix_count = 0;
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR cur_gsbase = 0;
+
+    if (CS_sig(ucontext) != cs64_sel) return FALSE;
+
+#ifdef __linux__
+    if (user_shared_data->ProcessorFeatures[PF_RDWRFSGSBASE_AVAILABLE])
+        __asm__("rdgsbase %0" : "=r" (cur_gsbase));
+    else
+        arch_prctl( ARCH_GET_GS, &cur_gsbase );
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    sysarch( AMD64_GET_GSBASE, &cur_gsbase );
+#elif defined(__NetBSD__)
+    sysarch( X86_64_GET_GSBASE, &cur_gsbase );
+#elif defined(__APPLE__)
+    /* init_handler() has already reset GSBASE, we can't determine what it was before the signal */
+#endif
+
+    if (cur_gsbase == (ULONG_PTR)teb) return FALSE;
+
+    if (rip != __wine_syscall_dispatcher_gs_load_ptr && rip != __wine_unix_call_dispatcher_gs_load_ptr)
+    {
+        len = virtual_uninterrupted_read_memory( rip, instr, sizeof(instr) );
+        if (!len) return FALSE;
+
+        for (i = 0; i < len; i++)
+        {
+            switch (instr[i])
+            {
+            /* instruction prefixes */
+            case 0x2e:  /* %cs: */
+            case 0x36:  /* %ss: */
+            case 0x3e:  /* %ds: */
+            case 0x26:  /* %es: */
+            case 0x40:  /* rex */
+            case 0x41:  /* rex */
+            case 0x42:  /* rex */
+            case 0x43:  /* rex */
+            case 0x44:  /* rex */
+            case 0x45:  /* rex */
+            case 0x46:  /* rex */
+            case 0x47:  /* rex */
+            case 0x48:  /* rex */
+            case 0x49:  /* rex */
+            case 0x4a:  /* rex */
+            case 0x4b:  /* rex */
+            case 0x4c:  /* rex */
+            case 0x4d:  /* rex */
+            case 0x4e:  /* rex */
+            case 0x4f:  /* rex */
+            case 0x64:  /* %fs: */
+            case 0x66:  /* opcode size */
+            case 0x67:  /* addr size */
+            case 0xf0:  /* lock */
+            case 0xf2:  /* repne */
+            case 0xf3:  /* repe */
+                if (++prefix_count >= 15) return FALSE;
+                continue;
+            case 0x65:  /* %gs: */
+                break;
+            default:
+                return FALSE;
+            }
+            break;
+        }
+    }
+
+    TRACE( "gsbase %016lx teb %p at instr %p, fixing up\n", cur_gsbase, teb, instr );
+
+#ifdef __linux__
+    arch_prctl( ARCH_SET_GS, teb );
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    sysarch( AMD64_SET_GSBASE, &teb );
+#elif defined(__NetBSD__)
+    sysarch( X86_64_SET_GSBASE, &teb );
+#elif defined(__APPLE__)
+    /* leave_handler() will set GSBASE to the TEB */
+#endif
+    return TRUE;
+}
+
+
+/**********************************************************************
+ *		segv_handler
+ *
+ * Handler for SIGSEGV and related errors.
+ */
+static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext;
+    EXCEPTION_RECORD rec = { 0 };
+    struct xcontext context;
+    void *steamclient_addr = NULL;
+#ifdef __PROSPERO__
+    DWORD trace_raw = 0, trace_live = 0;
+
+    /* Capture before init_handler or any imported helper can change live FP state. */
+    if (ps5_mxcsr_trace_enabled)
+    {
+        __asm__ volatile( "stmxcsr %0" : "=m" (trace_live) :: "memory" );
+        trace_raw = ((volatile XSAVE_FORMAT *)FPU_sig((ucontext_t *)sigcontext))->MxCsr;
+    }
+#endif
+    ucontext = init_handler( sigcontext );
+
+    rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+    save_context( &context, ucontext );
+#ifdef __PROSPERO__
+    if (ps5_mxcsr_trace_enabled)
+    {
+        context.mxcsr_context = context.c.MxCsr;
+        context.mxcsr_flt = context.c.FltSave.MxCsr;
+        context.mxcsr_raw = trace_raw;
+        context.mxcsr_live = trace_live;
+        context.mxcsr_trace = TRUE;
+    }
+#endif
+
+    switch(TRAP_sig(ucontext))
+    {
+    case TRAP_x86_OFLOW:   /* Overflow exception */
+        rec.ExceptionCode = EXCEPTION_INT_OVERFLOW;
+        break;
+    case TRAP_x86_BOUND:   /* Bound range exception */
+        rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+        break;
+    case TRAP_x86_PRIVINFLT:   /* Invalid opcode exception */
+        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    case TRAP_x86_STKFLT:  /* Stack fault */
+        rec.ExceptionCode = EXCEPTION_STACK_OVERFLOW;
+        break;
+    case TRAP_x86_SEGNPFLT:  /* Segment not present exception */
+    case TRAP_x86_PROTFLT:   /* General protection fault */
+        {
+            WORD err = ERROR_sig(ucontext);
+            if (!err && (rec.ExceptionCode = is_privileged_instr( &context.c ))) break;
+            if ((err & 7) == 2 && handle_interrupt( ucontext, &rec, &context )) return;
+            rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+            rec.NumberParameters = 2;
+            rec.ExceptionInformation[0] = 0;
+            /* if error contains a LDT selector, use that as fault address */
+            if ((err & 7) == 4) rec.ExceptionInformation[1] = err & ~7;
+            else rec.ExceptionInformation[1] = 0xffffffffffffffff;
+        }
+        break;
+    case TRAP_x86_PAGEFLT:  /* Page fault */
+        if ((steamclient_addr = steamclient_handle_fault( siginfo->si_addr, (ERROR_sig(ucontext) >> 1) & 0x09 )))
+        {
+            RIP_sig(ucontext) = (intptr_t)steamclient_addr;
+            leave_handler( ucontext );
+            return;
+        }
+
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = (ERROR_sig(ucontext) >> 1) & 0x09;
+        rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+        if (!virtual_handle_fault( &rec, (void *)RSP_sig(ucontext) ) || check_invalid_gsbase( ucontext ))
+        {
+            leave_handler( ucontext );
+            return;
+        }
+        if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT)
+        {
+            ULONG flags;
+            NtQueryInformationProcess( GetCurrentProcess(), ProcessExecuteFlags,
+                                       &flags, sizeof(flags), NULL );
+            /* send EXCEPTION_EXECUTE_FAULT only if data execution prevention is enabled */
+            if (!(flags & MEM_EXECUTE_OPTION_DISABLE)) rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+            if (!(flags & MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION) &&
+                check_atl_thunk( ucontext, &rec, &context.c ))
+                return;
+        }
+        break;
+    case TRAP_x86_ALIGNFLT:  /* Alignment check exception */
+        if (EFL_sig(ucontext) & 0x00040000)
+        {
+            EFL_sig(ucontext) &= ~0x00040000;  /* reset AC flag */
+            leave_handler( ucontext );
+            return;
+        }
+        rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
+        break;
+    default:
+        ERR_(seh)( "Got unexpected trap %ld\n", (ULONG_PTR)TRAP_sig(ucontext) );
+        /* fall through */
+    case TRAP_x86_NMI:       /* NMI interrupt */
+    case TRAP_x86_DNA:       /* Device not available exception */
+    case TRAP_x86_DOUBLEFLT: /* Double fault exception */
+    case TRAP_x86_TSSFLT:    /* Invalid TSS exception */
+    case TRAP_x86_MCHK:      /* Machine check exception */
+    case TRAP_x86_CACHEFLT:  /* Cache flush exception */
+        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    }
+#ifdef __PROSPERO__
+    /* A host page was executable while one of its Windows pages was sealed.
+     * Encrypted bytes may have changed registers before they trapped, so keep
+     * the complete interrupted context in klog before asking Windows to open
+     * the page. This marker must disappear when temporary data openings stay
+     * non-executable. */
+    if (!is_inside_syscall( RSP_sig(ucontext) ) &&
+        !(rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters == 2 &&
+          rec.ExceptionInformation[1] == RIP_sig(ucontext)) &&
+        virtual_is_sealed_page( (void *)RIP_sig(ucontext) ))
+    {
+        ERR_(seh)( "running in the inaccessible page at %p (%x): reported as an execute fault\n",
+                   (void *)RIP_sig(ucontext), (int)rec.ExceptionCode );
+        ERR_(seh)( "title xo diagnostic=sealed-context rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+                   context.c.Rax, context.c.Rbx, context.c.Rcx, context.c.Rdx );
+        ERR_(seh)( "title xo diagnostic=sealed-context rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+                   context.c.Rsi, context.c.Rdi, context.c.Rbp, context.c.Rsp );
+        ERR_(seh)( "title xo diagnostic=sealed-context r8=%016lx r9=%016lx r10=%016lx r11=%016lx\n",
+                   context.c.R8, context.c.R9, context.c.R10, context.c.R11 );
+        ERR_(seh)( "title xo diagnostic=sealed-context r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+                   context.c.R12, context.c.R13, context.c.R14, context.c.R15 );
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+        rec.ExceptionInformation[1] = RIP_sig(ucontext);
+    }
+#endif
+    if (handle_syscall_fault( ucontext, &rec, &context.c ))
+    {
+        leave_handler( ucontext );
+        return;
+    }
+#ifdef __PROSPERO__
+    if (__wine_ps5_is_title()) virtual_restore_title_mutex_depth( 0, "exception-dispatch" );
+#endif
+    setup_raise_exception( ucontext, &rec, &context );
+}
+
+
+/**********************************************************************
+ *		trap_handler
+ *
+ * Handler for SIGTRAP.
+ */
+static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+    EXCEPTION_RECORD rec = { 0 };
+    struct xcontext context;
+
+    if (handle_syscall_trap( ucontext, siginfo ))
+    {
+        leave_handler( ucontext );
+        return;
+    }
+
+    rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+    save_context( &context, ucontext );
+
+    switch (TRAP_sig(ucontext))
+    {
+    case TRAP_x86_TRCTRAP:
+        rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        break;
+    case TRAP_x86_BPTFLT:
+        rec.ExceptionAddress = (char *)rec.ExceptionAddress - 1;  /* back up over the int3 instruction */
+        /* fall through */
+    default:
+        rec.ExceptionCode = EXCEPTION_BREAKPOINT;
+        rec.NumberParameters = 1;
+        rec.ExceptionInformation[0] = 0;
+        break;
+    }
+    setup_raise_exception( ucontext, &rec, &context );
+}
+
+
+/**********************************************************************
+ *		fpe_handler
+ *
+ * Handler for SIGFPE.
+ */
+static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+    EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(ucontext) };
+    struct xcontext context;
+
+    save_context( &context, sigcontext );
+
+    switch (siginfo->si_code)
+    {
+    case FPE_FLTSUB:
+        rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+        break;
+    case FPE_INTDIV:
+        rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
+        break;
+    case FPE_INTOVF:
+        rec.ExceptionCode = EXCEPTION_INT_OVERFLOW;
+        break;
+    case FPE_FLTDIV:
+        rec.ExceptionCode = EXCEPTION_FLT_DIVIDE_BY_ZERO;
+        break;
+    case FPE_FLTOVF:
+        rec.ExceptionCode = EXCEPTION_FLT_OVERFLOW;
+        break;
+    case FPE_FLTUND:
+        rec.ExceptionCode = EXCEPTION_FLT_UNDERFLOW;
+        break;
+    case FPE_FLTRES:
+        rec.ExceptionCode = EXCEPTION_FLT_INEXACT_RESULT;
+        break;
+    case FPE_FLTINV:
+    default:
+        if (context.c.FltSave.StatusWord & 0x40)
+            rec.ExceptionCode = EXCEPTION_FLT_STACK_CHECK;
+        else
+            rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
+        break;
+    }
+
+    if (TRAP_sig(ucontext) == TRAP_x86_CACHEFLT)
+    {
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = 0;
+        rec.ExceptionInformation[1] = context.c.FltSave.MxCsr;
+        if (CS_sig(ucontext) != cs64_sel) rec.ExceptionCode = STATUS_FLOAT_MULTIPLE_TRAPS;
+    }
+    setup_raise_exception( sigcontext, &rec, &context );
+}
+
+
+/**********************************************************************
+ *		int_handler
+ *
+ * Handler for SIGINT.
+ */
+static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+    HANDLE handle;
+
+    if (p__wine_ctrl_routine)
+    {
+        if (!NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
+                               p__wine_ctrl_routine, 0 /* CTRL_C_EVENT */, 0, 0, 0, 0, NULL ))
+            NtClose( handle );
+    }
+    leave_handler( ucontext );
+}
+
+
+/**********************************************************************
+ *		abrt_handler
+ *
+ * Handler for SIGABRT.
+ */
+static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+    EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
+
+    setup_exception( ucontext, &rec );
+}
+
+
+/**********************************************************************
+ *		quit_handler
+ *
+ * Handler for SIGQUIT.
+ */
+static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+
+    if (!is_inside_syscall( RSP_sig(ucontext) )) user_mode_abort_thread( 0, get_syscall_frame() );
+    abort_thread( 0 );
+}
+
+
+#ifdef WINE_PS5_TITLE
+static void title_store_suspend_registers( struct wine_ps5_suspend_diagnostic *diagnostic,
+                                           const CONTEXT *context )
+{
+    diagnostic->user_regs.rax = context->Rax;
+    diagnostic->user_regs.rbx = context->Rbx;
+    diagnostic->user_regs.rcx = context->Rcx;
+    diagnostic->user_regs.rdx = context->Rdx;
+    diagnostic->user_regs.rsi = context->Rsi;
+    diagnostic->user_regs.rdi = context->Rdi;
+    diagnostic->user_regs.r8  = context->R8;
+    diagnostic->user_regs.r9  = context->R9;
+    diagnostic->user_regs.r10 = context->R10;
+    diagnostic->user_regs.r11 = context->R11;
+    diagnostic->user_regs.r12 = context->R12;
+    diagnostic->user_regs.r13 = context->R13;
+    diagnostic->user_regs.r14 = context->R14;
+    diagnostic->user_regs.r15 = context->R15;
+    diagnostic->user_regs.rbp = context->Rbp;
+}
+#endif
+
+/**********************************************************************
+ *		usr1_handler
+ *
+ * Handler for SIGUSR1, used to signal a thread that it got suspended.
+ */
+static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *ucontext = init_handler( sigcontext );
+    BOOL inside_syscall = is_inside_syscall( RSP_sig(ucontext) );
+#ifdef WINE_PS5_TITLE
+    struct wine_ps5_suspend_diagnostic *diagnostic = &ntdll_get_thread_data()->suspend_diagnostic;
+
+    diagnostic->native_rip = RIP_sig(ucontext);
+    diagnostic->native_rsp = RSP_sig(ucontext);
+    diagnostic->inside_syscall = inside_syscall;
+#endif
+
+    if (inside_syscall)
+    {
+        struct syscall_frame *frame = get_syscall_frame();
+        ULONG64 saved_compaction = 0;
+        I386_CONTEXT *wow_context;
+        struct xcontext *context;
+
+        context = (struct xcontext *)(((ULONG_PTR)RSP_sig(ucontext) - 128 /* red zone */ - sizeof(*context)) & ~15);
+        if ((char *)context < (char *)ntdll_get_thread_data()->kernel_stack)
+        {
+            ERR_(seh)( "kernel stack overflow.\n" );
+            leave_handler( ucontext );
+            return;
+        }
+        context->c.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS | CONTEXT_EXCEPTION_REQUEST;
+        if (frame->restore_flags & RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT)
+        {
+            frame->restore_flags &= ~RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT;
+            frame->eflags = 0x200;
+            fixup_frame_fpu_state( frame, ucontext );
+        }
+        NtGetContextThread( GetCurrentThread(), &context->c );
+        if (xstate_extended_features)
+        {
+            if (user_shared_data->XState.CompactionEnabled)
+                frame->xstate.CompactionMask |= xstate_extended_features;
+            context_init_xstate( &context->c, &frame->xstate );
+            saved_compaction = frame->xstate.CompactionMask;
+        }
+#ifdef WINE_PS5_TITLE
+        diagnostic->user_rip = context->c.Rip;
+        diagnostic->user_rsp = context->c.Rsp;
+        title_store_suspend_registers( diagnostic, &context->c );
+        __atomic_store_n( &diagnostic->waiting, 1, __ATOMIC_RELEASE );
+#endif
+        wait_suspend( &context->c );
+#ifdef WINE_PS5_TITLE
+        __atomic_store_n( &diagnostic->waiting, 0, __ATOMIC_RELEASE );
+#endif
+        if (xstate_extended_features) frame->xstate.CompactionMask = saved_compaction;
+        if (context->c.ContextFlags & 0x40)
+        {
+            /* xstate is updated directly in frame's xstate */
+            context->c.ContextFlags &= ~0x40;
+            frame->restore_flags |= 0x40;
+        }
+        if ((wow_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 ))
+             && (wow_context->ContextFlags & CONTEXT_I386_CONTROL) == CONTEXT_I386_CONTROL)
+        {
+            WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+
+            cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
+        }
+        NtSetContextThread( GetCurrentThread(), &context->c );
+    }
+    else
+    {
+        struct xcontext context;
+
+        save_context( &context, ucontext );
+        context.c.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
+        if (is_wow64() && context.c.SegCs == cs64_sel) context.c.ContextFlags |= CONTEXT_EXCEPTION_ACTIVE;
+#ifdef WINE_PS5_TITLE
+        diagnostic->user_rip = context.c.Rip;
+        diagnostic->user_rsp = context.c.Rsp;
+        title_store_suspend_registers( diagnostic, &context.c );
+        __atomic_store_n( &diagnostic->waiting, 1, __ATOMIC_RELEASE );
+#endif
+        wait_suspend( &context.c );
+#ifdef WINE_PS5_TITLE
+        __atomic_store_n( &diagnostic->waiting, 0, __ATOMIC_RELEASE );
+#endif
+        restore_context( &context, ucontext );
+    }
+    leave_handler( ucontext );
+}
+
+#ifdef WINE_PS5_TITLE
+static size_t title_hang_append( char *buffer, size_t size, size_t pos, const char *format, ... )
+{
+    va_list args;
+    int len;
+
+    if (pos >= size) return pos;
+    va_start( args, format );
+    len = vsnprintf( buffer + pos, size - pos, format, args );
+    va_end( args );
+    if (len < 0) return pos;
+    if ((size_t)len >= size - pos) return size - 1;
+    return pos + len;
+}
+
+static const char *title_hang_address_role( const struct ps5_title_stack_address *address )
+{
+    enum wine_ps5_hang_address_class class;
+
+    class = wine_ps5_hang_classify_address( address->pc, address->base, address->size,
+                                            address->module );
+    return wine_ps5_hang_address_class_name( class );
+}
+
+static void title_log_hang_stack( unsigned int tid, unsigned int snapshot, unsigned int epoch,
+                                  const struct ps5_title_stack_address *addresses,
+                                  unsigned int count )
+{
+    char line[2048];
+    unsigned int i;
+    size_t pos;
+
+    pos = title_hang_append( line, sizeof(line), 0,
+                             "title hang stack tid=%04x event=%u sample=%u/%u frames=%u callers=",
+                             tid, epoch, snapshot, wine_ps5_hang_sample_total( snapshot ), count );
+    if (!count) pos = title_hang_append( line, sizeof(line), pos, "unavailable" );
+    for (i = 0; i < count; i++)
+    {
+        if (addresses[i].base)
+            pos = title_hang_append( line, sizeof(line), pos, "%s%s:%s+%#lx",
+                                     i ? "," : "", title_hang_address_role( &addresses[i] ),
+                                     addresses[i].module,
+                                     (unsigned long)(addresses[i].pc - addresses[i].base) );
+        else
+            pos = title_hang_append( line, sizeof(line), pos, "%sunbacked+%#lx",
+                                     i ? "," : "", (unsigned long)addresses[i].pc );
+    }
+    title_hang_append( line, sizeof(line), pos, "\n" );
+    sceKernelDebugOutText( 0, line );
+}
+
+static void title_log_hang_code( unsigned int tid, unsigned int snapshot, unsigned int epoch,
+                                 ULONG_PTR rip )
+{
+    BYTE code[WINE_PS5_HANG_CODE_BYTES];
+    BYTE before[WINE_PS5_HANG_CODE_BEFORE_BYTES];
+    ULONG_PTR start = rip >= sizeof(before) ? rip - sizeof(before) : 0;
+    char line[320];
+    unsigned int i;
+    size_t pos;
+
+    pos = title_hang_append( line, sizeof(line), 0,
+                             "title hang code tid=%04x event=%u sample=%u/%u rip=%016lx bytes=",
+                             tid, epoch, snapshot, wine_ps5_hang_sample_total( snapshot ), rip );
+    if (!virtual_read_title_code( rip, code, sizeof(code) ))
+        pos = title_hang_append( line, sizeof(line), pos, "unavailable" );
+    else
+        for (i = 0; i < ARRAY_SIZE(code); i++)
+            pos = title_hang_append( line, sizeof(line), pos, "%02x", code[i] );
+    title_hang_append( line, sizeof(line), pos, "\n" );
+    sceKernelDebugOutText( 0, line );
+
+    pos = title_hang_append( line, sizeof(line), 0,
+                             "title hang code_before tid=%04x event=%u sample=%u/%u "
+                             "rip=%016lx start=%016lx bytes=",
+                             tid, epoch, snapshot, wine_ps5_hang_sample_total( snapshot ),
+                             rip, start );
+    if (!start || !virtual_read_title_code( start, before, sizeof(before) ))
+        pos = title_hang_append( line, sizeof(line), pos, "unavailable" );
+    else
+        for (i = 0; i < ARRAY_SIZE(before); i++)
+            pos = title_hang_append( line, sizeof(line), pos, "%02x", before[i] );
+    title_hang_append( line, sizeof(line), pos, "\n" );
+    sceKernelDebugOutText( 0, line );
+}
+
+static void title_capture_signal_registers( struct wine_ps5_hang_registers *registers,
+                                            const ucontext_t *ucontext )
+{
+    registers->rax = RAX_sig(ucontext);
+    registers->rbx = RBX_sig(ucontext);
+    registers->rcx = RCX_sig(ucontext);
+    registers->rdx = RDX_sig(ucontext);
+    registers->rsi = RSI_sig(ucontext);
+    registers->rdi = RDI_sig(ucontext);
+    registers->r8  = R8_sig(ucontext);
+    registers->r9  = R9_sig(ucontext);
+    registers->r10 = R10_sig(ucontext);
+    registers->r11 = R11_sig(ucontext);
+    registers->r12 = R12_sig(ucontext);
+    registers->r13 = R13_sig(ucontext);
+    registers->r14 = R14_sig(ucontext);
+    registers->r15 = R15_sig(ucontext);
+    registers->rbp = RBP_sig(ucontext);
+}
+
+static void title_load_suspend_registers( struct wine_ps5_hang_registers *registers,
+                                          const struct wine_ps5_suspend_diagnostic *diagnostic )
+{
+    registers->rax = diagnostic->user_regs.rax;
+    registers->rbx = diagnostic->user_regs.rbx;
+    registers->rcx = diagnostic->user_regs.rcx;
+    registers->rdx = diagnostic->user_regs.rdx;
+    registers->rsi = diagnostic->user_regs.rsi;
+    registers->rdi = diagnostic->user_regs.rdi;
+    registers->r8  = diagnostic->user_regs.r8;
+    registers->r9  = diagnostic->user_regs.r9;
+    registers->r10 = diagnostic->user_regs.r10;
+    registers->r11 = diagnostic->user_regs.r11;
+    registers->r12 = diagnostic->user_regs.r12;
+    registers->r13 = diagnostic->user_regs.r13;
+    registers->r14 = diagnostic->user_regs.r14;
+    registers->r15 = diagnostic->user_regs.r15;
+    registers->rbp = diagnostic->user_regs.rbp;
+}
+
+static void title_log_hang_registers( unsigned int tid, unsigned int snapshot,
+                                      const struct wine_ps5_hang_registers *registers,
+                                      BOOL full )
+{
+    static const char *const names[WINE_PS5_HANG_MEMORY_REGS] = { "rdx", "rdi", "r8" };
+    struct ps5_title_memory_region regions[WINE_PS5_HANG_MEMORY_REGS];
+    const ULONG_PTR addresses[WINE_PS5_HANG_MEMORY_REGS] =
+        { registers->rdx, registers->rdi, registers->r8 };
+    ULONG_PTR next;
+    unsigned int valid, i;
+    char line[512];
+
+    snprintf( line, sizeof(line),
+              "title hang regs tid=%04x sample=%u/%u "
+              "rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx "
+              "rsi=%016lx rdi=%016lx r8=%016lx r9=%016lx "
+              "r10=%016lx r11=%016lx r12=%016lx r13=%016lx "
+              "r14=%016lx r15=%016lx rbp=%016lx\n",
+              tid, snapshot, wine_ps5_hang_sample_total( snapshot ),
+              (ULONG_PTR)registers->rax, (ULONG_PTR)registers->rbx,
+              (ULONG_PTR)registers->rcx, (ULONG_PTR)registers->rdx,
+              (ULONG_PTR)registers->rsi, (ULONG_PTR)registers->rdi,
+              (ULONG_PTR)registers->r8, (ULONG_PTR)registers->r9,
+              (ULONG_PTR)registers->r10, (ULONG_PTR)registers->r11,
+              (ULONG_PTR)registers->r12, (ULONG_PTR)registers->r13,
+              (ULONG_PTR)registers->r14, (ULONG_PTR)registers->r15,
+              (ULONG_PTR)registers->rbp );
+    sceKernelDebugOutText( 0, line );
+
+    if (virtual_read_title_pointer_link( registers->r9, &next ))
+    {
+        snprintf( line, sizeof(line),
+                  "title hang chain tid=%04x sample=%u/%u reg=r9 addr=%016lx next=%016lx\n",
+                  tid, snapshot, wine_ps5_hang_sample_total( snapshot ),
+                  (ULONG_PTR)registers->r9, next );
+        sceKernelDebugOutText( 0, line );
+    }
+    if (!full) return;
+
+    valid = virtual_query_title_readable_regions( addresses, regions, ARRAY_SIZE(addresses) );
+    for (i = 0; i < ARRAY_SIZE(addresses); i++)
+    {
+        if (!(valid & (1u << i))) continue;
+        snprintf( line, sizeof(line),
+                  "title hang mem tid=%04x sample=%u/%u reg=%s addr=%016lx "
+                  "region_base=%016lx region_size=%#lx protect=%#lx\n",
+                  tid, snapshot, wine_ps5_hang_sample_total( snapshot ), names[i], addresses[i],
+                  regions[i].base, (ULONG_PTR)regions[i].size,
+                  (unsigned long)regions[i].protect );
+        sceKernelDebugOutText( 0, line );
+    }
+}
+
+static void title_record_profile_sample( struct ntdll_thread_data *data,
+                                         struct wine_ps5_suspend_diagnostic *diagnostic,
+                                         unsigned int generation, BOOL user_context,
+                                         ULONG_PTR user_rip, BOOL in_syscall,
+                                         unsigned int syscall_id, BOOL unix_call )
+{
+    const char *request = __atomic_load_n( &data->profile_request, __ATOMIC_ACQUIRE );
+    unsigned int request_id =
+        __atomic_load_n( &data->profile_request_id, __ATOMIC_RELAXED );
+    unsigned int waiting = __atomic_load_n( &data->profile_waiting, __ATOMIC_ACQUIRE );
+    struct ps5_title_stack_address address = {0};
+    unsigned int kind;
+    ULONG_PTR where = 0;
+    size_t i;
+    uint64_t cpu = 0, wall = 0;
+    int saved_errno = errno;
+    BOOL cpu_valid = ps5_title_profile_read_cpu( &cpu, &wall );
+
+    ps5_title_hitch_profile_tick( data, cpu_valid, cpu );
+    errno = saved_errno; /* The sample must not change the interrupted thread's errno. */
+
+    kind = wine_ps5_profile_classify( waiting, request || request_id, user_context, unix_call );
+    if (kind == WINE_PS5_PROFILE_UNIX_REQUEST)
+    {
+        where = request_id;
+        if (request)
+        {
+            for (i = 0; i + 1 < sizeof(address.module) && request[i]; i++)
+                address.module[i] = request[i];
+            address.module[i] = 0;
+        }
+    }
+    else if (kind == WINE_PS5_PROFILE_USER || kind == WINE_PS5_PROFILE_UNIX_CALL)
+    {
+        where = wine_ps5_profile_page( user_rip );
+        address.pc = user_rip;
+        virtual_resolve_title_pe_modules( &address, 1 );
+        if (!address.base &&
+            virtual_find_hang_module( user_rip, &address.base, address.module,
+                                      sizeof(address.module) ))
+            address.size = user_rip - address.base + 1;
+        if (kind == WINE_PS5_PROFILE_UNIX_CALL && address.base) where = address.base;
+    }
+    else if (kind == WINE_PS5_PROFILE_UNIX_SYSCALL)
+        where = in_syscall ? syscall_id : ~0u;
+    __atomic_store_n( &diagnostic->profile_kind, kind, __ATOMIC_RELAXED );
+    __atomic_store_n( &diagnostic->profile_where, where, __ATOMIC_RELAXED );
+    __atomic_store_n( &diagnostic->profile_module_base, address.base, __ATOMIC_RELAXED );
+    memcpy( diagnostic->profile_module, address.module, sizeof(diagnostic->profile_module) );
+    diagnostic->profile_cpu_ns = cpu;
+    diagnostic->profile_wall_ns = wall;
+    diagnostic->profile_cpu_valid = cpu_valid;
+    __atomic_store_n( &diagnostic->profile_completed, generation, __ATOMIC_RELEASE );
+}
+
+static void title_record_hang_position( struct wine_ps5_suspend_diagnostic *diagnostic,
+                                        unsigned int snapshot, unsigned int epoch,
+                                        ULONG_PTR rip, ULONG_PTR rsp,
+                                        const char **rip_state, const char **rsp_state )
+{
+    uint64_t rip_samples[WINE_PS5_HANG_SNAPSHOT_COUNT];
+    uint64_t rsp_samples[WINE_PS5_HANG_SNAPSHOT_COUNT];
+    uint32_t valid;
+    unsigned int i, index;
+
+    *rip_state = *rsp_state = snapshot && snapshot < WINE_PS5_HANG_SNAPSHOT_COUNT
+                              ? "collecting" : "unavailable";
+    if (!snapshot || snapshot > WINE_PS5_HANG_SNAPSHOT_COUNT) return;
+    if (epoch != __atomic_load_n( &diagnostic->hang_epoch, __ATOMIC_ACQUIRE )) return;
+    index = snapshot - 1;
+    __atomic_store_n( &diagnostic->hang_rip[index], rip, __ATOMIC_RELAXED );
+    __atomic_store_n( &diagnostic->hang_rsp[index], rsp, __ATOMIC_RELAXED );
+    if (epoch != __atomic_load_n( &diagnostic->hang_epoch, __ATOMIC_ACQUIRE )) return;
+    valid = __atomic_or_fetch( &diagnostic->hang_valid, 1u << index, __ATOMIC_RELEASE );
+    if (snapshot != WINE_PS5_HANG_SNAPSHOT_COUNT) return;
+    for (i = 0; i < WINE_PS5_HANG_SNAPSHOT_COUNT; i++)
+    {
+        rip_samples[i] = __atomic_load_n( &diagnostic->hang_rip[i], __ATOMIC_RELAXED );
+        rsp_samples[i] = __atomic_load_n( &diagnostic->hang_rsp[i], __ATOMIC_RELAXED );
+    }
+    *rip_state = wine_ps5_hang_position_class_name(
+        wine_ps5_hang_classify_position( rip_samples, valid ));
+    *rsp_state = wine_ps5_hang_position_class_name(
+        wine_ps5_hang_classify_position( rsp_samples, valid ));
+}
+
+static void hang_position_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    struct ps5_title_stack_address addresses[WINE_PS5_HANG_STACK_FRAMES + 1];
+    ucontext_t *ucontext = init_handler( sigcontext );
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    struct wine_ps5_suspend_diagnostic *diagnostic = &data->suspend_diagnostic;
+    unsigned int profile_generation =
+        __atomic_exchange_n( &diagnostic->profile_pending, 0, __ATOMIC_ACQ_REL );
+    BOOL hang_sample = !!__atomic_exchange_n( &diagnostic->hang_pending, 0, __ATOMIC_ACQ_REL );
+
+    if (!profile_generation && !hang_sample)
+    {
+        leave_handler( ucontext );
+        return;
+    }
+    unsigned int mutex_depth = virtual_title_mutex_depth();
+    struct syscall_frame *frame = get_syscall_frame();
+    BOOL in_syscall = is_inside_syscall( RSP_sig(ucontext) );
+    BOOL in_signal = is_inside_signal_stack( (void *)RSP_sig(ucontext) );
+    unsigned int suspend_wait = __atomic_load_n( &diagnostic->waiting, __ATOMIC_ACQUIRE );
+    BOOL user_context = !in_syscall && (!in_signal || (suspend_wait && diagnostic->user_rip));
+    struct wine_ps5_hang_registers registers;
+    ULONG_PTR user_rip, user_rsp, low, high;
+    unsigned int syscall_id = in_syscall ? frame->syscall_id : ~0u;
+    unsigned int snapshot = __atomic_load_n( &diagnostic->hang_snapshot, __ATOMIC_ACQUIRE );
+    BOOL primary = wine_ps5_hang_sample_is_primary( snapshot );
+    unsigned int epoch = __atomic_load_n( &diagnostic->hang_epoch, __ATOMIC_ACQUIRE );
+    unsigned int count = 0, resolved_count;
+    const char *rip_state, *rsp_state;
+    size_t slots;
+    char line[512];
+
+    if (in_syscall)
+    {
+        user_rip = frame->rip;
+        user_rsp = frame->rsp;
+    }
+    else if (in_signal && diagnostic->user_rip)
+    {
+        user_rip = diagnostic->user_rip;
+        user_rsp = diagnostic->user_rsp;
+    }
+    else
+    {
+        user_rip = RIP_sig(ucontext);
+        user_rsp = RSP_sig(ucontext);
+    }
+    if (profile_generation)
+        title_record_profile_sample( data, diagnostic, profile_generation, user_context,
+                                     user_rip, in_syscall, syscall_id,
+                                     wine_ps5_profile_is_unix_call(
+                                         in_syscall, frame->restore_flags ) );
+    if (!hang_sample) goto done;
+
+    if (user_context)
+    {
+        if (in_signal) title_load_suspend_registers( &registers, diagnostic );
+        else title_capture_signal_registers( &registers, ucontext );
+    }
+    if (!primary && !user_context) goto done;
+
+    addresses[0].pc = user_rip;
+    addresses[0].base = addresses[0].size = 0;
+    addresses[0].module[0] = 0;
+    low = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+    high = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
+    if (primary && !(user_rsp & (sizeof(ULONG_PTR) - 1)) &&
+        user_rsp >= low && user_rsp < high && high - user_rsp >= sizeof(ULONG_PTR))
+    {
+        slots = (high - user_rsp) / sizeof(ULONG_PTR);
+        if (slots > WINE_PS5_HANG_STACK_SLOTS) slots = WINE_PS5_HANG_STACK_SLOTS;
+        count = virtual_find_title_stack_addresses( (const ULONG_PTR *)user_rsp, slots,
+                                                    addresses + 1,
+                                                    WINE_PS5_HANG_STACK_FRAMES );
+    }
+    resolved_count = count + 1;
+    virtual_resolve_title_pe_modules( addresses, resolved_count );
+    if (!addresses[0].base &&
+        virtual_find_hang_module( user_rip, &addresses[0].base, addresses[0].module,
+                                  sizeof(addresses[0].module) ))
+        addresses[0].size = user_rip - addresses[0].base + 1;
+
+    if (primary)
+        title_record_hang_position( diagnostic, snapshot, epoch, user_rip, user_rsp,
+                                    &rip_state, &rsp_state );
+    else
+        rip_state = rsp_state = "late";
+    if (addresses[0].base)
+        snprintf( line, sizeof(line),
+                  "title hang thread tid=%04x event=%u sample=%u/%u suspend_wait=%u unix=%u "
+                  "signal=%u syscall=%#x win_rip=%016lx module=%s:%s+%#lx win_rsp=%016lx "
+                  "rip_state=%s rsp_state=%s native_rip=%016lx native_rsp=%016lx\n",
+                  data->title_thread.id, epoch, snapshot,
+                  wine_ps5_hang_sample_total( snapshot ),
+                  suspend_wait, in_syscall, in_signal, syscall_id, user_rip,
+                  title_hang_address_role( &addresses[0] ), addresses[0].module,
+                  user_rip - addresses[0].base, user_rsp, rip_state, rsp_state,
+                  (ULONG_PTR)RIP_sig(ucontext), (ULONG_PTR)RSP_sig(ucontext) );
+    else
+        snprintf( line, sizeof(line),
+                  "title hang thread tid=%04x event=%u sample=%u/%u suspend_wait=%u unix=%u "
+                  "signal=%u syscall=%#x win_rip=%016lx module=unbacked+%#lx win_rsp=%016lx "
+                  "rip_state=%s rsp_state=%s native_rip=%016lx native_rsp=%016lx\n",
+                  data->title_thread.id, epoch, snapshot,
+                  wine_ps5_hang_sample_total( snapshot ),
+                  suspend_wait, in_syscall, in_signal, syscall_id, user_rip, user_rip,
+                  user_rsp, rip_state, rsp_state,
+                  (ULONG_PTR)RIP_sig(ucontext), (ULONG_PTR)RSP_sig(ucontext) );
+    sceKernelDebugOutText( 0, line );
+    if (primary)
+        title_log_hang_stack( data->title_thread.id, snapshot, epoch, addresses + 1, count );
+    if (user_context)
+    {
+        if (primary) title_log_hang_code( data->title_thread.id, snapshot, epoch, user_rip );
+        title_log_hang_registers( data->title_thread.id, snapshot, &registers, primary );
+    }
+done:
+    virtual_restore_title_mutex_depth( mutex_depth, "hang-signal-return" );
+    leave_handler( ucontext );
+}
+#endif
+
+
+#ifdef __APPLE__
+/**********************************************************************
+ *		sigsys_handler
+ *
+ * Handler for SIGSYS, signals that a non-existent system call was invoked.
+ * Only called on macOS 14 Sonoma and later.
+ */
+static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
+    ucontext_t *ucontext = init_handler( sigcontext );
+    struct syscall_frame *frame = get_syscall_frame();
+
+    TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
+
+    frame->rip = RIP_sig(ucontext) + 0xb;
+    frame->rcx = RIP_sig(ucontext);
+    frame->eflags = EFL_sig(ucontext);
+    frame->restore_flags = 0;
+    if (instrumentation_callback) frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION;
+    RCX_sig(ucontext) = (ULONG_PTR)frame;
+    R11_sig(ucontext) = frame->eflags;
+    if (EFL_sig(ucontext) & 0x100)
+    {
+        EFL_sig(ucontext) &= ~0x100;  /* clear single-step flag */
+        frame->restore_flags |= CONTEXT_CONTROL;
+    }
+    RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
+}
+#endif
+
+
+/***********************************************************************
+ *           ldt_set_entry
+ */
+void ldt_set_entry( WORD sel, LDT_ENTRY entry )
+{
+#ifdef linux
+    struct modify_ldt_s ldt_info = { .entry_number = sel >> 3 };
+    int ret;
+
+    ldt_info.base_addr       = ldt_get_base( entry );
+    ldt_info.limit           = entry.LimitLow | (entry.HighWord.Bits.LimitHi << 16);
+    ldt_info.seg_32bit       = entry.HighWord.Bits.Default_Big;
+    ldt_info.contents        = (entry.HighWord.Bits.Type >> 2) & 3;
+    ldt_info.read_exec_only  = !(entry.HighWord.Bits.Type & 2);
+    ldt_info.limit_in_pages  = entry.HighWord.Bits.Granularity;
+    ldt_info.seg_not_present = !entry.HighWord.Bits.Pres;
+    ldt_info.usable          = entry.HighWord.Bits.Sys;
+    if ((ret = modify_ldt( &ldt_info ))) ERR( "modify_ldt failed %d\n", ret );
+#elif defined(__APPLE__)
+    if (i386_set_ldt(sel >> 3, (union ldt_entry *)&entry, 1) < 0) perror("i386_set_ldt");
+#else
+    fprintf( stderr, "No LDT support on this platform\n" );
+    exit(1);
+#endif
+}
+
+
+/**********************************************************************
+ *           get_thread_ldt_entry
+ */
+NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *info, ULONG len )
+{
+    THREAD_BASIC_INFORMATION tbi;
+    NTSTATUS status;
+    TEB *teb = NtCurrentTeb();
+
+    if (len != sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
+    if (info->Selector >> 16) return STATUS_UNSUCCESSFUL;
+    if (is_gdt_sel( info->Selector )) return STATUS_UNSUCCESSFUL;
+
+    if (handle != GetCurrentThread())
+    {
+        status = NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL );
+        if (status) return status;
+    }
+    else tbi.ClientId = teb->ClientId;
+
+    return ldt_get_entry( info->Selector, tbi.ClientId, &info->Entry );
+}
+
+
+/**********************************************************************
+ *             signal_init_threading
+ */
+void signal_init_threading(void)
+{
+    __asm__( "movw %%cs,%0" : "=m" (cs64_sel) );
+    __asm__( "movw %%ss,%0" : "=m" (ds64_sel) );
+}
+
+
+/**********************************************************************
+ *		signal_alloc_thread
+ */
+NTSTATUS signal_alloc_thread( TEB *teb )
+{
+    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    WOW_TEB *wow_teb = get_wow_teb( teb );
+
+    if (wow_teb)
+    {
+#ifdef __PROSPERO__
+        /* The PS5 has one GDT FS selector (0x13); only its base moves. */
+        thread_data->fs = fs32_sel;
+        thread_data->wow_fsbase = wow_teb;
+#else
+        if (!fs32_sel)
+        {
+            thread_data->fs = ldt_alloc_entry( ldt_make_fs32_entry( wow_teb ));
+            if (!thread_data->fs) return STATUS_TOO_MANY_THREADS;
+        }
+        else thread_data->fs = fs32_sel;
+#endif
+    }
+    thread_data->frame_size = frame_size;
+    return STATUS_SUCCESS;
+}
+
+
+/**********************************************************************
+ *		signal_free_thread
+ */
+void signal_free_thread( TEB *teb )
+{
+#ifndef __PROSPERO__
+    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
+#elif defined(WINE_PS5_TITLE)
+    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    ps5_title_restore_wow_shadow( thread_data );
+#else
+    (void)teb;
+#endif
+}
+
+#ifdef __APPLE__
+/**********************************************************************
+ *		mac_thread_gsbase
+ */
+static void *mac_thread_gsbase(void)
+{
+    struct thread_identifier_info tiinfo;
+    unsigned int info_count = THREAD_IDENTIFIER_INFO_COUNT;
+
+    mach_port_t self = mach_thread_self();
+    kern_return_t kr = thread_info(self, THREAD_IDENTIFIER_INFO, (thread_info_t) &tiinfo, &info_count);
+    mach_port_deallocate(mach_task_self(), self);
+
+    if (kr == KERN_SUCCESS) return (void*)tiinfo.thread_handle;
+    return NULL;
+}
+#endif
+
+
+/**********************************************************************
+ *		signal_init_process
+ */
+void signal_init_process(void)
+{
+    struct sigaction sig_act;
+    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+    void *ptr, *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
+#ifdef __PROSPERO__
+    const char *mxcsr_trace = getenv( "WINEPS5_MXCSR_TRACE" );
+
+    ps5_mxcsr_trace_enabled = mxcsr_trace && !strcmp( mxcsr_trace, "1" );
+#endif
+
+    if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
+    frame_size = offsetof( struct syscall_frame, xstate ) + xstate_size;
+
+    thread_data->syscall_frame = (struct syscall_frame *)(((ULONG_PTR)kernel_stack - frame_size) & ~(ULONG_PTR)63);
+
+    /* Place the dispatcher pointer on its own host page. */
+    ptr = SYSCALL_DISPATCHER_PTR;
+    anon_mmap_fixed( ptr, SYSCALL_DISPATCHER_PAGE, PROT_READ | PROT_WRITE, 0 );
+    *(void **)ptr = virtual_readable_entry( __wine_syscall_dispatcher );
+
+    xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+
+    if (wow_teb)
+    {
+#if defined(__linux__)
+        cs32_sel = 0x23;
+        fs32_sel = alloc_fs_sel( -1, wow_teb );
+#elif defined(__APPLE__)
+        cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
+#elif defined(__PROSPERO__)
+        /* the GDT's 32-bit user code segment; %fs keeps the GDT's 0x13 and
+         * only its base moves (see ps5_set_fsbase) */
+        cs32_sel = 0x33;
+        __asm__( "movw %%fs,%0" : "=m" (fs32_sel) );
+#endif
+    }
+
+    signal_alloc_thread( NtCurrentTeb() );
+#ifdef WINE_PS5_TITLE
+    if (wow_teb)
+        sceKernelDebugOutText( 0, "wine: title WoW64 signal setup selected cs=0x33 fs=0x13\n" );
+#endif
+
+    sig_act.sa_mask = server_block_set;
+    sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+
+    sig_act.sa_sigaction = int_handler;
+    if (set_handler( SIGINT, &sig_act ) == -1) goto error;
+    sig_act.sa_sigaction = fpe_handler;
+    if (set_handler( SIGFPE, &sig_act ) == -1) goto error;
+    sig_act.sa_sigaction = abrt_handler;
+    if (set_handler( SIGABRT, &sig_act ) == -1) goto error;
+    sig_act.sa_sigaction = quit_handler;
+    if (set_handler( SIGQUIT, &sig_act ) == -1) goto error;
+    sig_act.sa_sigaction = usr1_handler;
+    if (set_handler( SIGUSR1, &sig_act ) == -1) goto error;
+#ifdef WINE_PS5_TITLE
+    sig_act.sa_sigaction = hang_position_handler;
+    if (set_handler( SIGURG, &sig_act ) == -1) goto error;
+#endif
+    sig_act.sa_sigaction = trap_handler;
+    if (set_handler( SIGTRAP, &sig_act ) == -1) goto error;
+    sig_act.sa_sigaction = segv_handler;
+    if (set_handler( SIGSEGV, &sig_act ) == -1) goto error;
+    if (set_handler( SIGILL, &sig_act ) == -1) goto error;
+    if (set_handler( SIGBUS, &sig_act ) == -1) goto error;
+#ifdef __APPLE__
+    sig_act.sa_sigaction = sigsys_handler;
+    if (set_handler( SIGSYS, &sig_act ) == -1) goto error;
+#endif
+    install_bpf(&sig_act);
+    return;
+
+ error:
+    perror("sigaction");
+    exit(1);
+}
+
+void set_thread_teb( TEB *teb )
+{
+#ifdef __linux__
+    arch_prctl( ARCH_SET_GS, teb );
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    /* sysarch() rather than amd64_set_gsbase(): the PS5's libc has no
+     * amd64_set_gsbase, and this is what that wrapper does on FreeBSD. */
+    sysarch( AMD64_SET_GSBASE, &teb );
+#elif defined(__NetBSD__)
+    sysarch( X86_64_SET_GSBASE, &teb );
+#endif
+}
+
+/***********************************************************************
+ *           init_syscall_frame
+ */
+void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
+{
+    struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&teb->GdiTebBatch;
+    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
+    CONTEXT *ctx, context = { 0 };
+    I386_CONTEXT *wow_context;
+    void *callback;
+
+    assert( thread_data->frame_size == frame_size );
+    thread_data->instrumentation_callback = &instrumentation_callback;
+
+#if defined __linux__
+    arch_prctl( ARCH_SET_GS, teb );
+    if (fs32_sel)
+    {
+        arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
+        alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
+    }
+#elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
+    sysarch( AMD64_SET_GSBASE, &teb );
+#ifdef __PROSPERO__
+    /* the C library's %fs base, put back on every way into Unix code */
+    if (fs32_sel && !(thread_data->pthread_teb = ps5_get_fsbase()))
+        ERR( "no %%fs base for this thread; 32-bit code will crash it\n" );
+#ifdef WINE_PS5_TITLE
+    /* libkernel's signal wrapper reads its thread pointer at %fs:0x10
+     * (libkernel+0xc48a on 5.50) before Wine can restore the native base.
+     * Preserve the real Windows FiberData/ArbitraryUserPointer externally,
+     * keep the 0x28 pair stable and refuse a non-NULL 0x38 pair. Every
+     * native/WOW transition updates these fields in ps5_title_sysarch(). */
+    if (fs32_sel && thread_data->pthread_teb)
+        ps5_title_init_wow_shadow( thread_data, get_wow_teb( teb ) );
+    if (fs32_sel && thread_data->pthread_teb)
+        sceKernelDebugOutText( 0, "wine: title WoW64 FS shadow initialized\n" );
+#endif
+#endif
+#elif defined(__NetBSD__)
+    sysarch( X86_64_SET_GSBASE, &teb );
+#elif defined (__APPLE__)
+    thread_data->pthread_teb = mac_thread_gsbase();
+#else
+# error Please define setting %gs for your architecture
+#endif
+
+    context.ContextFlags = CONTEXT_ALL | CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE;
+    context.Rcx    = (ULONG_PTR)entry;
+    context.Rdx    = (ULONG_PTR)arg;
+    context.Rsp    = (ULONG_PTR)teb->Tib.StackBase - 0x28;
+    context.Rip    = (ULONG_PTR)pRtlUserThreadStart;
+    context.SegCs  = cs64_sel;
+    context.SegDs  = ds64_sel;
+    context.SegEs  = ds64_sel;
+    context.SegFs  = thread_data->fs;
+    context.SegGs  = ds64_sel;
+    context.SegSs  = ds64_sel;
+    context.EFlags = 0x200;
+    context.FltSave.ControlWord = 0x27f;
+    context.FltSave.MxCsr = context.MxCsr = 0x1f80;
+
+    if ((wow_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
+    {
+        wow_context->ContextFlags = CONTEXT_I386_ALL;
+        wow_context->Eax = (ULONG_PTR)entry;
+        wow_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        wow_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
+        wow_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
+        wow_context->SegCs = cs32_sel;
+        wow_context->SegDs = ds64_sel;
+        wow_context->SegEs = ds64_sel;
+        wow_context->SegFs = thread_data->fs;
+        wow_context->SegGs = ds64_sel;
+        wow_context->SegSs = ds64_sel;
+        wow_context->EFlags = 0x202;
+        wow_context->FloatSave.ControlWord = context.FltSave.ControlWord;
+        *(XSAVE_FORMAT *)wow_context->ExtendedRegisters = context.FltSave;
+    }
+#ifdef WINE_PS5_TITLE
+    if (wow_context)
+    {
+        char line[192];
+        snprintf( line, sizeof(line), "wine: title WoW64 initial frame native_entry=%p wow_entry=%08x cs=%x\n",
+                  entry, wow_context->Eip, wow_context->SegCs );
+        sceKernelDebugOutText( 0, line );
+    }
+#endif
+
+    if (suspend)
+    {
+        wait_suspend( &context );
+        if (context.ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_AMD64)
+        {
+            amd64_thread_data()->dr0 = context.Dr0;
+            amd64_thread_data()->dr1 = context.Dr1;
+            amd64_thread_data()->dr2 = context.Dr2;
+            amd64_thread_data()->dr3 = context.Dr3;
+            amd64_thread_data()->dr6 = context.Dr6;
+            amd64_thread_data()->dr7 = context.Dr7;
+        }
+    }
+
+    ctx = (CONTEXT *)((ULONG_PTR)context.Rsp & ~15) - 1;
+    *ctx = context;
+    ctx->ContextFlags = CONTEXT_FULL;
+    memset( &frame->xstate, 0, sizeof(frame->xstate) );
+    if (user_shared_data->XState.CompactionEnabled)
+        frame->xstate.CompactionMask = 0x8000000000000000 | user_shared_data->XState.EnabledFeatures;
+    signal_set_full_context( ctx );
+
+    frame->cs  = cs64_sel;
+    frame->ss  = ds64_sel;
+    frame->rsp = (ULONG64)ctx - 8;
+    frame->rip = (ULONG64)pLdrInitializeThunk;
+    frame->rcx = (ULONG64)ctx;
+    if ((callback = instrumentation_callback))
+    {
+        frame->r10 = frame->rip;
+        frame->rip = (ULONG64)callback;
+    }
+
+    pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
+}
+
+
+/***********************************************************************
+ *           signal_start_thread
+ */
+__ASM_GLOBAL_FUNC( signal_start_thread,
+                   "subq $0x38,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0x38\n\t")
+                   "movq %rbp,0x30(%rsp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %rbp,0x30\n\t")
+                   "leaq 0x30(%rsp),%rbp\n\t"
+                   __ASM_CFI(".cfi_def_cfa_register %rbp\n\t")
+                   "movq %rbx,-0x08(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %rbx,-0x08\n\t")
+                   "movq %r12,-0x10(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r12,-0x10\n\t")
+                   "movq %r13,-0x18(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r13,-0x18\n\t")
+                   "movq %r14,-0x20(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r14,-0x20\n\t")
+                   "movq %r15,-0x28(%rbp)\n\t"
+                   __ASM_CFI(".cfi_rel_offset %r15,-0x28\n\t")
+                   "leaq 0x10(%rbp),%r9\n\t"       /* syscall_cfa */
+                   /* set syscall frame */
+                   "movq 0x378(%rcx),%r8\n\t"      /* thread_data->syscall_frame */
+                   "orq %r8,%r8\n\t"
+                   "jnz 1f\n\t"
+                   "movq %rsp,%r8\n\t"
+                   "subq 0x328(%rcx),%r8\n\t"      /* amd64_thread_data()->frame_size */
+                   "andq $~63,%r8\n\t"
+                   "movq %r8,0x378(%rcx)\n"        /* thread_data->syscall_frame */
+                   "1:\tmovq $0,0xa0(%r8)\n\t"     /* frame->prev_frame */
+                   "movq %r9,0xa8(%r8)\n\t"        /* frame->syscall_cfa */
+                   "movl $0,0xb4(%r8)\n\t"         /* frame->restore_flags */
+                   "stmxcsr 0x33c(%rcx)\n\t"       /* amd64_thread_data()->mxcsr */
+                   /* switch to kernel stack */
+                   "movq %r8,%rsp\n\t"
+                   "movq %rcx,%r13\n\t"            /* teb */
+                   "call " __ASM_NAME("init_syscall_frame") "\n\t"
+                   "movq %rsp,%rcx\n\t"            /* frame */
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+
+
+/***********************************************************************
+ *           __wine_syscall_dispatcher
+ */
+__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
+                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+                   "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+                   "pushfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "popq 0x80(%rcx)\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "movl $0,0xb4(%rcx)\n\t"        /* frame->restore_flags */
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") ":\n\t"
+                   "movq %rbx,0x08(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rbx, rcx, 0x08)
+                   "movq %rdx,0x18(%rcx)\n\t"
+                   "movq %rsi,0x20(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rsi, rcx, 0x20)
+                   "movq %rdi,0x28(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rdi, rcx, 0x28)
+                   "movq %r12,0x50(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r12, rcx, 0xd0, 0x00)
+                   "movq %r13,0x58(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r13, rcx, 0xd8, 0x00)
+                   "movq %r14,0x60(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r14, rcx, 0xe0, 0x00)
+                   "movq %r15,0x68(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r15, rcx, 0xe8, 0x00)
+                   "movw %cs,0x78(%rcx)\n\t"
+                   "movq %rsp,0x88(%rcx)\n\t"
+                   __ASM_CFI_CFA_IS_AT2(rcx, 0x88, 0x01)
+                   "movw %ss,0x90(%rcx)\n\t"
+                   "movq %rbp,0x98(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
+                   "movq %gs:0x30,%r13\n\t"        /* teb */
+                   "movl %eax,0xb0(%rcx)\n\t"      /* frame->syscall_id */
+                   /* Legends of Runeterra hooks the first system call return instruction, and
+                    * depends on us returning to it. Adjust the return address accordingly. */
+                   "subq $0xb,0x70(%rcx)\n\t"
+                   "cmpb $0,0x7ffe0285\n\t"        /* user_shared_data->ProcessorFeatures[PF_XSAVE_ENABLED] */
+                   "jz 2f\n\t"
+                   "movl 0x7ffe03d8,%eax\n\t"      /* user_shared_data->XState.EnabledFeatures */
+                   "xorl %edx,%edx\n\t"
+                   "andl $7,%eax\n\t"
+                   "xorq %rbp,%rbp\n\t"
+                   "movq %rbp,0x2c0(%rcx)\n\t"
+                   "movq %rbp,0x2c8(%rcx)\n\t"
+                   "movq %rbp,0x2d0(%rcx)\n\t"
+                   "testl $2,0x7ffe03ec\n\t"       /* user_shared_data->XState.CompactionEnabled */
+                   "jz 1f\n\t"
+                   "movq %rbp,0x2d8(%rcx)\n\t"
+                   "movq %rbp,0x2e0(%rcx)\n\t"
+                   "movq %rbp,0x2e8(%rcx)\n\t"
+                   "movq %rbp,0x2f0(%rcx)\n\t"
+                   "movq %rbp,0x2f8(%rcx)\n\t"
+                   /* The xsavec instruction is not supported by
+                    * binutils < 2.25. */
+                   ".byte 0x48, 0x0f, 0xc7, 0xa1, 0xc0, 0x00, 0x00, 0x00\n\t" /* xsavec64 0xc0(%rcx) */
+                   "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                   "jmp 3f\n"
+                   "1:\txsave64 0xc0(%rcx)\n\t"
+                   "jmp 3f\n"
+                   "2:\tfxsave64 0xc0(%rcx)\n"
+                   "3:\tleaq 0x98(%rcx),%rbp\n\t"
+                   __ASM_CFI_CFA_IS_AT1(rbp, 0x70)
+                   __ASM_CFI_REG_IS_AT1(rip, rbp, 0x58)
+                   __ASM_CFI_REG_IS_AT2(rbx, rbp, 0xf0, 0x7e)
+                   __ASM_CFI_REG_IS_AT2(rsi, rbp, 0x88, 0x7f)
+                   __ASM_CFI_REG_IS_AT2(rdi, rbp, 0x90, 0x7f)
+                   __ASM_CFI_REG_IS_AT2(r12, rbp, 0xb8, 0x7f)
+                   __ASM_CFI_REG_IS_AT1(r13, rbp, 0x40)
+                   __ASM_CFI_REG_IS_AT1(r14, rbp, 0x48)
+                   __ASM_CFI_REG_IS_AT1(r15, rbp, 0x50)
+                   __ASM_CFI_REG_IS_AT1(rbp, rbp, 0x00)
+                   "leaq 0x28(%rsp),%r15\n\t"      /* 5th argument */
+                   /* switch to kernel stack */
+                   "movq %rcx,%rsp\n\t"
+                   /* we're now on the kernel stack, stitch unwind info with previous frame */
+                   __ASM_CFI_CFA_IS_AT1(rbp, 0x10) /* frame->syscall_cfa */
+                   __ASM_CFI(".cfi_offset %rip,-0x08\n\t")
+                   __ASM_CFI(".cfi_offset %rbp,-0x10\n\t")
+                   __ASM_CFI(".cfi_offset %rbx,-0x18\n\t")
+                   __ASM_CFI(".cfi_offset %r12,-0x20\n\t")
+                   __ASM_CFI(".cfi_offset %r13,-0x28\n\t")
+                   __ASM_CFI(".cfi_offset %r14,-0x30\n\t")
+                   __ASM_CFI(".cfi_offset %r15,-0x38\n\t")
+                   __ASM_CFI(".cfi_undefined %rdi\n\t")
+                   __ASM_CFI(".cfi_undefined %rsi\n\t")
+                   /* When on the kernel stack, use %r13 instead of %gs to access the TEB.
+                    * (on macOS, signal handlers set gsbase to pthread_teb when on the kernel stack).
+                    */
+#ifdef __linux__
+                   "movq 0x320(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rsi,%rsi\n\t"
+                   "jz 2f\n\t"
+                   "cmpb $0,0x7ffe028a\n\t"        /* user_shared_data->ProcessorFeatures[PF_RDWRFSGSBASE_AVAILABLE] */
+                   "jz 1f\n\t"
+                   "wrfsbase %rsi\n\t"
+                   "jmp 2f\n"
+                   "1:\tmov $0x1002,%edi\n\t"      /* ARCH_SET_FS */
+                   "mov $158,%eax\n\t"             /* SYS_arch_prctl */
+                   "syscall\n\t"
+                   "leaq -0x98(%rbp),%rcx\n"
+                   "2:\n\t"
+#elif defined __APPLE__
+                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                   "syscall\n\t"
+                   "leaq -0x98(%rbp),%rcx\n"
+#elif defined(__PROSPERO__)
+                   "cmpq $0,0x320(%r13)\n\t"       /* amd64_thread_data()->pthread_teb */
+                   "jz 1f\n\t"
+                   /* the system call may clobber the 1st, 3rd and 4th arguments: keep
+                    * them in the frame's unused r8-r10 slots */
+                   "movq %r8,0x30(%rcx)\n\t"
+                   "movq %r9,0x38(%rcx)\n\t"
+                   "movq %r10,0x40(%rcx)\n\t"
+                   "leaq 0x320(%r13),%rsi\n\t"
+                   "movl $129,%edi\n\t"            /* AMD64_SET_FSBASE */
+                   PS5_SET_FSBASE_CALL
+                   "leaq -0x98(%rbp),%rcx\n\t"
+                   "movq 0x30(%rcx),%r8\n\t"
+                   "movq 0x38(%rcx),%r9\n\t"
+                   "movq 0x40(%rcx),%r10\n"
+                   "1:\n\t"
+#endif
+                   "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                   "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
+                   "movq 0x18(%rcx),%r11\n\t"      /* 2nd argument */
+                   "movl %eax,%ebx\n\t"
+                   "shrl $8,%ebx\n\t"
+                   "andl $0x30,%ebx\n\t"           /* syscall table number */
+                   "movq 0x370(%r13),%rcx\n\t"     /* thread_data->syscall_table */
+                   "leaq (%rcx,%rbx,2),%rbx\n\t"
+                   "andl $0xfff,%eax\n\t"          /* syscall number */
+                   "cmpq 16(%rbx),%rax\n\t"        /* table->ServiceLimit */
+                   "jae " __ASM_LOCAL_LABEL("bad_syscall") "\n\t"
+                   "movq (%rbx),%rcx\n\t"          /* table->ServiceTable */
+                   "movq (%rcx,%rax,8),%r12\n\t"
+                   "movq 24(%rbx),%rcx\n\t"        /* table->ArgumentTable */
+                   "movzbl (%rcx,%rax),%ecx\n\t"
+                   "subq $0x30,%rcx\n\t"
+                   "jbe 1f\n\t"
+                   "subq %rcx,%rsp\n\t"
+                   "shrq $3,%rcx\n\t"
+                   "andq $~15,%rsp\n\t"
+                   "movq %rsp,%rdi\n\t"
+                   "leaq 16(%r15),%rsi\n\t"        /* 7th argument */
+                   "cld\n\t"
+                   "rep; movsq\n"
+                   "1:\ttestl $1,0x380(%r13)\n\t"  /* thread_data->syscall_trace */
+                   "jnz " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
+                   "movq %r10,%rdi\n\t"            /* 1st argument */
+                   "movq %r11,%rsi\n\t"            /* 2nd argument */
+                   "movq %r8,%rdx\n\t"             /* 3rd argument */
+                   "movq %r9,%rcx\n\t"             /* 4th argument */
+                   "movq (%r15),%r8\n\t"           /* 5th argument */
+                   "movq 8(%r15),%r9\n\t"          /* 6th argument */
+                   "callq *%r12\n\t"
+                   "leaq -0x98(%rbp),%rcx\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
+                   /* push rbp-based kernel stack cfi */
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
+                   /* Keep %rsp at the aligned frame base until the title's
+                    * public sysarch helper returns. */
+#ifdef __linux__
+                   "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
+                   "testw %dx,%dx\n\t"
+                   "jz 1f\n\t"
+                   "movw %dx,%fs\n"
+                   "1:\n\t"
+#elif defined __APPLE__
+                   "movq %rax,%r8\n\t"
+                   "movq %rcx,%rdx\n\t"
+                   "movq %r13,%rdi\n\t"            /* teb */
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                   "syscall\n\t"
+                   "movq %rdx,%rcx\n\t"
+                   "movq %r8,%rax\n\t"
+#elif defined(__PROSPERO__)
+                   "cmpq $0,0x340(%r13)\n\t"       /* amd64_thread_data()->wow_fsbase */
+                   "jz 1f\n\t"
+                   /* %r12 and %r14 are reloaded from the frame below */
+                   "movq %rax,%r12\n\t"
+                   "movq %rcx,%r14\n\t"
+                   __ASM_CFI_CFA_IS_AT2(rsp, 0xa8, 0x01)
+                   "leaq 0x340(%r13),%rsi\n\t"
+                   "movl $129,%edi\n\t"            /* AMD64_SET_FSBASE */
+                   PS5_SET_FSBASE_CALL
+                   "movq %r14,%rcx\n\t"
+                   __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01)
+                   "movq %r12,%rax\n"
+                   "1:\n\t"
+#endif
+                   "leaq 0x70(%rcx),%rsp\n\t"  /* %rsp > frame: outside syscall */
+                   "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
+                   "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
+                   "jnz 2f\n\t"
+                   "ldmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                   "movaps 0x1c0(%rcx),%xmm6\n\t"
+                   "movaps 0x1d0(%rcx),%xmm7\n\t"
+                   "movaps 0x1e0(%rcx),%xmm8\n\t"
+                   "movaps 0x1f0(%rcx),%xmm9\n\t"
+                   "movaps 0x200(%rcx),%xmm10\n\t"
+                   "movaps 0x210(%rcx),%xmm11\n\t"
+                   "movaps 0x220(%rcx),%xmm12\n\t"
+                   "movaps 0x230(%rcx),%xmm13\n\t"
+                   "movaps 0x240(%rcx),%xmm14\n\t"
+                   "movaps 0x250(%rcx),%xmm15\n\t"
+                   "jmp 4f\n"
+                   "2:\tcmpb $0,0x7ffe0285\n\t"    /* user_shared_data->ProcessorFeatures[PF_XSAVE_ENABLED] */
+                   "jz 3f\n\t"
+                   "movq %rax,%r11\n\t"
+                   "movl 0x7ffe03d8,%eax\n\t"      /* user_shared_data->XState.EnabledFeatures */
+                   "movl 0x7ffe03dc,%edx\n\t"
+                   "xrstor64 0xc0(%rcx)\n\t"
+                   "movq %r11,%rax\n\t"
+                   "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
+                   "jmp 4f\n"
+                   "3:\tfxrstor64 0xc0(%rcx)\n"
+                   "4:\tmovq 0x98(%rcx),%rbp\n\t"
+                   "movq 0x68(%rcx),%r15\n\t"
+                   "movq 0x60(%rcx),%r14\n\t"
+                   "movq 0x58(%rcx),%r13\n\t"
+                   "movq 0x50(%rcx),%r12\n\t"
+                   "movq 0x80(%rcx),%r11\n\t"      /* frame->eflags */
+                   "movq 0x28(%rcx),%rdi\n\t"
+                   "movq 0x20(%rcx),%rsi\n\t"
+                   "movq 0x08(%rcx),%rbx\n\t"
+                   "testl $0x10000,%edx\n\t"       /* RESTORE_FLAGS_INSTRUMENTATION */
+                   "jnz 2f\n\t"
+                   "3:\ttestl $0x3,%edx\n\t"       /* CONTEXT_CONTROL | CONTEXT_INTEGER */
+                   "jnz 1f\n\t"
+
+                   /* switch to user stack */
+                   "movq 0x88(%rcx),%rsp\n\t"
+                   /* push rcx-based kernel stack cfi */
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   __ASM_CFI(".cfi_def_cfa %rsp, 0\n\t")
+                   __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0, 0x00)
+                   __ASM_CFI(".cfi_same_value %rbp\n\t")
+                   __ASM_CFI(".cfi_same_value %rbx\n\t")
+                   __ASM_CFI(".cfi_same_value %r12\n\t")
+                   __ASM_CFI(".cfi_same_value %r13\n\t")
+                   __ASM_CFI(".cfi_same_value %r14\n\t")
+                   __ASM_CFI(".cfi_same_value %r15\n\t")
+                   __ASM_CFI(".cfi_same_value %rdi\n\t")
+                   __ASM_CFI(".cfi_same_value %rsi\n\t")
+                   "movq 0x70(%rcx),%rcx\n\t"      /* frame->rip */
+                   __ASM_CFI(".cfi_register rip, rcx\n\t")
+                   "pushq %r11\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "popfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "pushq %rcx\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "ret\n\t"
+                   /* pop rcx-based kernel stack cfi */
+                   __ASM_CFI(".cfi_restore_state\n")
+
+                   "1:\ttestl $0x2,%edx\n\t"       /* CONTEXT_INTEGER */
+                   "jnz 1f\n\t"
+                   /* CONTEXT_CONTROL */
+                   "movq (%rsp),%rcx\n\t"          /* frame->rip */
+                   "pushq %r11\n\t"
+                   /* make sure that if trap flag is set the trap happens on the first instruction after iret */
+                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
+                   "popfq\n\t"
+                   "iretq\n"
+                   /* CONTEXT_INTEGER */
+                   "1:\tmovq 0x00(%rcx),%rax\n\t"
+                   "movq 0x18(%rcx),%rdx\n\t"
+                   "movq 0x30(%rcx),%r8\n\t"
+                   "movq 0x38(%rcx),%r9\n\t"
+                   "movq 0x40(%rcx),%r10\n\t"
+                   "movq 0x48(%rcx),%r11\n\t"
+                   "movq 0x10(%rcx),%rcx\n\t"
+                   "pushfq\n\t"
+                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
+                   "popfq\n\t"
+                   "iretq\n"
+                   /* RESTORE_FLAGS_INSTRUMENTATION */
+                   "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
+                   "movq (%r10),%r10\n\t"
+                   "test %r10,%r10\n\t"
+                   "jz 3b\n\t"
+                   "testl $0x2,%edx\n\t"          /* CONTEXT_INTEGER */
+                   "jnz 1b\n\t"
+                   "xchgq %r10,(%rsp)\n\t"
+                   "pushq %r11\n\t"
+                   /* make sure that if trap flag is set the trap happens on the first instruction after iret */
+                   "andq $~0x4000,(%rsp)\n\t" /* make sure NT flag is not set, or iretq will fault */
+                   "popfq\n\t"
+                   "iretq\n"
+
+                   /* pop rbp-based kernel stack cfi */
+                   __ASM_CFI("\t.cfi_restore_state\n")
+                   __ASM_LOCAL_LABEL("trace_syscall") ":\n\t"
+                   "pushq 8(%r15)\n\t"             /* 6th argument */
+                   "pushq (%r15)\n\t"              /* 5th argument */
+                   "pushq %r9\n\t"                 /* 4th argument */
+                   "pushq %r8\n\t"                 /* 3rd argument */
+                   "pushq %r11\n\t"                /* 2nd argument */
+                   "pushq %r10\n\t"                /* 1st argument */
+                   "movl 0x18(%rbp),%edi\n\t"      /* frame->syscall_id */
+                   "movl %edi,%eax\n\t"
+                   "andl $0xfff,%eax\n\t"          /* syscall number */
+                   "movq 24(%rbx),%rcx\n\t"        /* table->ArgumentTable */
+                   "movzbl (%rcx,%rax),%edx\n\t"   /* len */
+                   "movq %rsp,%rsi\n\t"            /* args */
+                   "call " __ASM_NAME("trace_syscall") "\n\t"
+                   "popq %rdi\n\t"                 /* 1st argument */
+                   "popq %rsi\n\t"                 /* 2nd argument */
+                   "popq %rdx\n\t"                 /* 3rd argument */
+                   "popq %rcx\n\t"                 /* 4th argument */
+                   "popq %r8\n\t"                  /* 5th argument */
+                   "popq %r9\n\t"                  /* 6th argument */
+                   "call *%r12\n"
+
+                   __ASM_LOCAL_LABEL("trace_syscall_ret") ":\n\t"
+                   "movq %rax,%r12\n\t"            /* retval */
+                   "movl 0x18(%rbp),%edi\n\t"      /* frame->syscall_id */
+                   "movq %r12,%rsi\n\t"            /* retval */
+                   "call " __ASM_NAME("trace_sysret") "\n\t"
+                   "leaq -0x98(%rbp),%rcx\n\t"     /* syscall frame */
+                   "movq %r12,%rax\n\t"
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n"
+
+                   __ASM_LOCAL_LABEL("bad_syscall") ":\n\t"
+                   "movl $0xc000001c,%eax\n\t"     /* STATUS_INVALID_SYSTEM_SERVICE */
+                   "movq %rsp,%rcx\n\t"
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+
+__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+                   "movq %rsp,%rcx\n\t"
+                   "leaq 0x98(%rcx),%rbp\n\t"
+                   "testl $1,0x380(%r13)\n\t"      /* thread_data->syscall_trace */
+                   "jnz " __ASM_LOCAL_LABEL("trace_syscall_ret" ) "\n\t"
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+
+__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+                   "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+                   "pushfq\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
+                   "popq 0x80(%rcx)\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   "movl $0x10000,0xb4(%rcx)\n\t"    /* frame->restore_flags <- RESTORE_FLAGS_INSTRUMENTATION */
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") )
+
+
+/***********************************************************************
+ *           __wine_unix_call_dispatcher
+ */
+__ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                   "movq %rcx,%r10\n\t"
+                   __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
+                   "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
+                   "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                   __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+                   "movl $0x20000,0xb4(%rcx)\n\t"  /* frame->restore_flags <- RESTORE_FLAGS_INCOMPLETE_FRAME_CONTEXT */
+                   __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_prolog_end") ":\n\t"
+                   "movq %rbx,0x08(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rbx, rcx, 0x08)
+                   "movq %rsi,0x20(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rsi, rcx, 0x20)
+                   "movq %rdi,0x28(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT1(rdi, rcx, 0x28)
+                   "movq %r12,0x50(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r12, rcx, 0xd0, 0x00)
+                   "movq %r13,0x58(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r13, rcx, 0xd8, 0x00)
+                   "movq %r14,0x60(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r14, rcx, 0xe0, 0x00)
+                   "movq %r15,0x68(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(r15, rcx, 0xe8, 0x00)
+                   "movq %rsp,0x88(%rcx)\n\t"
+                   __ASM_CFI_CFA_IS_AT2(rcx, 0x88, 0x01)
+                   "movq %rbp,0x98(%rcx)\n\t"
+                   __ASM_CFI_REG_IS_AT2(rbp, rcx, 0x98, 0x01)
+                   "movq %gs:0x30,%r13\n\t"
+                   "stmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                   "movdqa %xmm6,0x1c0(%rcx)\n\t"
+                   "movdqa %xmm7,0x1d0(%rcx)\n\t"
+                   "movdqa %xmm8,0x1e0(%rcx)\n\t"
+                   "movdqa %xmm9,0x1f0(%rcx)\n\t"
+                   "movdqa %xmm10,0x200(%rcx)\n\t"
+                   "movdqa %xmm11,0x210(%rcx)\n\t"
+                   "movdqa %xmm12,0x220(%rcx)\n\t"
+                   "movdqa %xmm13,0x230(%rcx)\n\t"
+                   "movdqa %xmm14,0x240(%rcx)\n\t"
+                   "movdqa %xmm15,0x250(%rcx)\n\t"
+                   /* switch to kernel stack */
+                   "movq %rcx,%rsp\n\t"
+                   /* we're now on the kernel stack, stitch unwind info with previous frame */
+                   __ASM_CFI(".cfi_remember_state\n\t")
+                   __ASM_CFI_CFA_IS_AT2(rsp, 0xa8, 0x01) /* frame->syscall_cfa */
+                   __ASM_CFI(".cfi_offset %rip,-0x08\n\t")
+                   __ASM_CFI(".cfi_offset %rbp,-0x10\n\t")
+                   __ASM_CFI(".cfi_offset %rbx,-0x18\n\t")
+                   __ASM_CFI(".cfi_offset %r12,-0x20\n\t")
+                   __ASM_CFI(".cfi_offset %r13,-0x28\n\t")
+                   __ASM_CFI(".cfi_offset %r14,-0x30\n\t")
+                   __ASM_CFI(".cfi_offset %r15,-0x38\n\t")
+                   __ASM_CFI(".cfi_undefined %rdi\n\t")
+                   __ASM_CFI(".cfi_undefined %rsi\n\t")
+#ifdef __linux__
+                   "movq 0x320(%r13),%rsi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "testq %rsi,%rsi\n\t"
+                   "jz 2f\n\t"
+                   "cmpb $0,0x7ffe028a\n\t"        /* user_shared_data->ProcessorFeatures[PF_RDWRFSGSBASE_AVAILABLE] */
+                   "jz 1f\n\t"
+                   "wrfsbase %rsi\n\t"
+                   "jmp 2f\n"
+                   "1:\tmov $0x1002,%edi\n\t"      /* ARCH_SET_FS */
+                   "mov $158,%eax\n\t"             /* SYS_arch_prctl */
+                   "syscall\n\t"
+                   "2:\n\t"
+#elif defined __APPLE__
+                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                   "syscall\n\t"
+#elif defined(__PROSPERO__)
+                   "cmpq $0,0x320(%r13)\n\t"       /* amd64_thread_data()->pthread_teb */
+                   "jz 1f\n\t"
+                   /* keep the code, the args and the table in the frame's unused slots */
+                   "movq %rdx,0x18(%rsp)\n\t"
+                   "movq %r8,0x30(%rsp)\n\t"
+                   "movq %r10,0x40(%rsp)\n\t"
+                   "leaq 0x320(%r13),%rsi\n\t"
+                   "movl $129,%edi\n\t"            /* AMD64_SET_FSBASE */
+                   PS5_SET_FSBASE_CALL
+                   "movq 0x18(%rsp),%rdx\n\t"
+                   "movq 0x30(%rsp),%r8\n\t"
+                   "movq 0x40(%rsp),%r10\n"
+                   "1:\n\t"
+#endif
+                   "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                   "movq %r8,%rdi\n\t"             /* args */
+                   "callq *(%r10,%rdx,8)\n\t"
+                   "movq %rsp,%rcx\n\t"
+                   "testl $0xffff,0xb4(%rcx)\n\t"  /* frame->restore_flags */
+                   "jnz " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
+                   /* Keep the aligned frame stack across the public helper. */
+#ifdef __linux__
+                   "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
+                   "testw %dx,%dx\n\t"
+                   "jz 1f\n\t"
+                   "movw %dx,%fs\n"
+                   "1:\n\t"
+#elif defined __APPLE__
+                   "movq %rax,%rdx\n\t"
+                   "movq %rcx,%r14\n\t"
+                   "movq %r13,%rdi\n\t"            /* teb */
+                   "xorl %esi,%esi\n\t"
+                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                   "syscall\n\t"
+                   "movq %r14,%rcx\n\t"
+                   "movq %rdx,%rax\n\t"
+                   "movq 0x60(%rcx),%r14\n\t"
+#elif defined(__PROSPERO__)
+                   "cmpq $0,0x340(%r13)\n\t"       /* amd64_thread_data()->wow_fsbase */
+                   "jz 1f\n\t"
+                   /* %r13 is reloaded from the frame below, %r14 here */
+                   "movq %rcx,%r14\n\t"
+                   "leaq 0x340(%r13),%rsi\n\t"
+                   "movq %rax,%r13\n\t"
+                   "movl $129,%edi\n\t"            /* AMD64_SET_FSBASE */
+                   PS5_SET_FSBASE_CALL
+                   "movq %r13,%rax\n\t"
+                   "movq %r14,%rcx\n\t"
+                   "movq 0x60(%rcx),%r14\n"
+                   "1:\n\t"
+#endif
+                   "ldmxcsr 0xd8(%rcx)\n\t"        /* frame->xsave.MxCsr */
+                   "movdqa 0x1c0(%rcx),%xmm6\n\t"
+                   "movdqa 0x1d0(%rcx),%xmm7\n\t"
+                   "movdqa 0x1e0(%rcx),%xmm8\n\t"
+                   "movdqa 0x1f0(%rcx),%xmm9\n\t"
+                   "movdqa 0x200(%rcx),%xmm10\n\t"
+                   "movdqa 0x210(%rcx),%xmm11\n\t"
+                   "movdqa 0x220(%rcx),%xmm12\n\t"
+                   "movdqa 0x230(%rcx),%xmm13\n\t"
+                   "movdqa 0x240(%rcx),%xmm14\n\t"
+                   "movdqa 0x250(%rcx),%xmm15\n\t"
+                   "movq 0x88(%rcx),%rsp\n\t"  /* switch to user stack */
+                   __ASM_CFI(".cfi_restore_state\n\t")
+                   "movq 0x58(%rcx),%r13\n\t"
+                   "movq 0x28(%rcx),%rdi\n\t"
+                   "movq 0x20(%rcx),%rsi\n\t"
+                   "pushq 0x70(%rcx)\n\t"          /* frame->rip */
+                   __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_end") ":\n\t"
+                   "ret" )
+
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_prolog_end_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_gs_load_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_prolog_end_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_prolog_end") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_gs_load_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_end_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_end") )
+
+#endif  /* __x86_64__ */
