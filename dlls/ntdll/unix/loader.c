@@ -538,6 +538,7 @@ char *get_alternate_wineloader( WORD machine )
     const char *arch;
     BOOL force_wow64;
     char *ret = NULL;
+    int length = 0;
 
 #ifdef __PROSPERO__
     /* Native titles host this WOW64 pair in-process; no alternate Unix loader can exec. */
@@ -559,10 +560,15 @@ char *get_alternate_wineloader( WORD machine )
     }
 
     if (!build_dir)
-        asprintf( &ret, "%s%s/wine", dll_dir, get_so_dir( machine ));
+        length = asprintf( &ret, "%s%s/wine", dll_dir, get_so_dir( machine ));
     else if (alt_build_dir)
-        asprintf( &ret, "%s/loader/wine", alt_build_dir );
+        length = asprintf( &ret, "%s/loader/wine", alt_build_dir );
 
+#ifdef __PROSPERO__
+    if (length < 0) return NULL;
+#else
+    (void)length;
+#endif
     return ret;
 }
 
