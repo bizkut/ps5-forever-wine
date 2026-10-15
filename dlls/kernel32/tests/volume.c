@@ -348,76 +348,222 @@ static void test_GetVolumeNameForVolumeMountPointW(void)
 
 static void test_GetLogicalDriveStringsA(void)
 {
-    UINT size, size2;
-    char *buf, *ptr;
+    UINT size, size2, i;
+    DWORD mask = 0, expected = GetLogicalDrives();
+    char *storage, *buf, *ptr;
 
     ok( pGetLogicalDriveStringsA != NULL, "GetLogicalDriveStringsA not available\n");
-    if(!pGetLogicalDriveStringsA) {
-        return;
-    }
+    if (!pGetLogicalDriveStringsA) return;
 
     size = pGetLogicalDriveStringsA(0, NULL);
     ok(size%4 == 1, "size = %d\n", size);
+    if (!size) return;
 
-    buf = HeapAlloc(GetProcessHeap(), 0, size);
-
-    *buf = 0;
-    size2 = pGetLogicalDriveStringsA(2, buf);
+    storage = HeapAlloc(GetProcessHeap(), 0, size + 2);
+    buf = storage + 1;
+    memset(storage, 0x5a, size + 2);
+    size2 = pGetLogicalDriveStringsA(size - 1, buf);
     ok(size2 == size, "size2 = %d\n", size2);
-    ok(!*buf, "buf changed\n");
+    for (i = 0; i < size + 2; i++)
+        ok(storage[i] == 0x5a, "short buffer changed at %u\n", i);
 
     size2 = pGetLogicalDriveStringsA(size, buf);
-    ok(size2 == size-1, "size2 = %d\n", size2);
+    ok(size2 == size - 1, "size2 = %d\n", size2);
+    ok(storage[0] == 0x5a && buf[size] == 0x5a, "buffer guards changed\n");
+    if (size2 != size - 1) goto done;
 
-    for(ptr = buf; ptr < buf+size2; ptr += 4) {
-        ok(('A' <= *ptr && *ptr <= 'Z'), "device name '%c' is not uppercase\n", *ptr);
-        ok(ptr[1] == ':', "ptr[1] = %c, expected ':'\n", ptr[1]);
-        ok(ptr[2] == '\\', "ptr[2] = %c expected '\\'\n", ptr[2]);
-        ok(!ptr[3], "ptr[3] = %c expected nullbyte\n", ptr[3]);
-    }
-    ok(!*ptr, "buf[size2] is not nullbyte\n");
-
-    HeapFree(GetProcessHeap(), 0, buf);
-}
-
-static void test_GetLogicalDriveStringsW(void)
-{
-    UINT size, size2;
-    WCHAR *buf, *ptr;
-
-    ok( pGetLogicalDriveStringsW != NULL, "GetLogicalDriveStringsW not available\n");
-    if(!pGetLogicalDriveStringsW) {
-        return;
-    }
-
-    SetLastError(0xdeadbeef);
-    size = pGetLogicalDriveStringsW(0, NULL);
-    if (size == 0 && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED) {
-        win_skip("GetLogicalDriveStringsW not implemented\n");
-        return;
-    }
-    ok(size%4 == 1, "size = %d\n", size);
-
-    buf = HeapAlloc(GetProcessHeap(), 0, size*sizeof(WCHAR));
-
-    *buf = 0;
-    size2 = pGetLogicalDriveStringsW(2, buf);
-    ok(size2 == size, "size2 = %d\n", size2);
-    ok(!*buf, "buf changed\n");
-
-    size2 = pGetLogicalDriveStringsW(size, buf);
-    ok(size2 == size-1, "size2 = %d\n", size2);
-
-    for(ptr = buf; ptr < buf+size2; ptr += 4) {
+    for (ptr = buf; ptr < buf + size2; ptr += 4)
+    {
         ok('A' <= *ptr && *ptr <= 'Z', "device name '%c' is not uppercase\n", *ptr);
         ok(ptr[1] == ':', "ptr[1] = %c, expected ':'\n", ptr[1]);
         ok(ptr[2] == '\\', "ptr[2] = %c expected '\\'\n", ptr[2]);
         ok(!ptr[3], "ptr[3] = %c expected nullbyte\n", ptr[3]);
+        if ('A' <= *ptr && *ptr <= 'Z') mask |= 1u << (*ptr - 'A');
     }
     ok(!*ptr, "buf[size2] is not nullbyte\n");
+    ok(mask == expected, "string mask %#lx, GetLogicalDrives %#lx\n", mask, expected);
 
-    HeapFree(GetProcessHeap(), 0, buf);
+done:
+    HeapFree(GetProcessHeap(), 0, storage);
 }
+
+static void test_GetLogicalDriveStringsW(void)
+{
+    UINT size, size2, i;
+    DWORD mask = 0, expected = GetLogicalDrives();
+    WCHAR *storage, *buf, *ptr;
+
+    ok( pGetLogicalDriveStringsW != NULL, "GetLogicalDriveStringsW not available\n");
+    if (!pGetLogicalDriveStringsW) return;
+
+    SetLastError(0xdeadbeef);
+    size = pGetLogicalDriveStringsW(0, NULL);
+    if (size == 0 && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
+    {
+        win_skip("GetLogicalDriveStringsW not implemented\n");
+        return;
+    }
+    ok(size%4 == 1, "size = %d\n", size);
+    if (!size) return;
+
+    storage = HeapAlloc(GetProcessHeap(), 0, (size + 2) * sizeof(WCHAR));
+    buf = storage + 1;
+    memset(storage, 0x5a, (size + 2) * sizeof(WCHAR));
+    size2 = pGetLogicalDriveStringsW(size - 1, buf);
+    ok(size2 == size, "size2 = %d\n", size2);
+    for (i = 0; i < size + 2; i++)
+        ok(storage[i] == 0x5a5a, "short buffer changed at %u\n", i);
+
+    size2 = pGetLogicalDriveStringsW(size, buf);
+    ok(size2 == size - 1, "size2 = %d\n", size2);
+    ok(storage[0] == 0x5a5a && buf[size] == 0x5a5a, "buffer guards changed\n");
+    if (size2 != size - 1) goto done;
+
+    for (ptr = buf; ptr < buf + size2; ptr += 4)
+    {
+        ok('A' <= *ptr && *ptr <= 'Z', "device name '%c' is not uppercase\n", *ptr);
+        ok(ptr[1] == ':', "ptr[1] = %c, expected ':'\n", ptr[1]);
+        ok(ptr[2] == '\\', "ptr[2] = %c expected '\\'\n", ptr[2]);
+        ok(!ptr[3], "ptr[3] = %c expected nullbyte\n", ptr[3]);
+        if ('A' <= *ptr && *ptr <= 'Z') mask |= 1u << (*ptr - 'A');
+    }
+    ok(!*ptr, "buf[size2] is not nullbyte\n");
+    ok(mask == expected, "string mask %#lx, GetLogicalDrives %#lx\n", mask, expected);
+
+done:
+    HeapFree(GetProcessHeap(), 0, storage);
+}
+
+static void test_ps5_title_root( const WCHAR *path, BOOL supported )
+{
+    FILE_FS_DEVICE_INFORMATION info;
+    IO_STATUS_BLOCK io;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    NTSTATUS status;
+    HANDLE handle;
+
+    name.Buffer = (WCHAR *)path;
+    name.Length = name.MaximumLength = lstrlenW(path) * sizeof(WCHAR);
+    InitializeObjectAttributes(&attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL);
+    memset(&io, 0x5a, sizeof(io));
+    status = NtOpenFile(&handle, SYNCHRONIZE, &attr, &io, 0,
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+    if (!supported)
+    {
+        ok(status == STATUS_OBJECT_PATH_NOT_FOUND, "%s: status %#lx\n", debugstr_w(path), status);
+        if (!status) CloseHandle(handle);
+        return;
+    }
+    ok(!status, "%s: status %#lx\n", debugstr_w(path), status);
+    if (status) return;
+
+    memset(&info, 0x5a, sizeof(info));
+    status = NtQueryVolumeInformationFile(handle, &io, &info, sizeof(info), FileFsDeviceInformation);
+    ok(!status, "%s: volume status %#lx\n", debugstr_w(path), status);
+    if (!status)
+    {
+        ok(io.Information == sizeof(info), "%s: information %Iu\n", debugstr_w(path), io.Information);
+        ok(info.DeviceType == FILE_DEVICE_DISK_FILE_SYSTEM, "%s: device type %#lx\n",
+           debugstr_w(path), info.DeviceType);
+        ok(info.Characteristics & FILE_DEVICE_IS_MOUNTED, "%s: not mounted (%#lx)\n",
+           debugstr_w(path), info.Characteristics);
+        ok(!(info.Characteristics & (FILE_REMOTE_DEVICE | FILE_REMOVABLE_MEDIA)),
+           "%s: not a local fixed volume (%#lx)\n", debugstr_w(path), info.Characteristics);
+    }
+    CloseHandle(handle);
+}
+
+/* Opt-in, read-only title contract: kernel32_test.exe volume ps5-title-drives.
+ * Ordinary Wine and payload configurations may legitimately expose other drives. */
+static void test_ps5_title_drives(void)
+{
+    static const struct
+    {
+        const char *rootA;
+        const WCHAR *rootW, *device, *nt_root;
+        BOOL supported;
+    } drives[] =
+    {
+        {"C:\\", L"C:\\", L"C:", L"\\??\\C:\\", TRUE},
+        {"W:\\", L"W:\\", L"W:", L"\\??\\W:\\", TRUE},
+        {"D:\\", L"D:\\", L"D:", L"\\??\\D:\\", FALSE},
+        {"Z:\\", L"Z:\\", L"Z:", L"\\??\\Z:\\", FALSE}
+    };
+    static const DWORD expected_mask = (1u << ('C' - 'A')) | (1u << ('W' - 'A'));
+    static const WCHAR expectedW[] = L"C:\\\0W:\\\0";
+    static const char expectedA[] = "C:\\\0W:\\\0";
+    WCHAR target[128], devices[1024], stringsW[16];
+    char stringsA[16];
+    DWORD ret, mask = 0, logical = GetLogicalDrives();
+    UINT i, len, pos, end, type;
+
+    ok(logical == expected_mask, "drive mask %#lx\n", logical);
+    test_GetLogicalDriveStringsA();
+    test_GetLogicalDriveStringsW();
+    memset(stringsA, 0x5a, sizeof(stringsA));
+    memset(stringsW, 0x5a, sizeof(stringsW));
+    ret = GetLogicalDriveStringsA(ARRAY_SIZE(stringsA), stringsA);
+    ok(ret == sizeof(expectedA) - 1, "ANSI string length %lu\n", ret);
+    ok(!memcmp(stringsA, expectedA, sizeof(expectedA)), "unexpected ANSI drive strings\n");
+    ret = GetLogicalDriveStringsW(ARRAY_SIZE(stringsW), stringsW);
+    ok(ret == ARRAY_SIZE(expectedW) - 1, "Unicode string length %lu\n", ret);
+    ok(!memcmp(stringsW, expectedW, sizeof(expectedW)), "unexpected Unicode drive strings\n");
+
+    for (i = 0; i < ARRAY_SIZE(drives); i++)
+    {
+        type = GetDriveTypeA(drives[i].rootA);
+        ok(type == (drives[i].supported ? DRIVE_FIXED : DRIVE_NO_ROOT_DIR),
+           "%s: ANSI drive type %u\n", drives[i].rootA, type);
+        type = GetDriveTypeW(drives[i].rootW);
+        ok(type == (drives[i].supported ? DRIVE_FIXED : DRIVE_NO_ROOT_DIR),
+           "%s: Unicode drive type %u\n", drives[i].rootA, type);
+        test_ps5_title_root(drives[i].nt_root, drives[i].supported);
+        memset(target, 0x5a, sizeof(target));
+        SetLastError(0xdeadbeef);
+        ret = QueryDosDeviceW(drives[i].device, target, ARRAY_SIZE(target));
+        if (!drives[i].supported)
+        {
+            ok(!ret && GetLastError() == ERROR_FILE_NOT_FOUND, "%s: ret %lu, error %lu\n",
+               debugstr_w(drives[i].device), ret, GetLastError());
+            continue;
+        }
+        ok(ret > 1 && ret <= ARRAY_SIZE(target), "%s: ret %lu, error %lu\n",
+           debugstr_w(drives[i].device), ret, GetLastError());
+        if (ret <= 1 || ret > ARRAY_SIZE(target)) continue;
+        for (len = 0; len < ret && target[len]; len++) {}
+        ok(len && len + 1 < ret && !target[len + 1], "%s: missing target terminators\n",
+           debugstr_w(drives[i].device));
+        if (!len || len + 1 >= ret) continue;
+        test_ps5_title_root(target, TRUE);
+        if (target[len - 1] != '\\') target[len++] = '\\';
+        target[len] = 0;
+        test_ps5_title_root(target, TRUE);
+    }
+
+    ret = QueryDosDeviceW(NULL, devices, ARRAY_SIZE(devices));
+    ok(ret && ret <= ARRAY_SIZE(devices), "device list ret %lu, error %lu\n", ret, GetLastError());
+    if (ret && ret <= ARRAY_SIZE(devices))
+    {
+        for (pos = 0; pos < ret && devices[pos]; pos = end + 1)
+        {
+            for (end = pos; end < ret && devices[end]; end++) {}
+            ok(end < ret, "device list missing terminator\n");
+            if (end == ret) break;
+            if (end - pos == 2 && devices[pos + 1] == ':' && devices[pos] >= 'A' && devices[pos] <= 'Z')
+                mask |= 1u << (devices[pos] - 'A');
+        }
+        ok(mask == expected_mask, "device-list drive mask %#lx\n", mask);
+    }
+    test_ps5_title_root(L"\\??\\C:\\windows", TRUE);
+    test_ps5_title_root(L"\\??\\W:\\prefix", TRUE);
+    type = GetDriveTypeA("\\\\forever-drive-probe.invalid\\share\\");
+    ok(type == DRIVE_NO_ROOT_DIR, "unsupported ANSI UNC drive type %u\n", type);
+    type = GetDriveTypeW(L"\\\\forever-drive-probe.invalid\\share\\");
+    ok(type == DRIVE_NO_ROOT_DIR, "unsupported Unicode UNC drive type %u\n", type);
+    test_ps5_title_root(L"\\??\\UNC\\forever-drive-probe.invalid\\share\\", FALSE);
+}
+
 
 static void test_GetVolumeInformationA(void)
 {
@@ -2187,6 +2333,9 @@ static void test_GetDiskSpaceInformationA(void)
 
 START_TEST(volume)
 {
+    char **argv;
+    int argc = winetest_get_mainargs(&argv);
+
     hdll = GetModuleHandleA("kernel32.dll");
     pFindFirstVolumeA = (void *) GetProcAddress(hdll, "FindFirstVolumeA");
     pFindNextVolumeA = (void *) GetProcAddress(hdll, "FindNextVolumeA");
@@ -2198,6 +2347,12 @@ START_TEST(volume)
     pCreateSymbolicLinkA = (void *) GetProcAddress(hdll, "CreateSymbolicLinkA");
     pGetVolumeInformationByHandleW = (void *) GetProcAddress(hdll, "GetVolumeInformationByHandleW");
     pGetDiskSpaceInformationA = (void *) GetProcAddress(hdll, "GetDiskSpaceInformationA");
+
+    if (argc >= 3 && !strcmp(argv[2], "ps5-title-drives"))
+    {
+        test_ps5_title_drives();
+        return;
+    }
 
     test_query_dos_deviceA();
     test_dos_devices();

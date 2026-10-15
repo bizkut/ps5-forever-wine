@@ -22,6 +22,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -560,6 +561,51 @@ static void create_session( unsigned int id )
     free( id_strW );
 }
 
+#ifdef __PROSPERO__
+/* Direct title paths do not have Unix dosdevice symlinks or a mount-manager
+ * service. Publish the same bounded C:/W: roots in the object namespace so
+ * enumeration and native device queries agree with ordinary file access. */
+static void init_title_drives( struct directory *devices, struct directory *dosdevices )
+{
+    static const WCHAR drive_names[][2] = {{'C',':'}, {'W',':'}};
+    WCHAR volume_name[] = {'H','a','r','d','d','i','s','k','V','o','l','u','m','e','1'};
+    struct unicode_str volume_str = {volume_name, sizeof(volume_name)};
+    struct unicode_str drive_str;
+    struct object *volume, *link;
+    char path[PATH_MAX], *slash;
+    size_t len;
+    unsigned int i;
+
+    if (!inprocess_server) return;
+
+    len = strlen( inprocess_config_dir );
+    if (len + sizeof("/drive_c") > sizeof(path))
+        fatal_error( "title drive path is too long\n" );
+    memcpy( path, inprocess_config_dir, len );
+    memcpy( path + len, "/drive_c", sizeof("/drive_c") );
+
+    for (i = 0; i < ARRAY_SIZE(drive_names); i++)
+    {
+        if (i)
+        {
+            path[len] = 0;
+            if (!(slash = strrchr( path, '/' )) || slash == path)
+                fatal_error( "title prefix must have a parent directory\n" );
+            *slash = 0;
+        }
+        volume_name[ARRAY_SIZE(volume_name) - 1] = '1' + i;
+        drive_str.str = drive_names[i];
+        drive_str.len = sizeof(drive_names[i]);
+        if (!(volume = create_unix_device( &devices->obj, &volume_str, OBJ_PERMANENT, NULL, path )))
+            fatal_error( "cannot create title drive device (status %08x)\n", get_error() );
+        link = create_obj_symlink( &dosdevices->obj, &drive_str, OBJ_PERMANENT, volume, NULL );
+        release_object( volume );
+        if (!link) fatal_error( "cannot create title drive link (status %08x)\n", get_error() );
+        release_object( link );
+    }
+}
+#endif
+
 void init_directories( struct fd *intl_fd )
 {
     /* Directories */
@@ -683,6 +729,9 @@ void init_directories( struct fd *intl_fd )
     release_object( create_symlink( &dir_global->obj, &link_conin_str, OBJ_PERMANENT, &link_currentin_str, NULL ));
     release_object( create_symlink( &dir_global->obj, &link_conout_str, OBJ_PERMANENT, &link_currentout_str, NULL ));
     release_object( create_symlink( &dir_global->obj, &link_con_str, OBJ_PERMANENT, &link_console_str, NULL ));
+#ifdef __PROSPERO__
+    init_title_drives( dir_device, dir_global );
+#endif
 
     /* events */
     for (i = 0; i < ARRAY_SIZE( kernel_events ); i++)
