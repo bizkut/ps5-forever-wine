@@ -615,6 +615,12 @@ static inline int wine_ps5_title_game_image( const char *dos, const char *unix_i
     if (length < 4 || prefix + length - 4 + sizeof("_loader.dll") > sizeof(loader)) return 0;
     memcpy( loader, unix_image, prefix + length - 4 );
     memcpy( loader + prefix + length - 4, "_loader.dll", sizeof("_loader.dll") );
+    if (exists( loader )) return 1;
+    /* Blizzard ships the final WoW.exe beside lowercase wow_loader.dll,
+     * while beta uses WowB_loader.dll. Try the derived spelling first, then
+     * a lowercase basename without changing the directory path. */
+    for (size_t i = prefix; loader[i]; ++i)
+        if (loader[i] >= 'A' && loader[i] <= 'Z') loader[i] += 'a' - 'A';
     return exists( loader );
 }
 

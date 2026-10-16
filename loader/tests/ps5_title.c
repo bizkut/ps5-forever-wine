@@ -1122,7 +1122,8 @@ static void test_hdr_luminance_edid(void)
 static int game_loader_exists( const char *path )
 {
     return !strcmp( path, "/prefix/drive_c/WoW/WowB_loader.dll" ) ||
-           !strcmp( path, "/prefix/drive_c/WoW/wOwTest_loader.dll" );
+           !strcmp( path, "/prefix/drive_c/WoW/wOwTest_loader.dll" ) ||
+           !strcmp( path, "/prefix/drive_c/WoW/wow_loader.dll" );
 }
 
 static void test_game_image_rule(void)
@@ -1131,6 +1132,8 @@ static void test_game_image_rule(void)
                                       "/prefix/drive_c/WoW/WowB.exe", game_loader_exists ) );
     assert( wine_ps5_title_game_image( "w:\\WoW\\wOwTest.ExE",
                                       "/prefix/drive_c/WoW/wOwTest.ExE", game_loader_exists ) );
+    assert( wine_ps5_title_game_image( "C:\\WoW\\WoW.exe",
+                                      "/prefix/drive_c/WoW/WoW.exe", game_loader_exists ) );
     assert( !wine_ps5_title_game_image( "C:\\WoW\\WowVoiceProxy.exe",
                                        "/prefix/drive_c/WoW/WowVoiceProxy.exe", game_loader_exists ) );
     assert( !wine_ps5_title_game_image( "Z:\\WoW\\WowB.exe",
