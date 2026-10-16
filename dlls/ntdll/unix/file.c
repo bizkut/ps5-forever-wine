@@ -7506,7 +7506,7 @@ static ssize_t bounced_pwrite( int fd, const void *buffer, size_t length, off_t 
  * recent cumulative local traffic masks self-contention evidence (see
  * wine/ps5_title_private.h). Broker failures fall back to the ordinary local
  * write; repeating part of one locally is safe. */
-#define BROKER_CONNECTIONS 4
+#define BROKER_CONNECTIONS 16
 #define BROKER_RETRY_SECONDS 30
 #define BROKER_UNAVAILABLE (-2)
 
@@ -7514,13 +7514,27 @@ static struct
 {
     pthread_mutex_t lock;
     int fd;
-} broker[BROKER_CONNECTIONS] =
+} broker[BROKER_CONNECTIONS];
+static pthread_once_t broker_once = PTHREAD_ONCE_INIT;
+
+static void broker_init(void)
 {
-    { PTHREAD_MUTEX_INITIALIZER, -1 }, { PTHREAD_MUTEX_INITIALIZER, -1 },
-    { PTHREAD_MUTEX_INITIALIZER, -1 }, { PTHREAD_MUTEX_INITIALIZER, -1 },
-};
+    unsigned int i;
+
+    for (i = 0; i < BROKER_CONNECTIONS; i++)
+    {
+        pthread_mutex_init( &broker[i].lock, NULL );
+        broker[i].fd = -1;
+    }
+}
 static LONG64 broker_retry_at;
 static LONG broker_logged_up, broker_logged_down;
+
+/* Wine process/thread IDs are four-byte aligned (server/process.c). */
+static unsigned int broker_windows_index( unsigned int thread_id )
+{
+    return (thread_id >> 2) % BROKER_CONNECTIONS;
+}
 
 #define TITLE_WRITE_ROUTE_LOG_LIMIT 64
 
@@ -7657,7 +7671,8 @@ static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply )
     if (server_get_unix_name( handle, &path ) || !path) goto done;
     if (!wb_path_root( path ) || strlen( path ) > WB_MAX_PATH) goto done;
     request.path_length = strlen( path );
-    index = GetCurrentThreadId() % BROKER_CONNECTIONS;
+    pthread_once( &broker_once, broker_init );
+    index = broker_windows_index( GetCurrentThreadId() );
     pthread_mutex_lock( &broker[index].lock );
     if (broker_get_connection( index, now ) != -1)
     {
@@ -7746,8 +7761,9 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
         return BROKER_UNAVAILABLE;
     }
 
+    pthread_once( &broker_once, broker_init );
     index = known_path ? (uintptr_t)pthread_self() % BROKER_CONNECTIONS
-                       : GetCurrentThreadId() % BROKER_CONNECTIONS;
+                       : broker_windows_index( GetCurrentThreadId() );
     pthread_mutex_lock( &broker[index].lock );
     if (broker_get_connection( index, now ) != -1)
     {

@@ -21,6 +21,12 @@
  * broker answers struct wb_reply with the bytes written or -errno. The
  * broker only writes existing regular files below WB_USER_ROOT and never
  * creates, truncates or removes one.
+ * The Wine client lazily opens at most 16 pooled connections per process,
+ * each locked across a synchronous request and reply; no client worker is
+ * added. The broker uses one worker and a 1 MiB buffer per live connection
+ * (at most 16 workers / 16 MiB for a fully used Wine process's pool).
+ * Wine thread-ID routing drops the two fixed alignment bits before taking
+ * the pool index, allowing consecutive Wine threads to use all 16 slots.
  * In place of a write, WB_ICON_MAGIC (path_length and length 0) asks the
  * broker to copy WB_ICON_FILE, a 512x512 PNG, over the home screen's copies
  * of the title's icon (/user/app/WB_TITLE_ID/... and /user/appmeta/...),
