@@ -4668,6 +4668,33 @@ static void fontcollection_add_replacements(struct dwrite_fontcollection *collec
     RegCloseKey(hkey);
 }
 
+/* Windows' core families, which Chromium requires: blink::FontFallbackIterator ends with
+   GetLastResortFallbackFont() (Arial, MS UI Gothic, Microsoft Sans Serif, Segoe UI,
+   Calibri, Times New Roman, Courier New) and stops the renderer when none exists
+   (FontCache::CrashWithFontInfo, seen on Battle.net's password sign-in page). The PS5
+   title ships Tahoma and Droid Sans Fallback instead; each missing family becomes an
+   alias of one of them. Installed fonts and registry replacements take precedence. */
+static void fontcollection_add_default_replacements(struct dwrite_fontcollection *collection)
+{
+    static const WCHAR *const defaults[][2] =
+    {
+        { L"Arial", L"Tahoma" },
+        { L"Microsoft Sans Serif", L"Tahoma" },
+        { L"Segoe UI", L"Tahoma" },
+        { L"Calibri", L"Tahoma" },
+        { L"Times New Roman", L"Tahoma" },
+        { L"Courier New", L"Tahoma" },
+        { L"MS UI Gothic", L"Droid Sans Fallback" },
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(defaults); ++i)
+    {
+        if (collection_find_family(collection, defaults[i][0]) == ~0u)
+            fontcollection_add_replacement(collection, defaults[i][0], defaults[i][1]);
+    }
+}
+
 HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerator *enumerator, IDWriteFontCollection3 **ret)
 {
     struct fontfile_enum {
@@ -4849,7 +4876,10 @@ HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet
     }
 
     if (set->is_system)
+    {
         fontcollection_add_replacements(collection);
+        fontcollection_add_default_replacements(collection);
+    }
 
     hr = IDWriteFontCollection3_QueryInterface(&collection->IDWriteFontCollection3_iface, riid, ret);
     IDWriteFontCollection3_Release(&collection->IDWriteFontCollection3_iface);
