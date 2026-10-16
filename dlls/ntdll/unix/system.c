@@ -76,18 +76,12 @@
 
 #ifdef __PROSPERO__
 # include <ps5platform/kernel.h>
-# include <dlfcn.h>
+# include "wine/ps5_title.h"
 
 
 extern int ps5_pthread_getaffinity_np( pthread_t thread, size_t size, void *set );
 extern uint64_t sceKernelGetCpuFrequency(void);
 
-static int ps5_get_hw_model_name( char *name )
-{
-    int (*get_hw_model_name)( char * ) = dlsym( RTLD_DEFAULT, "sceKernelGetHwModelName" );
-
-    return get_hw_model_name ? get_hw_model_name( name ) : -1;
-}
 
 /* The PS5's published maximum CPU clock; the SDK has no query for it. */
 # define PS5_CPU_MAX_MHZ 3500
@@ -2549,20 +2543,13 @@ static void create_smbios_processors( struct smbios_buffer *buf )
 
 #ifdef __PROSPERO__
 
-/* What the Linux kernel the console boots (ps5-linux-patches: dmi-id.c and
- * the ICC driver) shows an unprivileged user in /sys/class/dmi/id: vendor,
- * product, and the model read from the console's NVS. The serial there is
- * root-only and every other field is unset, so they read empty, as here. */
+/* The native host has no Linux DMI files; use Wine's generic identity and
+ * leave unavailable fields empty rather than exposing console model data. */
 static const char *get_smbios_string( const char *path, char *str, size_t size )
 {
     const char *field = strrchr( path, '/' ) + 1;
-    char model[256];
 
-    str[0] = 0;
-    if (!strcmp( field, "sys_vendor" )) snprintf( str, size, "%s", "Sony Interactive Entertainment" );
-    else if (!strcmp( field, "product_name" )) snprintf( str, size, "%s", "PlayStation 5" );
-    else if (!strcmp( field, "product_version" ) && !ps5_get_hw_model_name( model ))
-        snprintf( str, size, "%s", model );
+    snprintf( str, size, "%s", wine_ps5_smbios_string( field, PACKAGE_VERSION ));
     return str;
 }
 
@@ -2600,6 +2587,10 @@ static GUID *get_system_uuid( GUID *uuid )
     };
     int fd;
 
+#ifdef __PROSPERO__
+    memset( uuid, 0, sizeof(*uuid) );
+    return uuid;
+#else
     memset( uuid, 0xff, sizeof(*uuid) );
     if ((fd = open( "/var/lib/dbus/machine-id", O_RDONLY )) != -1)
     {
@@ -2623,6 +2614,7 @@ static GUID *get_system_uuid( GUID *uuid )
         }
         close( fd );
     }
+#endif
     return uuid;
 }
 

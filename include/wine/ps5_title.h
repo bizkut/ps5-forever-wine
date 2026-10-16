@@ -4,6 +4,15 @@
 #ifndef __WINE_PS5_TITLE_H
 #define __WINE_PS5_TITLE_H
 
+/* Human-readable driver identity, without changing the hardware PCI identity. */
+#define WINE_PS5_GPU_VENDOR_ID 0x1002
+#define WINE_PS5_GPU_DEVICE_ID 0x13fb
+
+static inline const char *wine_ps5_gpu_name(void)
+{
+    return "AMD Radeon Graphics (RADV)";
+}
+
 #if defined(__PROSPERO__) || defined(WINE_PS5_TITLE_HOST_TEST)
 #include <pthread.h>
 #include <fcntl.h>
@@ -11,6 +20,24 @@
 #include <string.h>
 
 #define WINE_PS5_TITLE_RUNTIME_VERSION 12
+
+/* Match Wine's generic SMBIOS fallback where the native host has no Linux
+ * DMI data; never substitute a particular PC or console model. */
+static inline const char *wine_ps5_smbios_string( const char *field, const char *version )
+{
+    if (!strcmp( field, "sys_vendor" ) || !strcmp( field, "bios_vendor" ) ||
+        !strcmp( field, "board_vendor" ) || !strcmp( field, "chassis_vendor" ))
+        return "The Wine project";
+    if (!strcmp( field, "product_name" ) || !strcmp( field, "board_name" )) return "Wine";
+    if (!strcmp( field, "product_version" ) || !strcmp( field, "bios_version" ) ||
+        !strcmp( field, "board_version" ) || !strcmp( field, "chassis_version" ))
+        return version;
+    if (!strcmp( field, "bios_date" )) return "01/01/2021";
+    if (!strcmp( field, "product_serial" ) || !strcmp( field, "chassis_serial" ) ||
+        !strcmp( field, "board_serial" ))
+        return "0";
+    return "";
+}
 
 #define PS5_TITLE_SURFACE_CREATE 1
 #define PS5_TITLE_SURFACE_OPEN 2
@@ -127,7 +154,7 @@ static inline unsigned int wine_ps5_build_hdr_edid( unsigned char *edid,
                                                     unsigned int width, unsigned int height )
 {
     static const unsigned char header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
-    static const char name[13] = {'P','S','5',' ','H','D','R',' ','T','V','\n',' ',' '};
+    static const char name[13] = {'W','i','n','e',' ','H','D','R',' ','T','V','\n',' '};
     unsigned char *cta, *timing;
     unsigned char max_code, max_full_frame_code, min_code;
     unsigned int i, hblank, vblank, hsync_offset, hsync_width;
@@ -158,7 +185,7 @@ static inline unsigned int wine_ps5_build_hdr_edid( unsigned char *edid,
 
     memset( edid, 0, WINE_PS5_HDR_EDID_SIZE );
     memcpy( edid, header, sizeof(header) );
-    edid[8] = 0x5e; edid[9] = 0x13;  /* WPS: synthetic Wine PS5 monitor. */
+    edid[8] = 0x5d; edid[9] = 0x2e;  /* WIN: synthetic Wine monitor. */
     edid[10] = 0x01;
     edid[16] = 1; edid[17] = 36;     /* Week 1, 2026. */
     edid[18] = 1; edid[19] = 4;

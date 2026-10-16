@@ -24,7 +24,6 @@
 
 #include "config.h"
 
-#include <cpuid.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -373,26 +372,6 @@ static BOOL PS5_SetCursorPos( INT x, INT y )
     return ps5_send_message( &point, sizeof(point) );
 }
 
-/* The GPU name as RADV shows it under the Linux the console boots, where
- * Wine names the GPU after the Vulkan device: libdrm has no amdgpu.ids entry
- * for 1002:13fb, so for this APU it takes the trimmed CPUID brand string
- * (from "Radeon" on if present, "AMD " in front unless it starts with it),
- * and RADV appends its chip name, GFX1013. The PS5 RADV builds it alike. */
-static void ps5_gpu_name( char *name, size_t size )
-{
-    unsigned int brand[13] = {0};
-    char *p, *end;
-    unsigned int i;
-
-    for (i = 0; i < 3; i++)
-        __cpuid( 0x80000002 + i, brand[4 * i], brand[4 * i + 1], brand[4 * i + 2], brand[4 * i + 3] );
-    p = (char *)brand;
-    while (*p == ' ') p++;
-    end = p + strlen( p );
-    while (end > p && end[-1] == ' ') *--end = 0;
-    if (strstr( p, "Radeon" )) p = strstr( p, "Radeon" );
-    snprintf( name, size, "%s%s (RADV GFX1013)", strncmp( p, "AMD", 3 ) ? "AMD " : "", p );
-}
 
 
 #ifdef __PROSPERO__
@@ -427,7 +406,7 @@ static UINT PS5_UpdateDisplayDevices( const struct gdi_device_manager *manager, 
     /* The console's own GPU function, 1002:13fb, revision 0 (lspci under
      * Linux on a PS5, where amdgpu drives it as Cyan Skillfish), as RADV
      * reports it too, so DXGI and Vulkan agree. */
-    struct pci_id pci_id = { .vendor = 0x1002, .device = 0x13fb };
+    struct pci_id pci_id = { .vendor = WINE_PS5_GPU_VENDOR_ID, .device = WINE_PS5_GPU_DEVICE_ID };
     struct gdi_monitor monitor =
     {
         .rc_monitor = { 0, 0, PS5_DESKTOP_WIDTH, PS5_DESKTOP_HEIGHT },
@@ -442,7 +421,6 @@ static UINT PS5_UpdateDisplayDevices( const struct gdi_device_manager *manager, 
         .dmBitsPerPel = 32, .dmDisplayFrequency = 60,
     };
     DEVMODEW current = mode;
-    char gpu_name[128];
 
 #ifdef __PROSPERO__
     if (!ps5_title_desktop) pthread_once( &title_modes_once, init_title_modes );
@@ -453,8 +431,7 @@ static UINT PS5_UpdateDisplayDevices( const struct gdi_device_manager *manager, 
         monitor.rc_monitor.bottom = monitor.rc_work.bottom = current.dmPelsHeight;
     }
 #endif
-    ps5_gpu_name( gpu_name, sizeof(gpu_name) );
-    manager->add_gpu( gpu_name, &pci_id, NULL, param );
+    manager->add_gpu( wine_ps5_gpu_name(), &pci_id, NULL, param );
     manager->add_source( "Default", source_flags, 96, param );
     manager->add_monitor( &monitor, param );
     current.dmFields |= DM_POSITION;

@@ -50,11 +50,8 @@ BOOL WINAPI SfcGetNextProtectedFile(HANDLE handle, PROTECTED_FILE_DATA *data)
  *  RpcHandle    [I] This must be NULL
  *  ProtFileName [I] Filename with Path to check
  *
- * RETURNS
- *  Failure: FALSE with GetLastError() != ERROR_FILE_NOT_FOUND
- *  Success: TRUE, when the File is Protected
- *           FALSE with GetLastError() == ERROR_FILE_NOT_FOUND,
- *           when the File is not Protected
+ *  TRUE when the file is protected; FALSE otherwise. This compatibility
+ *  stub always returns FALSE and leaves the caller's last-error value intact.
  *
  *
  * BUGS
@@ -63,18 +60,10 @@ BOOL WINAPI SfcGetNextProtectedFile(HANDLE handle, PROTECTED_FILE_DATA *data)
  */
 BOOL WINAPI SfcIsFileProtected(HANDLE RpcHandle, LPCWSTR ProtFileName)
 {
-    static BOOL reported = FALSE;
-
-    if (reported) {
-        TRACE("(%p, %s) stub\n", RpcHandle, debugstr_w(ProtFileName));
-    }
-    else
-    {
-        FIXME("(%p, %s) stub\n", RpcHandle, debugstr_w(ProtFileName));
-        reported = TRUE;
-    }
-
-    SetLastError(ERROR_FILE_NOT_FOUND);
+    (void)RpcHandle;
+    (void)ProtFileName;
+    /* WoW can reach this in a title-child execution context where Wine's
+     * diagnostics and last-error helper fault. Keep the stub leaf-only. */
     return FALSE;
 }
 
@@ -99,12 +88,12 @@ BOOL WINAPI SfcIsKeyProtected(HKEY hKey, LPCWSTR lpSubKey, REGSAM samDesired)
 {
     static BOOL reported = FALSE;
 
-    if (reported) {
-        TRACE("(%p, %s) stub\n", hKey, debugstr_w(lpSubKey));
-    }
+    if (reported)
+        TRACE("stub\n");
     else
     {
-        FIXME("(%p, %s) stub\n", hKey, debugstr_w(lpSubKey));
+        /* Keep title startup independent of debug string helper imports. */
+        FIXME("stub\n");
         reported = TRUE;
     }
 

@@ -1010,6 +1010,46 @@ static float float_distance( float a, float b )
     return a > b ? a - b : b - a;
 }
 
+static void test_generic_identity(void)
+{
+    static const struct
+    {
+        const char *field, *value;
+    } fields[] =
+    {
+        { "sys_vendor", "The Wine project" },
+        { "product_name", "Wine" },
+        { "product_version", "test-package-version" },
+        { "bios_vendor", "The Wine project" },
+        { "bios_version", "test-package-version" },
+        { "bios_date", "01/01/2021" },
+        { "product_serial", "0" },
+        { "product_sku", "" },
+        { "product_family", "" },
+        { "chassis_type", "" },
+        { "chassis_vendor", "The Wine project" },
+        { "chassis_version", "test-package-version" },
+        { "chassis_serial", "0" },
+        { "chassis_tag", "" },
+        { "board_vendor", "The Wine project" },
+        { "board_name", "Wine" },
+        { "board_version", "test-package-version" },
+        { "board_serial", "0" },
+        { "board_asset_tag", "" },
+        { "unknown", "" },
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        assert( !strcmp( wine_ps5_smbios_string( fields[i].field, "test-package-version" ),
+                         fields[i].value ));
+    assert( !strcmp( wine_ps5_gpu_name(), "AMD Radeon Graphics (RADV)" ));
+    assert( WINE_PS5_GPU_VENDOR_ID == 0x1002 );
+    assert( WINE_PS5_GPU_DEVICE_ID == 0x13fb );
+    puts( "ps5 identity: generic Wine SMBIOS, unavailable DMI fields, RADV name and real PCI IDs PASS" );
+}
+
+
 static void test_sdr_white_level_conversion(void)
 {
     assert( !wine_ps5_sdr_white_level_from_nits( WINE_PS5_SDR_WHITE_MIN_NITS - 1 ));
@@ -1047,6 +1087,8 @@ static void test_hdr_luminance_edid(void)
         assert( !(sum & 0xff) );
     }
     assert( !memcmp( edid, "\x00\xff\xff\xff\xff\xff\xff\x00", 8 ) );
+    assert( edid[8] == 0x5d && edid[9] == 0x2e ); /* EISA WIN. */
+    assert( edid[75] == 0xfc && !memcmp( edid + 77, "Wine HDR TV\n ", 13 ));
     assert( edid[126] == 1 && edid[128] == 0x02 && edid[129] == 0x03 );
     assert( (edid[56] | ((edid[58] & 0xf0) << 4)) == 3840 );
     assert( (edid[59] | ((edid[61] & 0xf0) << 4)) == 2160 );
@@ -1074,7 +1116,7 @@ static void test_hdr_luminance_edid(void)
     invalid = luminance;
     invalid.max_full_frame_luminance = invalid.max_luminance + 1.0f;
     assert( !wine_ps5_build_hdr_edid( edid, &invalid, 3840, 2160 ) );
-    puts( "ps5 hdr edid: runtime ABI, CTA luminance codes, BT.2020/D65 and checksums PASS" );
+    puts( "ps5 hdr edid: Wine identity, runtime ABI, CTA luminance codes, BT.2020/D65 and checksums PASS" );
 }
 
 static int game_loader_exists( const char *path )
@@ -2280,6 +2322,7 @@ int main(void)
     test_radv_windows();
     test_title_driver_load();
     test_title_stdout_binding();
+    test_generic_identity();
     test_sdr_white_level_conversion();
     test_hdr_luminance_edid();
     test_game_image_rule();
