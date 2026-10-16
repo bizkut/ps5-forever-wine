@@ -45,8 +45,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(ps5drv);
 struct ps5_window_surface
 {
     struct window_surface header;
-    void *bits;
-    size_t size;
+    void *bits;  /* draw plane, followed by size bytes of published pixels */
+    size_t size; /* bytes in one plane */
     UINT stride;
     char shm[PS5_DESKTOP_SHM_NAME];
     RECT clip;  /* bounding visible rect in surface coordinates */
@@ -211,17 +211,19 @@ static BOOL ps5_surface_flush( struct window_surface *window_surface, const RECT
     const BYTE *src;
     BYTE *dst;
     RECT clipped;
-    UINT src_stride = color_info->bmiHeader.biWidth * 4;
-    int y, src_y, height = abs( color_info->bmiHeader.biHeight );
+    int y;
     BOOL ret = TRUE;
 
     if (!intersect_rect( &clipped, dirty, &bounds )) return TRUE;
-    /* A surface drawn straight into the shared memory needs no copy, only the
-     * damage report; one whose bitmap could not wrap it is copied here. dirty
-     * and color_bits are relative to the DIB, not rect->left/top. The latter
-     * may be negative when win32u crops a very large window. */
+    /* GDI and foreign processes share the first plane, including bitmap reads.
+     * A private DIB must update those draw pixels before publishing, so a later
+     * owner flush retains foreign drawing. dirty and color_bits are relative
+     * to the DIB, not rect->left/top, which can be negative. */
     if (color_bits != surface->bits)
     {
+        UINT src_stride = color_info->bmiHeader.biWidth * 4;
+        int src_y, height = abs( color_info->bmiHeader.biHeight );
+
         dst = (BYTE *)surface->bits + clipped.top * surface->stride + clipped.left * 4;
         for (y = clipped.top; y < clipped.bottom; y++, dst += surface->stride)
         {
@@ -230,6 +232,10 @@ static BOOL ps5_surface_flush( struct window_surface *window_surface, const RECT
             memcpy( dst, src, (clipped.right - clipped.left) * 4 );
         }
     }
+    src = (const BYTE *)surface->bits + clipped.top * surface->stride + clipped.left * 4;
+    dst = (BYTE *)surface->bits + surface->size + clipped.top * surface->stride + clipped.left * 4;
+    for (y = clipped.top; y < clipped.bottom; y++, src += surface->stride, dst += surface->stride)
+        memcpy( dst, src, (clipped.right - clipped.left) * 4 );
     damage.left = clipped.left;
     damage.top = clipped.top;
     damage.right = clipped.right;
@@ -262,7 +268,7 @@ static void ps5_surface_destroy( struct window_surface *window_surface )
 {
     struct ps5_window_surface *surface = (struct ps5_window_surface *)window_surface;
 
-    if (surface->bits) munmap( surface->bits, surface->size );
+    if (surface->bits) munmap( surface->bits, 2 * surface->size );
     if (surface->shm[0]) unlink_surface( surface->shm );
 }
 
@@ -300,6 +306,7 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     info->bmiHeader.biCompression = BI_RGB;
     info->bmiHeader.biSizeImage = width * height * 4u;
     size = info->bmiHeader.biSizeImage;
+    if (size > SIZE_MAX / 2) return NULL;
     /* O_EXCL also handles names left by a killed process with a reused pid. */
     do
     {
@@ -308,7 +315,7 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
                   (unsigned int)getpid(), (unsigned long)(UINT_PTR)hwnd, serial );
 #ifdef __PROSPERO__
         if (ps5_title_desktop)
-            fd = __wine_ps5_desktop_surface( shm, size, PS5_TITLE_SURFACE_CREATE );
+            fd = __wine_ps5_desktop_surface( shm, 2 * size, PS5_TITLE_SURFACE_CREATE );
         else
 #endif
             fd = shm_open( shm, O_RDWR | O_CREAT | O_EXCL, 0600 );
@@ -320,13 +327,13 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     }
 #ifdef __PROSPERO__
     if (ps5_title_desktop)
-        bits = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+        bits = mmap( NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
     else
 #endif
-    if (fchmod( fd, 0666 ) || ftruncate( fd, size ))
+    if (fchmod( fd, 0666 ) || ftruncate( fd, 2 * size ))
         bits = MAP_FAILED;
     else
-        bits = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+        bits = mmap( NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
     if (bits == MAP_FAILED)
     {
         ERR( "Cannot create the shared surface for %p: %s\n", hwnd, strerror( errno ) );
@@ -336,8 +343,8 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     }
     close( fd );
 
-    /* GDI draws straight into the shared memory the title reads, as winex11
-     * draws into an XShm image, so a flush only reports the damage. */
+    /* GDI draws into the first plane; a flush copies dirty rows into the
+     * second plane, the only pixels the title reads. */
     desc.Width = width;
     desc.Height = height;
     desc.Pitch = width * 4u;
@@ -357,7 +364,7 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     if (!(window_surface = window_surface_create( sizeof(*surface), &ps5_surface_funcs, hwnd, rect, info, bitmap )))
     {
         if (bitmap) NtGdiDeleteObjectApp( bitmap );
-        munmap( bits, size );
+        munmap( bits, 2 * size );
         unlink_surface( shm );
         return NULL;
     }
@@ -369,6 +376,7 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     /* Match window_surface_create's initial white DIB, including pixels
      * outside the first dirty rectangle. */
     if (!bitmap) memset( bits, 0xff, size );
+    memset( (BYTE *)bits + size, 0xff, size );
     if (width <= 0xffff && height <= 0xffff && rect->left == (INT16)rect->left && rect->top == (INT16)rect->top)
     {
         NtUserSetProp( hwnd, surface_id_prop, (HANDLE)(UINT_PTR)(((UINT64)getpid() << 32) | serial) );
@@ -379,16 +387,14 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
     return window_surface;
 }
 
-/* Another process's window surface, drawn into from this one: the same shared
- * memory its owner, the hub and the title use, opened by the name the owner
- * published on the window. A flush reports the damage for the owner's window;
- * the owner's own drawing and this one land in the same pixels, the later one
- * showing, as on Windows. */
+/* Another process's window surface, drawn into from this one: open both planes
+ * by the name the owner published, and wrap the same draw plane as the owner.
+ * A flush publishes its dirty rows and reports damage for the owner's window. */
 struct ps5_foreign_surface
 {
     struct window_surface header;
-    void *bits;
-    size_t size;
+    void *bits;  /* draw plane, followed by size bytes of published pixels */
+    size_t size; /* bytes in one plane */
     UINT stride;
 };
 
@@ -408,15 +414,18 @@ static BOOL foreign_surface_flush( struct window_surface *window_surface, const 
         .id = (UINT_PTR)window_surface->hwnd,
     };
     const RECT bounds = { 0, 0, surface->stride / 4, surface->size / surface->stride };
-    UINT src_stride = color_info->bmiHeader.biWidth * 4;
-    int y, src_y, height = abs( color_info->bmiHeader.biHeight );
+    int y;
     const BYTE *src;
     BYTE *dst;
     RECT clipped;
 
     if (!intersect_rect( &clipped, dirty, &bounds )) return TRUE;
+    /* Keep the shared draw plane current when this process uses a private DIB. */
     if (color_bits != surface->bits)
     {
+        UINT src_stride = color_info->bmiHeader.biWidth * 4;
+        int src_y, height = abs( color_info->bmiHeader.biHeight );
+
         dst = (BYTE *)surface->bits + clipped.top * surface->stride + clipped.left * 4;
         for (y = clipped.top; y < clipped.bottom; y++, dst += surface->stride)
         {
@@ -425,6 +434,10 @@ static BOOL foreign_surface_flush( struct window_surface *window_surface, const 
             memcpy( dst, src, (clipped.right - clipped.left) * 4 );
         }
     }
+    src = (const BYTE *)surface->bits + clipped.top * surface->stride + clipped.left * 4;
+    dst = (BYTE *)surface->bits + surface->size + clipped.top * surface->stride + clipped.left * 4;
+    for (y = clipped.top; y < clipped.bottom; y++, src += surface->stride, dst += surface->stride)
+        memcpy( dst, src, (clipped.right - clipped.left) * 4 );
     damage.left = clipped.left;
     damage.top = clipped.top;
     damage.right = clipped.right;
@@ -437,7 +450,7 @@ static void foreign_surface_destroy( struct window_surface *window_surface )
     struct ps5_foreign_surface *surface = (struct ps5_foreign_surface *)window_surface;
 
     /* The shared memory is the owner's: it unlinks it. */
-    if (surface->bits) munmap( surface->bits, surface->size );
+    if (surface->bits) munmap( surface->bits, 2 * surface->size );
 }
 
 static const struct window_surface_funcs foreign_surface_funcs =
@@ -469,18 +482,19 @@ static struct window_surface *open_foreign_surface( HWND hwnd, UINT64 id, UINT64
     RECT rect;
     int width = (UINT16)(packed >> 32), height = (UINT16)(packed >> 48), fd;
     char shm[PS5_DESKTOP_SHM_NAME];
-    size_t size = (size_t)width * height * 4;
+    size_t size;
     HBITMAP bitmap = 0;
     struct stat st;
     void *bits, *saved;
 
-    if (!width || !height) return NULL;
+    if (!width || !height || (size_t)height > SIZE_MAX / (width * 8u)) return NULL;
+    size = (size_t)width * height * 4;
     SetRect( &rect, (INT16)packed, (INT16)(packed >> 16), (INT16)packed + width, (INT16)(packed >> 16) + height );
     snprintf( shm, sizeof(shm), "/wine-ps5-%u-%lx-%u", (unsigned int)(id >> 32), (unsigned long)(UINT_PTR)hwnd,
               (unsigned int)id );
 #ifdef __PROSPERO__
     if (ps5_title_desktop)
-        fd = __wine_ps5_desktop_surface( shm, size, PS5_TITLE_SURFACE_OPEN );
+        fd = __wine_ps5_desktop_surface( shm, 2 * size, PS5_TITLE_SURFACE_OPEN );
     else
 #endif
         fd = shm_open( shm, O_RDWR, 0 );
@@ -491,13 +505,13 @@ static struct window_surface *open_foreign_surface( HWND hwnd, UINT64 id, UINT64
     }
 #ifdef __PROSPERO__
     if (ps5_title_desktop)
-        bits = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+        bits = mmap( NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
     else
 #endif
-    if (fstat( fd, &st ) || (size_t)st.st_size < size)
+    if (fstat( fd, &st ) || st.st_size < 0 || (uint64_t)st.st_size < 2 * size)
         bits = MAP_FAILED;
     else
-        bits = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+        bits = mmap( NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
     if (bits == MAP_FAILED)
     {
         WARN( "Cannot map %s, the surface of %p: %s\n", shm, hwnd, strerror( errno ) );
@@ -527,7 +541,7 @@ static struct window_surface *open_foreign_surface( HWND hwnd, UINT64 id, UINT64
     }
     if (desc.hDeviceDc) NtGdiDeleteObjectApp( desc.hDeviceDc );
 
-    /* window_surface_create paints the bitmap white, here the owner's pixels. */
+    /* window_surface_create paints the bitmap white, here the owner's draw plane. */
     saved = bitmap ? malloc( size ) : NULL;
     if (saved) memcpy( saved, bits, size );
     window_surface = window_surface_create( sizeof(*surface), &foreign_surface_funcs, hwnd, &rect, info, bitmap );
@@ -539,7 +553,7 @@ static struct window_surface *open_foreign_surface( HWND hwnd, UINT64 id, UINT64
     if (!window_surface)
     {
         if (bitmap) NtGdiDeleteObjectApp( bitmap );
-        munmap( bits, size );
+        munmap( bits, 2 * size );
         return NULL;
     }
     surface = (struct ps5_foreign_surface *)window_surface;

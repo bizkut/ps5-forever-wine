@@ -375,6 +375,7 @@ static pthread_mutex_t title_dir_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
 static LONG64 title_io_now_us(void);
+static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply );
 
 static struct wine_ps5_sticky_writes title_write_sticky_handles;
 static pthread_mutex_t title_write_sticky_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2691,7 +2692,7 @@ static NTSTATUS server_get_name_info( HANDLE handle, FILE_NAME_INFORMATION *info
 }
 
 
-static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
+static NTSTATUS get_full_size_info(HANDLE handle, int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
     struct stat st;
     ULONGLONG bsize;
 
@@ -2712,6 +2713,24 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) 
     if (fstatfs( fd, &stfs ) < 0) return errno_to_status( errno );
     bsize = stfs.f_bsize;
 #endif
+#ifdef __PROSPERO__
+    if (ps5_direct_enabled())
+    {
+        struct wb_statfs_reply reply;
+
+        /* Keep the shim's mount flags and device classification; only the
+         * capacity counters require the payload's privileged statfs. */
+        if (broker_query_fs( handle, &reply ))
+        {
+            bsize = reply.bsize;
+            stfs.f_blocks = reply.blocks;
+            stfs.f_bfree = reply.bfree;
+            stfs.f_bavail = reply.bavail;
+        }
+    }
+#else
+    (void)handle;
+#endif
     if (bsize == 2048)  /* assume CD-ROM */
     {
         info->BytesPerSector = 2048;
@@ -2728,12 +2747,12 @@ static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS get_full_size_info_ex(int fd, FILE_FS_FULL_SIZE_INFORMATION_EX *info)
+static NTSTATUS get_full_size_info_ex(HANDLE handle, int fd, FILE_FS_FULL_SIZE_INFORMATION_EX *info)
 {
     FILE_FS_FULL_SIZE_INFORMATION full_info;
     NTSTATUS status;
 
-    if ((status = get_full_size_info(fd, &full_info)) != STATUS_SUCCESS)
+    if ((status = get_full_size_info(handle, fd, &full_info)) != STATUS_SUCCESS)
         return status;
 
     info->ActualTotalAllocationUnits = full_info.TotalAllocationUnits.QuadPart;
@@ -7600,6 +7619,70 @@ static int broker_connect(void)
     return fd;
 }
 
+/* Called with the selected pool slot locked, for writes and space queries. */
+static int broker_get_connection( unsigned int index, LONG64 now )
+{
+    if (broker[index].fd == -1 && (broker[index].fd = broker_connect()) == -1)
+    {
+        __atomic_store_n( &broker_retry_at, now + BROKER_RETRY_SECONDS * 1000000ll, __ATOMIC_SEQ_CST );
+        if (!InterlockedExchange( &broker_logged_down, 1 ))
+        {
+            char line[96];
+            snprintf( line, sizeof(line), "wine: title write broker unavailable pid=%d errno=%d\n",
+                      (int)getpid(), errno );
+            sceKernelDebugOutText( 0, line );
+        }
+    }
+    else if (!InterlockedExchange( &broker_logged_up, 1 ))
+    {
+        char line[96];
+        snprintf( line, sizeof(line), "wine: title write broker connected pid=%d\n", (int)getpid() );
+        sceKernelDebugOutText( 0, line );
+    }
+    return broker[index].fd;
+}
+
+/* Reuse the write client's handshake, connection pool and retry interval.
+ * An absent or older broker leaves the title's synthetic shim answer intact. */
+static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply )
+{
+    static LONG logged_broker, logged_synthetic;
+    struct wb_write request = {.magic = WB_STATFS_MAGIC};
+    LONG64 now = title_io_now_us();
+    char *path = NULL;
+    unsigned int index;
+    int result = 0;
+
+    if (now < __atomic_load_n( &broker_retry_at, __ATOMIC_SEQ_CST )) goto done;
+    if (server_get_unix_name( handle, &path ) || !path) goto done;
+    if (!wb_path_root( path ) || strlen( path ) > WB_MAX_PATH) goto done;
+    request.path_length = strlen( path );
+    index = GetCurrentThreadId() % BROKER_CONNECTIONS;
+    pthread_mutex_lock( &broker[index].lock );
+    if (broker_get_connection( index, now ) != -1)
+    {
+        if (broker_transfer( broker[index].fd, &request, sizeof(request), 1 ) ||
+            broker_transfer( broker[index].fd, path, request.path_length, 1 ) ||
+            broker_transfer( broker[index].fd, reply, sizeof(*reply), 0 ) || reply->magic != WB_MAGIC)
+        {
+            close( broker[index].fd );
+            broker[index].fd = -1;
+        }
+        else result = !reply->result;
+    }
+    pthread_mutex_unlock( &broker[index].lock );
+done:
+    free( path );
+    if (!InterlockedExchange( result ? &logged_broker : &logged_synthetic, 1 ))
+    {
+        char line[96];
+        snprintf( line, sizeof(line), "wine: title disk space source=%s pid=%d\n",
+                  result ? "broker" : "synthetic", (int)getpid() );
+        sceKernelDebugOutText( 0, line );
+    }
+    return result;
+}
+
 /* one request on a connected broker: length bytes, at most WB_MAX_WRITE;
  * the bytes written, or BROKER_UNAVAILABLE */
 static ssize_t broker_request( int fd, const char *path, size_t path_length, const char *buffer,
@@ -7666,25 +7749,8 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
     index = known_path ? (uintptr_t)pthread_self() % BROKER_CONNECTIONS
                        : GetCurrentThreadId() % BROKER_CONNECTIONS;
     pthread_mutex_lock( &broker[index].lock );
-    if (broker[index].fd == -1 && (broker[index].fd = broker_connect()) == -1)
+    if (broker_get_connection( index, now ) != -1)
     {
-        __atomic_store_n( &broker_retry_at, now + BROKER_RETRY_SECONDS * 1000000ll, __ATOMIC_SEQ_CST );
-        if (!InterlockedExchange( &broker_logged_down, 1 ))
-        {
-            char line[96];
-            snprintf( line, sizeof(line), "wine: title write broker unavailable pid=%d errno=%d\n",
-                      (int)getpid(), errno );
-            sceKernelDebugOutText( 0, line );
-        }
-    }
-    else
-    {
-        if (!InterlockedExchange( &broker_logged_up, 1 ))
-        {
-            char line[96];
-            snprintf( line, sizeof(line), "wine: title write broker connected pid=%d\n", (int)getpid() );
-            sceKernelDebugOutText( 0, line );
-        }
         while (done < length)
         {
             size_t chunk = min( length - done, WB_MAX_WRITE );
@@ -9870,7 +9936,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
             FILE_FS_SIZE_INFORMATION *info = buffer;
             FILE_FS_FULL_SIZE_INFORMATION full_info;
 
-            if ((status = get_full_size_info(fd, &full_info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info(handle, fd, &full_info)) == STATUS_SUCCESS)
             {
                 info->TotalAllocationUnits = full_info.TotalAllocationUnits;
                 info->AvailableAllocationUnits = full_info.CallerAvailableAllocationUnits;
@@ -10033,7 +10099,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         else
         {
             FILE_FS_FULL_SIZE_INFORMATION *info = buffer;
-            if ((status = get_full_size_info(fd, info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info(handle, fd, info)) == STATUS_SUCCESS)
                 io->Information = sizeof(*info);
         }
         break;
@@ -10044,7 +10110,7 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         else
         {
             FILE_FS_FULL_SIZE_INFORMATION_EX *info = buffer;
-            if ((status = get_full_size_info_ex(fd, info)) == STATUS_SUCCESS)
+            if ((status = get_full_size_info_ex(handle, fd, info)) == STATUS_SUCCESS)
                 io->Information = sizeof(*info);
         }
         break;

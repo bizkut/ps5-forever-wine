@@ -25,6 +25,11 @@
  * broker to copy WB_ICON_FILE, a 512x512 PNG, over the home screen's copies
  * of the title's icon (/user/app/WB_TITLE_ID/... and /user/appmeta/...),
  * which a title cannot reach; it answers how many it replaced, or -errno.
+ * WB_STATFS_MAGIC instead asks for filesystem space below WB_USER_ROOT:
+ * path_length bytes of path, with offset, length and reserved all zero.
+ * It answers struct wb_statfs_reply (including on refusal), with the real
+ * statfs counters or -errno; negative f_bavail is clamped to zero.
+ * Malformed requests close the connection.
  */
 
 #ifndef __WINE_PS5_WRITEBROKER_H
@@ -36,8 +41,8 @@
 #define WB_PORT        9141
 #define WB_MAGIC       0x31524257u   /* "WBR1" */
 /* 2: WB_USER_ROOT, versioned hello. 3: user data only, token in WB_USER_ROOT.
- * 4: WB_ICON_MAGIC */
-#define WB_VERSION     4
+ * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC */
+#define WB_VERSION     5
 #define WB_TOKEN_BYTES 16
 #define WB_MAX_PATH    1024
 #define WB_MAX_WRITE   (16u << 20)
@@ -48,6 +53,7 @@
 #define WB_TOKEN_FILE  WB_USER_ROOT ".writebroker-token"
 #define WB_QUIT_MAGIC  0x54495551u   /* "QUIT" in place of a wb_write: the broker exits */
 #define WB_ICON_MAGIC  0x4e4f4349u   /* "ICON" in place of a wb_write */
+#define WB_STATFS_MAGIC 0x53465453u  /* "STFS" in place of a wb_write */
 #define WB_ICON_FILE   WB_USER_ROOT "icon0.png"
 #define WB_TITLE_ID    "PPSA99030"
 
@@ -88,8 +94,19 @@ struct wb_reply
     int32_t  result;
 };
 
+struct wb_statfs_reply
+{
+    uint32_t magic;
+    int32_t result;
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t bavail;
+};
+
 _Static_assert( sizeof(struct wb_hello) == 24, "wb_hello wire size" );
 _Static_assert( sizeof(struct wb_write) == 24, "wb_write wire size" );
 _Static_assert( sizeof(struct wb_reply) == 8, "wb_reply wire size" );
+_Static_assert( sizeof(struct wb_statfs_reply) == 40, "wb_statfs_reply wire size" );
 
 #endif /* __WINE_PS5_WRITEBROKER_H */

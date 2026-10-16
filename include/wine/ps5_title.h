@@ -250,8 +250,9 @@ struct wine_ps5_title_runtime
     /* Window surface shared memory, done by the title parent for every
      * process: op PS5_TITLE_SURFACE_CREATE creates name exclusively
      * (O_RDWR|O_CREAT|O_EXCL, mode 0666) sized to size bytes and returns its
-     * fd; PS5_TITLE_SURFACE_OPEN opens an existing name O_RDWR and returns
-     * its fd (size is the minimum required size); PS5_TITLE_SURFACE_UNLINK
+     * fd; size includes both the draw and published planes (see ps5_desktop.h).
+     * PS5_TITLE_SURFACE_OPEN opens an existing name O_RDWR and returns its fd
+     * (size is the minimum total object size); PS5_TITLE_SURFACE_UNLINK
      * unlinks name and returns 0. -1 with errno on failure. name is a
      * "/wine-ps5-..." object name shorter than PS5_DESKTOP_SHM_NAME (64). */
     int (*desktop_surface)( const char *name, uint64_t size, int op );

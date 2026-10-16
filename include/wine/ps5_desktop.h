@@ -27,9 +27,14 @@
  * on any driver.
  *
  * Window pixels: each top-level window's surface is a shared-memory object
- * the driver creates (mode 0666) and names in a WINDOW message; the title
- * opens it by name, read-only. The pixels are 32-bit B,G,R,X, top-down, as
- * win32u's DIB surfaces and the title's scan-out are.
+ * the driver creates (mode 0666) and names in a WINDOW message. Each plane
+ * is stride * height bytes: GDI (including foreign processes) draws into the
+ * first plane, and flush copies the clipped dirty rows into the second,
+ * published plane before sending DAMAGE. The title opens the object read-only
+ * and composes only the published plane, including on window/cursor redraws.
+ * Both planes start white. Pixels are 32-bit B,G,R,X, top-down, as win32u's
+ * DIB surfaces and the title's scan-out are. Payload and title Wine use the
+ * same layout because their windows share the title compositor.
  *
  * Every message starts with struct ps5_desktop_header; size counts the
  * header. Integers are the console's (little-endian); the two ends are built
@@ -115,7 +120,7 @@ struct ps5_desktop_window
     uint32_t alpha;             /* LAYERED: 0-255 for the whole window */
     uint32_t color_key;         /* LAYERED: 0x00RRGGBB drawn transparent, or ~0u for none */
     int32_t  visible_left, visible_top, visible_right, visible_bottom; /* in the surface: what shows */
-    char     shm[PS5_DESKTOP_SHM_NAME]; /* the pixels' object, empty when there are none */
+    char     shm[PS5_DESKTOP_SHM_NAME]; /* draw + published planes, empty when there are none */
 };
 
 struct ps5_desktop_damage
