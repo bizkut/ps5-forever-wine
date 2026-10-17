@@ -428,6 +428,9 @@ struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, con
     struct ace *ace;
     struct acl *dacl;
     char *ptr;
+#ifdef __PROSPERO__
+    int title_world_access = inprocess_server && (mode & S_IRWXO) == S_IRWXO;
+#endif
 
     dacl_size = sizeof(*dacl) + sizeof(*ace) + sid_len( &local_system_sid );
     if (mode & S_IRWXU) dacl_size += sizeof(*ace) + sid_len( user );
@@ -436,6 +439,11 @@ struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, con
         (!(mode & S_IXUSR) && (mode & (S_IXGRP|S_IXOTH))))
         dacl_size += sizeof(*ace) + sid_len( user );
     if (mode & S_IRWXO) dacl_size += sizeof(*ace) + sid_len( &world_sid );
+#ifdef __PROSPERO__
+    if (title_world_access)
+        dacl_size += 4 * sizeof(*ace) + sid_len( &builtin_admins_sid ) + sid_len( &builtin_users_sid ) +
+                     sid_len( &interactive_sid ) + sid_len( &all_app_packages_sid );
+#endif
 
     sd = mem_alloc( sizeof(*sd) + sid_len( user ) + sid_len( group ) + dacl_size );
     if (!sd) return sd;
@@ -461,6 +469,9 @@ struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, con
         (!(mode & S_IXUSR) && (mode & (S_IXGRP|S_IXOTH))))
         dacl->count++;
     if (mode & S_IRWXO) dacl->count++;
+#ifdef __PROSPERO__
+    if (title_world_access) dacl->count += 4;
+#endif
 
     flags = (mode & S_IFDIR) ? OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE : 0;
 
@@ -487,6 +498,18 @@ struct security_descriptor *mode_to_sd( mode_t mode, const struct sid *user, con
             ace->mask |= FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
         ace->mask &= ~STANDARD_RIGHTS_ALL; /* never deny standard rights */
     }
+#ifdef __PROSPERO__
+    if (title_world_access)
+    {
+        /* Title files cannot persist security xattrs. Reproduce the explicit
+         * install grants that Battle.net otherwise repairs on every start. */
+        ace = set_ace( ace_next( ace ), &builtin_admins_sid, ACCESS_ALLOWED_ACE_TYPE, flags, FILE_ALL_ACCESS );
+        ace = set_ace( ace_next( ace ), &builtin_users_sid, ACCESS_ALLOWED_ACE_TYPE, flags, FILE_ALL_ACCESS );
+        ace = set_ace( ace_next( ace ), &interactive_sid, ACCESS_ALLOWED_ACE_TYPE, flags, FILE_ALL_ACCESS );
+        ace = set_ace( ace_next( ace ), &all_app_packages_sid, ACCESS_ALLOWED_ACE_TYPE, flags,
+                       FILE_GENERIC_READ | FILE_GENERIC_EXECUTE );
+    }
+#endif
     if (mode & S_IRWXO)
     {
         /* appropriate access rights for Everyone */

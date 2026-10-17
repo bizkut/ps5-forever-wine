@@ -81,9 +81,10 @@ const struct sid local_system_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { 
 const struct sid builtin_admins_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS } };
 const struct sid builtin_users_sid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS } };
 const struct sid domain_users_sid = { SID_REVISION, 5, SECURITY_NT_AUTHORITY, { SECURITY_NT_NON_UNIQUE, 0, 0, 0, DOMAIN_GROUP_RID_USERS } };
+const struct sid interactive_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_INTERACTIVE_RID } };
+const struct sid all_app_packages_sid = { SID_REVISION, 2, SECURITY_APP_PACKAGE_AUTHORITY, { SECURITY_APP_PACKAGE_BASE_RID, SECURITY_BUILTIN_PACKAGE_ANY_PACKAGE } };
 
 static const struct sid local_sid = { SID_REVISION, 1, SECURITY_LOCAL_SID_AUTHORITY, { SECURITY_LOCAL_RID } };
-static const struct sid interactive_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_INTERACTIVE_RID } };
 static const struct sid anonymous_logon_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_ANONYMOUS_LOGON_RID } };
 static const struct sid authenticated_user_sid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_AUTHENTICATED_USER_RID } };
 static const struct sid high_label_sid = { SID_REVISION, 1, SECURITY_MANDATORY_LABEL_AUTHORITY, { SECURITY_MANDATORY_HIGH_RID } };

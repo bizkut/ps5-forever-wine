@@ -51,6 +51,8 @@ extern const struct sid local_system_sid;
 extern const struct sid builtin_users_sid;
 extern const struct sid builtin_admins_sid;
 extern const struct sid domain_users_sid;
+extern const struct sid interactive_sid;
+extern const struct sid all_app_packages_sid;
 
 struct ace
 {
