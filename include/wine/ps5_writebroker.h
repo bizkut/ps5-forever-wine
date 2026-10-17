@@ -35,6 +35,9 @@
  * path_length bytes of path, with offset, length and reserved all zero.
  * It answers struct wb_statfs_reply (including on refusal), with the real
  * statfs counters or -errno; negative f_bavail is clamped to zero.
+ * Protocol version 6 identifies brokers that perform bounded, no-follow
+ * permission repair over their fixed launcher-data roots before creating
+ * the authentication token or accepting connections.
  * Malformed requests close the connection.
  */
 
@@ -47,14 +50,13 @@
 #define WB_PORT        9141
 #define WB_MAGIC       0x31524257u   /* "WBR1" */
 /* 2: WB_USER_ROOT, versioned hello. 3: user data only, token in WB_USER_ROOT.
- * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC */
-#define WB_VERSION     5
+ * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC. 6: startup permission repair. */
+#define WB_VERSION     6
 #define WB_TOKEN_BYTES 16
 #define WB_MAX_PATH    1024
 #define WB_MAX_WRITE   (16u << 20)
 /* The title's user data (Wine prefix with the games) lives outside the app
- * folder, which a store update replaces. The app creates it before starting
- * the broker, which never creates it: it must stay writable by the app. */
+ * folder, which a store update replaces. */
 #define WB_USER_ROOT   "/data/forever/"
 #define WB_TOKEN_FILE  WB_USER_ROOT ".writebroker-token"
 #define WB_QUIT_MAGIC  0x54495551u   /* "QUIT" in place of a wb_write: the broker exits */
@@ -94,6 +96,7 @@ struct wb_write
     uint32_t reserved;
 };
 
+
 struct wb_reply
 {
     uint32_t magic;
@@ -109,6 +112,7 @@ struct wb_statfs_reply
     uint64_t bfree;
     uint64_t bavail;
 };
+
 
 _Static_assert( sizeof(struct wb_hello) == 24, "wb_hello wire size" );
 _Static_assert( sizeof(struct wb_write) == 24, "wb_write wire size" );
