@@ -1217,52 +1217,6 @@ static void test_refused_program_rule(void)
     puts( "ps5 refused program: basename-only profile list and path/case-insensitive match PASS" );
 }
 
-static enum wine_ps5_title_spawn_action spawn_action( const char *image, const char *refused,
-                                                      const char *reporters, const char **match,
-                                                      size_t *match_length )
-{
-    uint16_t wide[512];
-    size_t length = strlen( image ), i;
-
-    assert( length < sizeof(wide) / sizeof(wide[0]) );
-    for (i = 0; i < length; i++) wide[i] = (unsigned char)image[i];
-    return wine_ps5_title_spawn_action( wide, length, refused, reporters, match, match_length );
-}
-
-static void test_crash_reporter_rule(void)
-{
-    static const char reporters[] = "OtherReporter.exe;BlizzardError.exe";
-    static const char refused[] = "Blocked.exe;BlizzardError.exe";
-    const char *match = NULL;
-    size_t length = 0;
-
-    /* A reporter ends its requester even when it is also in the refusal list. */
-    assert( spawn_action( "\\??\\C:\\Games\\Errors\\bLiZzArDeRrOr.ExE", refused, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_TERMINATE );
-    assert( match == reporters + strlen("OtherReporter.exe;") );
-    assert( length == strlen("BlizzardError.exe") );
-    assert( spawn_action( "D:/Helpers/BLIZZARDERROR.EXE", "", reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_TERMINATE );
-    assert( spawn_action( "BlizzardError.exe", NULL, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_TERMINATE );
-    assert( spawn_action( "C:\\Helpers\\Blocked.exe", refused, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_REFUSE );
-    assert( match == refused && length == strlen("Blocked.exe") );
-    assert( spawn_action( "C:\\Errors\\BlizzardError.exe", refused, NULL,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_REFUSE );
-    assert( spawn_action( "C:\\Games\\WowB.exe", refused, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_ALLOW );
-    assert( !match && !length );
-    assert( spawn_action( "C:\\Errors\\NotBlizzardError.exe", refused, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_ALLOW );
-    assert( spawn_action( "C:\\Errors\\BlizzardError.exe.old", refused, reporters,
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_ALLOW );
-    assert( spawn_action( "BlizzardError.exe", "", "",
-                          &match, &length ) == WINE_PS5_TITLE_SPAWN_ALLOW );
-    assert( !match && !length );
-    puts( "ps5 crash reporter: terminate requester, refusal-only and allow decisions PASS" );
-}
-
 static void test_write_routing(void)
 {
     static const uint64_t run120_stalls[] =
@@ -2422,7 +2376,6 @@ int main(void)
     test_hdr_luminance_edid();
     test_game_image_rule();
     test_refused_program_rule();
-    test_crash_reporter_rule();
     test_write_routing();
     test_sticky_write_routing();
     test_write_coalescing();

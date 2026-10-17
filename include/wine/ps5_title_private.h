@@ -587,25 +587,6 @@ static inline const char *wine_ps5_title_refused_program( const uint16_t *image,
     return NULL;
 }
 
-enum wine_ps5_title_spawn_action
-{
-    WINE_PS5_TITLE_SPAWN_ALLOW,
-    WINE_PS5_TITLE_SPAWN_REFUSE,
-    WINE_PS5_TITLE_SPAWN_TERMINATE
-};
-
-/* A crash reporter request ends the requesting game before it can show a
- * modal dialog on the GPU role's null driver. Ordinary refusals never do. */
-static inline enum wine_ps5_title_spawn_action wine_ps5_title_spawn_action(
-    const uint16_t *image, size_t length, const char *refused, const char *reporters,
-    const char **match, size_t *match_length )
-{
-    *match = wine_ps5_title_refused_program( image, length, reporters, match_length );
-    if (*match) return WINE_PS5_TITLE_SPAWN_TERMINATE;
-    *match = wine_ps5_title_refused_program( image, length, refused, match_length );
-    return *match ? WINE_PS5_TITLE_SPAWN_REFUSE : WINE_PS5_TITLE_SPAWN_ALLOW;
-}
-
 /* Battle.net's real WoW game images are drive-qualified Wow*.exe files with
  * a sibling <name>_loader.dll. The caller supplies the translated Unix image
  * and performs the filesystem check, keeping this predicate host-testable. */
