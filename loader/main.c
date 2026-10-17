@@ -861,6 +861,7 @@ static int ps5_hub_driver_message( struct ps5_desktop_hub *hub, struct ps5_hub_p
         const struct ps5_desktop_cursor_shape *shape = (const void *)header;
         struct ps5_desktop_cursor_shape **saved;
         if (!ps5_desktop_cursor_shape_valid( header, header->size )) return 0;
+        window = NULL;
         if (shape->id)
         {
             if (!(window = ps5_hub_find_window( hub, shape->id ))) return 1;
@@ -873,7 +874,7 @@ static int ps5_hub_driver_message( struct ps5_desktop_hub *hub, struct ps5_hub_p
         memcpy( *saved, header, header->size );
         if (hub->replay_cursors)
         {
-            if (shape->id)
+            if (window)
             {
                 if (!window->replay_cursor) window->replay_cursor_changed = 1;
             }
