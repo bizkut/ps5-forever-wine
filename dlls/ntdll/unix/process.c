@@ -956,13 +956,25 @@ static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_
     if (ps5_direct_enabled())
     {
         static LONG refused_logged;
-        const char *programs = getenv( "WINEPS5_REFUSED_PROGRAMS" ), *refused;
-        size_t refused_length;
+        const char *program;
+        size_t program_length;
+        enum wine_ps5_title_spawn_action action;
 
-        refused = wine_ps5_title_refused_program( (const uint16_t *)path.Buffer,
-                                                  path.Length / sizeof(*path.Buffer),
-                                                  programs, &refused_length );
-        if (refused)
+        action = wine_ps5_title_spawn_action( (const uint16_t *)path.Buffer,
+                                             path.Length / sizeof(*path.Buffer),
+                                             getenv( "WINEPS5_REFUSED_PROGRAMS" ),
+                                             getenv( "WINEPS5_CRASH_REPORTERS" ),
+                                             &program, &program_length );
+        if (action == WINE_PS5_TITLE_SPAWN_TERMINATE)
+        {
+            char line[384];
+
+            snprintf( line, sizeof(line), "wine: title crash reporter %.*s requested; ending the game\n",
+                      (int)program_length, program );
+            sceKernelDebugOutText( 0, line );
+            return NtTerminateProcess( GetCurrentProcess(), STATUS_UNSUCCESSFUL );
+        }
+        if (action == WINE_PS5_TITLE_SPAWN_REFUSE)
         {
             *process_handle_ptr = *thread_handle_ptr = 0;
             if (!InterlockedCompareExchange( &refused_logged, 1, 0 ))
@@ -970,7 +982,7 @@ static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_
                 char line[384];
 
                 snprintf( line, sizeof(line), "wine: title spawn refused image=%.*s reason=profile\n",
-                          (int)refused_length, refused );
+                          (int)program_length, program );
                 sceKernelDebugOutText( 0, line );
             }
             /* CreateProcessInternalW retries invalid images, not policy denial. */
