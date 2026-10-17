@@ -47,6 +47,9 @@ static NTSTATUS ps5_send_hardware_input( HWND hwnd, UINT flags, const INPUT *inp
 
 WINE_DEFAULT_DEBUG_CHANNEL(driver);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+#if defined(__PROSPERO__) && defined(WINE_PS5_TITLE_B1)
+#include "wine/ps5_cursor.h"
+#endif
 
 static const struct user_driver_funcs lazy_load_driver;
 static struct user_driver_funcs null_user_driver;
@@ -1165,6 +1168,61 @@ static void nulldrv_ThreadDetach( void )
 {
 }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_TITLE_B1)
+static struct wine_ps5_cursor_cache ps5_title_cursor_cache = WINE_PS5_CURSOR_CACHE_INIT;
+static struct user_driver_funcs ps5_title_gpu_driver;
+static wine_ps5_cursor_send ps5_title_cursor_send;
+static pthread_once_t ps5_title_gpu_once = PTHREAD_ONCE_INIT;
+
+static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
+{
+    /* The GPU parent has no desktop compositor window list. */
+    (void)hwnd;
+    wine_ps5_cursor_publish( &ps5_title_cursor_cache, 0, cursor, ps5_title_cursor_send );
+}
+
+static void ps5_title_gpu_DestroyCursorIcon( HCURSOR cursor )
+{
+    wine_ps5_cursor_destroy( &ps5_title_cursor_cache, cursor );
+}
+
+static void ps5_init_title_gpu_driver(void)
+{
+    ps5_title_cursor_send = __wine_ps5_get_vulkan_proc( "wineSetCursor" );
+    if (!ps5_title_cursor_send) return;
+    ps5_title_gpu_driver = null_user_driver;
+    ps5_title_gpu_driver.pSetCursor = ps5_title_gpu_SetCursor;
+    ps5_title_gpu_driver.pDestroyCursorIcon = ps5_title_gpu_DestroyCursorIcon;
+}
+
+static BOOL ps5_load_headless_driver(void)
+{
+    pthread_once( &ps5_title_gpu_once, ps5_init_title_gpu_driver );
+    __wine_set_user_driver( ps5_title_cursor_send ? &ps5_title_gpu_driver : &null_user_driver,
+                            WINE_GDI_DRIVER_VERSION );
+    /* CPU children retain the prefix cache. Native GPU parents publish the
+     * current output mode and synthetic HDR EDID once, as before. */
+    if (__wine_ps5_get_vulkan_proc( "wineGetDisplayModes" ))
+    {
+        if (!update_display_cache( TRUE ))
+        {
+            ERR( "Failed to publish the title GPU display cache.\n" );
+            NtTerminateProcess( GetCurrentProcess(), STATUS_UNSUCCESSFUL );
+            return FALSE;
+        }
+        if (ps5_title_cursor_send)
+            sceKernelDebugOutText( 0, "wine: B1 title display driver=title-gpu registry_refreshed=1 native_gpu=1 cursor=native\n" );
+        else
+            sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_refreshed=1 native_gpu=1\n" );
+    }
+    else if (ps5_title_cursor_send)
+        sceKernelDebugOutText( 0, "wine: B1 title display driver=title-gpu registry_untouched=1 cursor=native\n" );
+    else
+        sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_untouched=1\n" );
+    return TRUE;
+}
+#endif
+
 static const WCHAR guid_key_prefixW[] =
 {
     '\\','R','e','g','i','s','t','r','y',
@@ -1200,26 +1258,7 @@ static BOOL load_desktop_driver( HWND hwnd )
     {
         const char *headless = getenv( "WINEPS5_TITLE_HEADLESS" );
         if (headless && !strcmp( headless, "1" ))
-        {
-            /* Headless CPU profiles keep the prefix's payload display cache.
-             * The GPU parent has a native output, so rebuild that cache once:
-             * this is where its current mode and synthetic HDR EDID are
-             * published. */
-            __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
-            if (__wine_ps5_get_vulkan_proc( "wineGetDisplayModes" ))
-            {
-                if (!update_display_cache( TRUE ))
-                {
-                    ERR( "Failed to publish the title GPU display cache.\n" );
-                    NtTerminateProcess( GetCurrentProcess(), STATUS_UNSUCCESSFUL );
-                    return FALSE;
-                }
-                sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_refreshed=1 native_gpu=1\n" );
-            }
-            else
-                sceKernelDebugOutText( 0, "wine: B1 title display driver=null registry_untouched=1\n" );
-            return TRUE;
-        }
+            return ps5_load_headless_driver();
     }
 #endif
     if (__wine_ps5_is_title())

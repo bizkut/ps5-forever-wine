@@ -27,7 +27,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -46,9 +48,23 @@ WINE_DEFAULT_DEBUG_CHANNEL(ps5drv);
 
 static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int desktop_fd = -1;
+static DWORD event_tid;
 static DWORD desktop_tid;
-static BOOL queue_registered;
+/* Protected by connection_mutex; wineps5.so must not contain ELF TLS. */
+struct queue_thread
+{
+    struct queue_thread *next;
+    DWORD tid;
+};
+static struct queue_thread *queue_threads;
 static BOOL processing_events;
+static BOOL cursor_capable, cursor_capability_checked;
+static union
+{
+    struct ps5_desktop_cursor_shape shape;
+    unsigned char bytes[PS5_DESKTOP_MAX_MESSAGE];
+} cursor_pending_message;
+static unsigned int cursor_pending_size;
 #ifdef __PROSPERO__
 BOOL ps5_title_desktop;
 #endif
@@ -58,6 +74,7 @@ static union
     struct ps5_desktop_header header;
     struct ps5_desktop_mouse mouse;
     struct ps5_desktop_key key;
+    struct ps5_desktop_hello hello;
     uint64_t alignment;
     unsigned char bytes[sizeof(struct ps5_desktop_text) + PS5_DESKTOP_MAX_TEXT * sizeof(uint16_t)];
 } input_event;
@@ -88,14 +105,32 @@ static BOOL write_message( int fd, const void *message, unsigned int size )
     return TRUE;
 }
 
+/* connection_mutex is held by the caller. */
+static BOOL queue_is_registered( DWORD tid )
+{
+    const struct queue_thread *entry;
+    for (entry = queue_threads; entry; entry = entry->next)
+        if (entry->tid == tid) return TRUE;
+    return FALSE;
+}
+
 static void register_queue(void)
 {
     HANDLE handle;
     NTSTATUS status;
+    DWORD tid = GetCurrentThreadId();
+    struct queue_thread *entry;
 
-    if (queue_registered || !desktop_tid || desktop_tid != GetCurrentThreadId()) return;
+    if (queue_is_registered( tid ) || (tid != event_tid && tid != desktop_tid)) return;
+    if (!(entry = malloc( sizeof(*entry) )))
+    {
+        ERR( "Cannot remember the desktop queue thread\n" );
+        NtTerminateProcess( 0, 1 );
+        return;
+    }
     if ((status = wine_server_fd_to_handle( desktop_fd, GENERIC_READ | SYNCHRONIZE, 0, &handle )))
     {
+        free( entry );
         ERR( "Cannot allocate a handle for the desktop socket, status %#x\n", status );
         NtTerminateProcess( 0, 1 );
         return;
@@ -109,11 +144,32 @@ static void register_queue(void)
     NtClose( handle );
     if (status)
     {
+        free( entry );
         ERR( "Cannot register the desktop queue socket, status %#x\n", status );
         NtTerminateProcess( 0, 1 );
         return;
     }
-    queue_registered = TRUE;
+    entry->tid = tid;
+    entry->next = queue_threads;
+    queue_threads = entry;
+    if (!event_tid) event_tid = tid;
+}
+
+static void PS5_ThreadDetach(void)
+{
+    struct queue_thread **link, *entry;
+    DWORD tid = GetCurrentThreadId();
+    pthread_mutex_lock( &connection_mutex );
+    for (link = &queue_threads; (entry = *link); link = &entry->next)
+        if (entry->tid == tid)
+        {
+            *link = entry->next;
+            free( entry );
+            break;
+        }
+    if (event_tid == tid) event_tid = 0;
+    if (desktop_tid == tid) desktop_tid = 0;
+    pthread_mutex_unlock( &connection_mutex );
 }
 
 static BOOL connect_desktop(void)
@@ -126,7 +182,7 @@ static BOOL connect_desktop(void)
     {
         .header = { PS5_DESKTOP_HELLO, sizeof(hello) },
         .pid = getpid(),
-        .flags = desktop_tid ? PS5_DESKTOP_INPUT_SINK : 0,
+        .flags = PS5_DESKTOP_CURSOR_CAPABLE | (desktop_tid ? PS5_DESKTOP_INPUT_SINK : 0),
     };
     int fd = -1, unix_error, tcp_error;
 
@@ -172,6 +228,7 @@ connected:
         return FALSE;
     }
     desktop_fd = fd;
+    cursor_capable = cursor_capability_checked = FALSE;
     register_queue();
     return TRUE;
 }
@@ -206,7 +263,8 @@ void PS5_SetDesktopWindow( HWND hwnd )
                  debugstr_wn( image->Buffer, image->Length / sizeof(WCHAR) ), debugstr_w( desktop ) );
     }
     pthread_mutex_lock( &connection_mutex );
-    if (!queue_registered)
+    /* A cursor queue may already exist on this thread or another GUI thread. */
+    if (desktop_tid != tid || desktop_fd < 0)
     {
         desktop_tid = tid;
         if (desktop_fd < 0) connect_desktop();
@@ -216,6 +274,7 @@ void PS5_SetDesktopWindow( HWND hwnd )
             if (!write_message( desktop_fd, &hello, sizeof(hello) )) connection_lost();
         }
     }
+    else register_queue();
     pthread_mutex_unlock( &connection_mutex );
 }
 
@@ -223,8 +282,12 @@ BOOL PS5_CreateWindow( HWND hwnd )
 {
     if (hwnd == NtUserGetDesktopWindow())
     {
+        BOOL registered;
         PS5_SetDesktopWindow( hwnd );
-        if (desktop_tid == GetCurrentThreadId()) return queue_registered;
+        pthread_mutex_lock( &connection_mutex );
+        registered = desktop_tid != GetCurrentThreadId() || queue_is_registered( GetCurrentThreadId() );
+        pthread_mutex_unlock( &connection_mutex );
+        return registered;
     }
     return TRUE;
 }
@@ -319,13 +382,80 @@ static int read_event(void)
     }
 }
 
+/* All pending state is copied and consumed under connection_mutex. A late
+ * HELLO wakes the registered GUI queue and flushes without another SetCursor. */
+static void cursor_flush_pending(void)
+{
+    if (!cursor_capable || !cursor_pending_size) return;
+    if (!write_message( desktop_fd, &cursor_pending_message, cursor_pending_size )) connection_lost();
+    cursor_pending_size = 0;
+}
+
+static void cursor_confirm_capabilities( const struct ps5_desktop_hello *hello )
+{
+    if (hello->header.size != sizeof(*hello) || hello->pid ||
+        !(hello->flags & PS5_DESKTOP_CURSOR_CAPABLE)) connection_lost();
+    cursor_capable = TRUE;
+    cursor_flush_pending();
+}
+
+/* Peek before consuming: ordinary input must remain on the socket so its
+ * QS_DRIVER wakeup is not lost. Only a complete HELLO is removed here. */
+static BOOL cursor_peer_capabilities(void)
+{
+    struct ps5_desktop_hello reply;
+    ssize_t ret;
+    if (cursor_capable) { cursor_flush_pending(); return TRUE; }
+    if (processing_events || input_size) return FALSE;
+    if (!cursor_capability_checked)
+    {
+        struct pollfd descriptor = {desktop_fd, POLLIN, 0};
+        poll( &descriptor, 1, 100 );
+        cursor_capability_checked = TRUE;
+    }
+    ret = recv( desktop_fd, &reply, sizeof(reply), MSG_PEEK | MSG_DONTWAIT );
+    if (!ret || (ret < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) connection_lost();
+    if (ret < (ssize_t)sizeof(reply) || reply.header.type != PS5_DESKTOP_HELLO) return FALSE;
+    if (recv( desktop_fd, &reply, sizeof(reply), MSG_DONTWAIT ) != (ssize_t)sizeof(reply)) connection_lost();
+    cursor_confirm_capabilities( &reply );
+    return TRUE;
+}
+
+BOOL ps5_send_cursor_message( const void *message, unsigned int size )
+{
+    BOOL ret = FALSE;
+    pthread_mutex_lock( &connection_mutex );
+    if (!ps5_desktop_cursor_shape_valid( message, size )) goto done;
+    memcpy( &cursor_pending_message, message, size );
+    cursor_pending_size = size;
+    if (connect_desktop())
+    {
+        /* Non-input-sink GUI processes also need a HELLO wakeup. The desktop
+         * input-sink identity and hardware input routing are unchanged. */
+        if (!event_tid) event_tid = desktop_tid ? desktop_tid : GetCurrentThreadId();
+        register_queue();
+        ret = cursor_peer_capabilities();
+    }
+done:
+    pthread_mutex_unlock( &connection_mutex );
+    return ret;
+}
+
 static BOOL PS5_ProcessEvents( DWORD mask )
 {
     const struct ps5_desktop_text *text = (const void *)input_event.bytes;
     int ret;
 
-    if (GetCurrentThreadId() != desktop_tid || processing_events) return FALSE;
+    (void)mask;
+    if (GetCurrentThreadId() != desktop_tid && GetCurrentThreadId() != event_tid) return FALSE;
+    pthread_mutex_lock( &connection_mutex );
+    if (processing_events)
+    {
+        pthread_mutex_unlock( &connection_mutex );
+        return FALSE;
+    }
     processing_events = TRUE;
+    pthread_mutex_unlock( &connection_mutex );
     for (;;)
     {
         pthread_mutex_lock( &connection_mutex );
@@ -336,6 +466,11 @@ static BOOL PS5_ProcessEvents( DWORD mask )
         if (ret <= 0) break;
         switch (input_event.header.type)
         {
+        case PS5_DESKTOP_HELLO:
+            pthread_mutex_lock( &connection_mutex );
+            cursor_confirm_capabilities( &input_event.hello );
+            pthread_mutex_unlock( &connection_mutex );
+            break;
         case PS5_DESKTOP_MOUSE:
             if (input_event.header.size == sizeof(input_event.mouse)) send_mouse( &input_event.mouse );
             else connection_lost();
@@ -356,7 +491,9 @@ static BOOL PS5_ProcessEvents( DWORD mask )
         }
         input_size = 0;
     }
+    pthread_mutex_lock( &connection_mutex );
     processing_events = FALSE;
+    pthread_mutex_unlock( &connection_mutex );
     /* All input is routed through wineserver, which applies the caller's
      * message filter. The transport must be drained regardless of mask. */
     return TRUE;
@@ -495,6 +632,9 @@ static void PS5_SetTextInputFocus( HWND hwnd, BOOL focused )
 static const struct user_driver_funcs ps5drv_funcs =
 {
     .pSetTextInputFocus = PS5_SetTextInputFocus,
+    .pSetCursor = PS5_SetCursor,
+    .pDestroyCursorIcon = PS5_DestroyCursorIcon,
+    .pThreadDetach = PS5_ThreadDetach,
     .pSetCursorPos = PS5_SetCursorPos,
     .pChangeDisplaySettings = PS5_ChangeDisplaySettings,
     .pUpdateDisplayDevices = PS5_UpdateDisplayDevices,
@@ -521,6 +661,7 @@ static const struct user_driver_funcs ps5drv_funcs =
  * desktop transport. */
 static const struct user_driver_funcs title_funcs =
 {
+    .pThreadDetach = PS5_ThreadDetach,
     .pChangeDisplaySettings = PS5_ChangeDisplaySettings,
     .pUpdateDisplayDevices = PS5_UpdateDisplayDevices,
     .pCreateWindow = PS5_CreateWindow,

@@ -45,6 +45,8 @@
 #define __WINE_WINE_PS5_DESKTOP_H
 
 #include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 
 #define PS5_DESKTOP_PORT       58420
 #define PS5_DESKTOP_DRIVER_PORT 58421
@@ -56,8 +58,8 @@
 
 enum ps5_desktop_type
 {
-    /* driver -> hub */
-    PS5_DESKTOP_HELLO = 1,      /* struct ps5_desktop_hello: first message of a connection */
+    /* driver -> hub; a cursor-capable hub replies only to an opt-in HELLO */
+    PS5_DESKTOP_HELLO = 1,      /* struct ps5_desktop_hello: first message and capability answer */
     /* driver -> hub -> title */
     PS5_DESKTOP_WINDOW,         /* struct ps5_desktop_window: a top-level window's state */
     PS5_DESKTOP_DESTROY,        /* struct ps5_desktop_id: the window is gone */
@@ -73,6 +75,7 @@ enum ps5_desktop_type
     PS5_DESKTOP_ART,            /* struct ps5_desktop_art: install the title's new icon and backgrounds */
     /* driver -> title */
     PS5_DESKTOP_TEXT_INPUT,     /* struct ps5_desktop_text_input: a text field took or lost the focus */
+    PS5_DESKTOP_CURSOR_SHAPE,   /* struct ps5_desktop_cursor_shape: image or app-hidden cursor */
 };
 
 struct ps5_desktop_header
@@ -83,6 +86,7 @@ struct ps5_desktop_header
 
 /* HELLO flags */
 #define PS5_DESKTOP_INPUT_SINK 0x1  /* send the title's input to this connection */
+#define PS5_DESKTOP_CURSOR_CAPABLE 0x2 /* request HELLO reply; reply pid=0 confirms shape support */
 
 struct ps5_desktop_hello
 {
@@ -135,6 +139,47 @@ struct ps5_desktop_point
     struct ps5_desktop_header header;
     int32_t x, y;
 };
+
+/* Straight-alpha, top-down AARRGGBB desktop pixels. No row padding.
+ * Prefix/pixel offset 40, maximum message 16424 bytes. Publish for the GA_ROOT
+ * HWND (id zero is the desktop); receivers select the topmost visible window
+ * under the pointer and remember other windows' states. Both hubs replay these
+ * states after their window snapshot. Animated cursors publish frame zero.
+ * A hidden cursor has zero dimensions/hotspot and no pixels. Send this type
+ * only after a HELLO answer confirms PS5_DESKTOP_CURSOR_CAPABLE. */
+#define PS5_DESKTOP_CURSOR_SIDE 64u
+struct ps5_desktop_cursor_shape
+{
+    struct ps5_desktop_header header;
+    uint64_t id;                /* top-level target HWND, or zero for the desktop */
+    uint32_t width, height;
+    int32_t hotspot_x, hotspot_y;
+    uint32_t visible;
+    uint32_t reserved;          /* zero; keeps pixels and sizeof(prefix) at offset 40 */
+    uint32_t pixels[];
+};
+
+#define PS5_DESKTOP_MAX_MESSAGE (sizeof(struct ps5_desktop_cursor_shape) + \
+                               PS5_DESKTOP_CURSOR_SIDE * PS5_DESKTOP_CURSOR_SIDE * sizeof(uint32_t))
+
+/* The wire buffer can be unaligned. Validate its complete extent before any
+ * consumer reads pixels, and bound dimensions before multiplying them. */
+static inline int ps5_desktop_cursor_shape_valid( const void *message, size_t size )
+{
+    struct ps5_desktop_cursor_shape shape;
+    if (size < sizeof(shape)) return 0;
+    memcpy( &shape, message, sizeof(shape) );
+    if (shape.header.type != PS5_DESKTOP_CURSOR_SHAPE || shape.header.size != size ||
+        shape.visible > 1 || shape.reserved || shape.id == PS5_DESKTOP_Z_BOTTOM) return 0;
+    if (!shape.visible)
+        return size == sizeof(shape) && !shape.width && !shape.height &&
+               !shape.hotspot_x && !shape.hotspot_y;
+    return shape.width && shape.height &&
+           shape.width <= PS5_DESKTOP_CURSOR_SIDE && shape.height <= PS5_DESKTOP_CURSOR_SIDE &&
+           shape.hotspot_x >= 0 && (uint32_t)shape.hotspot_x < shape.width &&
+           shape.hotspot_y >= 0 && (uint32_t)shape.hotspot_y < shape.height &&
+           size == sizeof(shape) + shape.width * shape.height * sizeof(uint32_t);
+}
 
 /* MOUSE kinds */
 #define PS5_DESKTOP_MOUSE_MOVE   1  /* x, y */

@@ -36,6 +36,9 @@ extern BOOL ps5_title_desktop;
 #endif
 
 extern BOOL ps5_send_message( const void *message, unsigned int size );
+extern BOOL ps5_send_cursor_message( const void *message, unsigned int size );
+extern void PS5_SetCursor( HWND hwnd, HCURSOR cursor );
+extern void PS5_DestroyCursorIcon( HCURSOR cursor );
 extern BOOL PS5_CreateWindow( HWND hwnd );
 extern void PS5_SetDesktopWindow( HWND hwnd );
 extern LRESULT PS5_DesktopWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );

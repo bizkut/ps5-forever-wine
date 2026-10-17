@@ -4,6 +4,7 @@ UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 IMPORTS = ntdll
 
 SOURCES = \
+	cursor.c \
 	dllmain.c \
 	init.c \
 	window.c

@@ -517,7 +517,7 @@ static void __attribute__((noreturn)) ps5_broker_main(void)
 /* The title can only reach a payload over TCP. The desktop hub owns no Wine
  * state and loads no libraries; like the broker it is a loader started
  * through the ELF loader (ps5_start_helper). */
-#define PS5_HUB_MAX_FRAME (sizeof(struct ps5_desktop_text) + PS5_DESKTOP_MAX_TEXT * sizeof(uint16_t))
+#define PS5_HUB_MAX_FRAME PS5_DESKTOP_MAX_MESSAGE
 #define PS5_HUB_MAX_OUTPUT (1024 * 1024)
 
 struct ps5_hub_peer
@@ -545,6 +545,8 @@ struct ps5_hub_window
     struct ps5_hub_window *above, *below;
     struct ps5_hub_peer *owner;
     struct ps5_desktop_window state;
+    struct ps5_desktop_cursor_shape *cursor;
+    int replay_cursor, replay_cursor_changed;
 };
 
 struct ps5_desktop_hub
@@ -553,6 +555,8 @@ struct ps5_desktop_hub
     unsigned int sink_serial;
     int input_dropped;          /* "input dropped" was logged since the sink went */
     struct ps5_hub_window *top, *bottom;
+    struct ps5_desktop_cursor_shape *desktop_cursor;
+    int replay_cursors, replay_desktop_cursor, replay_desktop_changed;
     int session;                /* wineserver running: 1, exited: 0, not checked yet: -1 */
     time_t session_checked;
     int title_seen;             /* a title connected since the hub started */
@@ -648,6 +652,7 @@ static void ps5_hub_remove_window( struct ps5_desktop_hub *hub, struct ps5_hub_w
 {
     ps5_hub_unlink_window( hub, window );
     if (window->state.shm[0]) shm_unlink( window->state.shm );
+    free( window->cursor );
     free( window );
 }
 
@@ -680,6 +685,42 @@ static void ps5_hub_restack( struct ps5_desktop_hub *hub, struct ps5_hub_window 
     else hub->top = window;
 }
 
+static void ps5_hub_replay_cursors( struct ps5_desktop_hub *hub )
+{
+    struct ps5_hub_window *window;
+    size_t budget = 65536, pending;
+    if (!hub->replay_cursors) return;
+    if (!hub->title || hub->title->fd < 0) { hub->replay_cursors = 0; return; }
+    for (window = hub->top; window; window = window->below)
+    {
+        size_t size;
+        if (!window->replay_cursor) continue;
+        if (!window->cursor) { window->replay_cursor = 0; continue; }
+        size = window->cursor->header.size;
+        pending = hub->title->output_end - hub->title->output_begin;
+        if (size > budget || pending + size + 65536 > PS5_HUB_MAX_OUTPUT) return;
+        if (!ps5_hub_queue( hub->title, window->cursor, size )) return;
+        window->replay_cursor = 0;
+        budget -= size;
+    }
+    if (hub->replay_desktop_cursor && hub->desktop_cursor)
+    {
+        size_t size = hub->desktop_cursor->header.size;
+        pending = hub->title->output_end - hub->title->output_begin;
+        if (size > budget || pending + size + 65536 > PS5_HUB_MAX_OUTPUT) return;
+        if (!ps5_hub_queue( hub->title, hub->desktop_cursor, size )) return;
+    }
+    hub->replay_desktop_cursor = hub->replay_desktop_changed;
+    hub->replay_desktop_changed = 0;
+    hub->replay_cursors = hub->replay_desktop_cursor;
+    for (window = hub->top; window; window = window->below)
+    {
+        window->replay_cursor = window->replay_cursor_changed;
+        window->replay_cursor_changed = 0;
+        hub->replay_cursors |= window->replay_cursor;
+    }
+}
+
 static void ps5_hub_replay( struct ps5_desktop_hub *hub )
 {
     struct ps5_hub_window *window;
@@ -687,6 +728,14 @@ static void ps5_hub_replay( struct ps5_desktop_hub *hub )
     struct ps5_desktop_damage damage = { .header = { PS5_DESKTOP_DAMAGE, sizeof(damage) } };
     uint64_t previous = PS5_DESKTOP_Z_TOP;
 
+    hub->replay_cursors = 1;
+    hub->replay_desktop_cursor = hub->desktop_cursor != NULL;
+    hub->replay_desktop_changed = 0;
+    for (window = hub->top; window; window = window->below)
+    {
+        window->replay_cursor = window->cursor != NULL;
+        window->replay_cursor_changed = 0;
+    }
     for (window = hub->top; window; window = window->below)
     {
         state = window->state;
@@ -703,6 +752,7 @@ static void ps5_hub_replay( struct ps5_desktop_hub *hub )
         damage.bottom = window->state.height;
         if (!ps5_hub_queue( hub->title, &damage, sizeof(damage) )) return;
     }
+    ps5_hub_replay_cursors( hub );
 }
 
 /* The input sink after the current one stops being one: the connected peer
@@ -754,6 +804,12 @@ static int ps5_hub_driver_message( struct ps5_desktop_hub *hub, struct ps5_hub_p
             peer->sink_order = 0;
             if (hub->input_sink == peer) ps5_hub_set_sink( hub, ps5_hub_previous_sink( hub ) );
         }
+        if (hello->flags & PS5_DESKTOP_CURSOR_CAPABLE)
+        {
+            struct ps5_desktop_hello reply = {
+                .header = {PS5_DESKTOP_HELLO, sizeof(reply)}, .flags = PS5_DESKTOP_CURSOR_CAPABLE};
+            ps5_hub_queue( peer, &reply, sizeof(reply) );
+        }
         return 1;
     }
     if (!peer->hello) return 0;
@@ -800,6 +856,33 @@ static int ps5_hub_driver_message( struct ps5_desktop_hub *hub, struct ps5_hub_p
         if (header->size != sizeof(struct ps5_desktop_point)) return 0;
         ps5_hub_queue( hub->title, header, header->size );
         return 1;
+    case PS5_DESKTOP_CURSOR_SHAPE:
+    {
+        const struct ps5_desktop_cursor_shape *shape = (const void *)header;
+        struct ps5_desktop_cursor_shape **saved;
+        if (!ps5_desktop_cursor_shape_valid( header, header->size )) return 0;
+        if (shape->id)
+        {
+            if (!(window = ps5_hub_find_window( hub, shape->id ))) return 1;
+            saved = &window->cursor;
+        }
+        else saved = &hub->desktop_cursor;
+        if (*saved && (*saved)->header.size == header->size &&
+            !memcmp( *saved, header, header->size )) return 1;
+        if (!*saved && !(*saved = malloc( PS5_DESKTOP_MAX_MESSAGE ))) return 0;
+        memcpy( *saved, header, header->size );
+        if (hub->replay_cursors)
+        {
+            if (shape->id)
+            {
+                if (!window->replay_cursor) window->replay_cursor_changed = 1;
+            }
+            else if (!hub->replay_desktop_cursor) hub->replay_desktop_changed = 1;
+            return 1;
+        }
+        ps5_hub_queue( hub->title, header, header->size );
+        return 1;
+    }
     case PS5_DESKTOP_TEXT_INPUT:
         if (header->size != sizeof(struct ps5_desktop_text_input)) return 0;
         ps5_hub_queue( hub->title, header, header->size );
@@ -1268,6 +1351,7 @@ static void __attribute__((noreturn)) ps5_desktop_run( int drivers, int tcp_driv
     }
     for (;;)
     {
+        ps5_hub_replay_cursors( &hub );
         count = 3;
         for (peer = hub.peers; peer; peer = peer->next) count++;
         if (count > capacity)

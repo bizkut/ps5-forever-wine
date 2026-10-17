@@ -58,6 +58,51 @@ static void ntdll_set_exception_jmp_buf( jmp_buf jmp )
 #include "wine/ps5_title_private.h"
 #include "wine/ps5_title.h"
 #include "wine/ps5_suspend.h"
+#include "wine/ps5_desktop.h"
+
+static void test_cursor_message(void)
+{
+    union
+    {
+        struct ps5_desktop_cursor_shape shape;
+        unsigned char bytes[PS5_DESKTOP_MAX_MESSAGE];
+    } message;
+    struct ps5_desktop_cursor_shape *shape = &message.shape;
+    unsigned char unaligned[PS5_DESKTOP_MAX_MESSAGE + 1];
+    _Static_assert( sizeof(*shape) == 40 && offsetof(struct ps5_desktop_cursor_shape, pixels) == 40,
+                    "cursor wire prefix" );
+    _Static_assert( PS5_DESKTOP_CURSOR_SHAPE == 12, "append-only desktop message ids" );
+    *shape = (struct ps5_desktop_cursor_shape){
+        .header = {PS5_DESKTOP_CURSOR_SHAPE, PS5_DESKTOP_MAX_MESSAGE}, .id = 100,
+        .width = 64, .height = 64, .hotspot_x = 63, .hotspot_y = 63, .visible = 1};
+    memset( shape->pixels, 0xff, 64 * 64 * sizeof(uint32_t) );
+    assert( ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE ));
+    memcpy( unaligned + 1, shape, PS5_DESKTOP_MAX_MESSAGE );
+    assert( ps5_desktop_cursor_shape_valid( unaligned + 1, PS5_DESKTOP_MAX_MESSAGE ));
+    assert( !ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) - 1 ));
+    assert( !ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE - 4 ));
+    shape->width = UINT32_MAX;
+    assert( !ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE ));
+    shape->width = 64;
+    shape->hotspot_y = 64;
+    assert( !ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE ));
+    shape->hotspot_y = -1;
+    assert( !ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE ));
+    shape->hotspot_y = 0;
+    shape->visible = 2;
+    assert( !ps5_desktop_cursor_shape_valid( shape, PS5_DESKTOP_MAX_MESSAGE ));
+    *shape = (struct ps5_desktop_cursor_shape){.header = {PS5_DESKTOP_CURSOR_SHAPE, sizeof(*shape)}};
+    assert( ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) ));
+    shape->reserved = 1;
+    assert( !ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) ));
+    shape->reserved = 0;
+    shape->id = PS5_DESKTOP_Z_BOTTOM;
+    assert( !ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) ));
+    shape->id = 100;
+    assert( ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) )); /* per-window hide */
+    shape->width = 1;
+    assert( !ps5_desktop_cursor_shape_valid( shape, sizeof(*shape) ));
+}
 
 static struct wine_ps5_title_threads threads = WINE_PS5_TITLE_THREADS_INIT;
 static pthread_key_t thread_key;
@@ -2309,6 +2354,7 @@ static void test_qpc_from_tsc(void)
 
 int main(void)
 {
+    test_cursor_message();
     alarm( 30 );  /* a deadlock is a bounded failure, not an indefinitely hung test */
     test_thread_registry();
     test_supervisor( 0 );
