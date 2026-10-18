@@ -3351,7 +3351,7 @@ static void title_profile_emit_modules(void)
         unsigned int index;
 
         if (!bucket->count || bucket->kind != WINE_PS5_PROFILE_USER) continue;
-        if (wine_ps5_hang_name_equal( bucket->module, "WowB.exe" )) index = 0;
+        if (wine_ps5_wow_module( bucket->module )) index = 0;
         else if (wine_ps5_hang_name_equal( bucket->module, "d3d12core.dll" )) index = 1;
         else if (wine_ps5_hang_name_equal( bucket->module, "ntdll.dll" )) index = 2;
         else if (wine_ps5_hang_name_equal( bucket->module, "win32u.dll" )) index = 3;
@@ -3361,7 +3361,7 @@ static void title_profile_emit_modules(void)
     for (i = 0; i < ARRAY_SIZE(pct); i++)
         pct[i] = wine_ps5_profile_permille( modules[i], non_wait );
     snprintf( line, sizeof(line),
-              "title profile modules WowB.exe=%u.%u d3d12core.dll=%u.%u "
+              "title profile modules Wow*.exe=%u.%u d3d12core.dll=%u.%u "
               "ntdll.dll=%u.%u win32u.dll=%u.%u other=%u.%u\n",
               pct[0] / 10, pct[0] % 10, pct[1] / 10, pct[1] % 10,
               pct[2] / 10, pct[2] % 10, pct[3] / 10, pct[3] % 10,

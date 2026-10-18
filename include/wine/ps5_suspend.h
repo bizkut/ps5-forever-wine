@@ -369,6 +369,18 @@ static inline int wine_ps5_hang_name_equal( const char *left, const char *right 
     return !*left && !*right;
 }
 
+/* All channel clients share one CPU diagnostic bucket, not one product. */
+static inline int wine_ps5_wow_module( const char *name )
+{
+    const char *at;
+    if (!name || !name[0] || !name[1] || !name[2] ||
+        wine_ps5_hang_ascii_lower( name[0] ) != 'w' ||
+        wine_ps5_hang_ascii_lower( name[1] ) != 'o' ||
+        wine_ps5_hang_ascii_lower( name[2] ) != 'w') return 0;
+    for (at = name + 3; (*at >= 'A' && *at <= 'Z') || (*at >= 'a' && *at <= 'z'); ++at);
+    return wine_ps5_hang_name_equal( at, ".exe" );
+}
+
 static inline int wine_ps5_hang_system_module( const char *name )
 {
     return wine_ps5_hang_name_equal( name, "ntdll.dll" ) ||
@@ -397,7 +409,7 @@ static inline enum wine_ps5_hang_address_class wine_ps5_hang_classify_address(
 {
     if (!wine_ps5_hang_address_in_image( address, base, size ))
         return WINE_PS5_HANG_ADDRESS_UNBACKED;
-    if (wine_ps5_hang_name_equal( module, "WowB.exe" ))
+    if (wine_ps5_wow_module( module ))
         return WINE_PS5_HANG_ADDRESS_WOW;
     if (wine_ps5_hang_system_module( module ))
         return WINE_PS5_HANG_ADDRESS_SYSTEM;

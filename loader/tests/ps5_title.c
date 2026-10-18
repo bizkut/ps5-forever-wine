@@ -1791,6 +1791,12 @@ static void test_hang_diagnostic_helpers(void)
 
     assert( wine_ps5_hang_classify_address( base, base, size, "wowb.EXE" ) ==
             WINE_PS5_HANG_ADDRESS_WOW );
+    assert( wine_ps5_wow_module( "Wow.exe" ) );
+    assert( wine_ps5_wow_module( "wOwClassicT.EXE" ) );
+    assert( wine_ps5_wow_module( "WowFuture.exe" ) );
+    assert( !wine_ps5_wow_module( "Wow64.exe" ) );
+    assert( !wine_ps5_wow_module( "Wow.exe.dll" ) );
+    assert( !wine_ps5_wow_module( "BlizzardError.exe" ) );
     assert( wine_ps5_hang_classify_address( base + size - 1, base, size, "D3D12Core.dll" ) ==
             WINE_PS5_HANG_ADDRESS_SYSTEM );
     assert( wine_ps5_hang_classify_address( base + 0x1234, base, size, "gameplugin.dll" ) ==
