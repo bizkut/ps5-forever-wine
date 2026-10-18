@@ -3344,7 +3344,9 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
 
     *handle = 0;
 #ifdef __PROSPERO__
-    if (file && (ret = ps5_title_flush_coalesced_write( file ))) return ret;
+    if (file) ret = ps5_title_prepare_buffered_section( file, sec_flags );
+    else ret = ps5_title_flush_coalesced_write( 0 );
+    if (ret) return ret;
 #endif
 
     switch (protect & 0xff)
@@ -3408,6 +3410,9 @@ NTSTATUS WINAPI NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_
     unsigned int ret;
 
     *handle = 0;
+#ifdef __PROSPERO__
+    if ((ret = ps5_title_flush_coalesced_write( 0 ))) return ret;
+#endif
     if ((ret = validate_open_object_attributes( attr ))) return ret;
 
     SERVER_START_REQ( open_mapping )

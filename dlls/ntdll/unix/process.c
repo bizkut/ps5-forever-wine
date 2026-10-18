@@ -1481,6 +1481,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     RTL_USER_PROCESS_PARAMETERS copy;
     WCHAR *cmdline;
     NTSTATUS status;
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
 
     title_swiftshader_manifest( params );
     params = title_browser_switches( params, &copy, &cmdline );

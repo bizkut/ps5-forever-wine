@@ -742,6 +742,7 @@ __attribute__((visibility("default"))) void __wine_ps5_shutdown_title_runtime(vo
      * and native pthread handle have all been recycled by a later worker. */
     wine_ps5_title_signal_lifetime( &title_threads, title_initial_join.lifetime, SIGQUIT );
     wine_ps5_title_join_once( &title_initial_join, title_runtime.join_thread );
+    ps5_title_flush_all_coalesced_writes();
     sceKernelDebugOutText( 0, "wine: title clients quiesced; loader callbacks closed; initial thread joined\n" );
 }
 
@@ -4472,8 +4473,8 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
 
     if (dest) *dest = 0;
 #ifdef __PROSPERO__
-    if (source_process == NtCurrentProcess() &&
-        (ret = ps5_title_flush_coalesced_write( source ))) return ret;
+    if ((ret = ps5_title_flush_coalesced_write(
+            source_process == NtCurrentProcess() ? source : 0 ))) return ret;
 #endif
 
     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())

@@ -434,6 +434,8 @@ extern int ps5_tls_set( pthread_key_t key, const void *value );
 extern void ps5_title_request_exit( int status ) DECLSPEC_NORETURN;
 extern void ps5_direct_test(void);
 extern NTSTATUS ps5_title_flush_coalesced_write( HANDLE handle );
+extern NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags );
+extern NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory );
 extern NTSTATUS ps5_title_close_coalesced_write( HANDLE handle );
 extern void ps5_title_flush_all_coalesced_writes(void);
 extern void ps5_title_stop_coalesced_writes(void);

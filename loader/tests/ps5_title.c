@@ -1471,10 +1471,7 @@ static void test_sticky_write_routing(void)
     assert( local_fd >= 0 );
     broker_fd = open( name, O_RDWR );
     assert( broker_fd >= 0 );
-    /* RW coalescing remains disabled even for an exclusive open. Both routes
-     * complete pwrite before returning, so the other descriptor sees bytes. */
-    assert( !wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_GENERIC_READ |
-                                                 WINE_PS5_ACCESS_GENERIC_WRITE ) );
+    /* Sticky routing remains synchronous; targeted CASC buffering is tested below. */
     sticky_test_write( &handles, &state, handle, local_fd, broker_fd, "AAAA", 4, 0, 199999,
                        WINE_PS5_WRITE_LOCAL );
     assert( !wine_ps5_sticky_write_contains( &handles, handle ) );
@@ -1587,38 +1584,71 @@ static void test_write_trace(void)
 
 static void test_write_coalescing(void)
 {
-    assert( !wine_ps5_title_coalesce_eligible( 0, 1, 1 ) );
-    assert( wine_ps5_title_coalesce_eligible( 2, 1, 1 ) );
-    assert( wine_ps5_title_coalesce_eligible( WINE_PS5_COALESCE_WRITE_MAX, 1, 1 ) );
-    assert( !wine_ps5_title_coalesce_eligible( WINE_PS5_COALESCE_WRITE_MAX + 1, 1, 1 ) );
-    assert( !wine_ps5_title_coalesce_eligible( 2, 0, 1 ) );
-    assert( !wine_ps5_title_coalesce_eligible( 2, 1, 0 ) );
-    assert( wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_FILE_WRITE_DATA |
-                                                WINE_PS5_ACCESS_FILE_APPEND_DATA |
-                                                WINE_PS5_ACCESS_SYNCHRONIZE ) );
-    assert( wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_GENERIC_WRITE ) );
-    assert( !wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_FILE_READ_DATA |
-                                                 WINE_PS5_ACCESS_FILE_WRITE_DATA ) );
-    assert( !wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_GENERIC_READ |
-                                                 WINE_PS5_ACCESS_FILE_WRITE_DATA ) );
-    assert( !wine_ps5_title_coalesce_write_only( WINE_PS5_ACCESS_GENERIC_ALL ) );
+    static const char c_root[] = "/data/forever/prefix/drive_c";
+    static const char w_root[] = "/data/forever";
+    struct wine_ps5_title_buffer_state state = {0};
 
-    assert( wine_ps5_title_coalesce_decide( 0, 0, 0x1000, 2, 0 ) ==
-            WINE_PS5_COALESCE_BUFFER );
-    assert( wine_ps5_title_coalesce_decide( 2, 0x1002, 0x1002, 2, 0 ) ==
-            WINE_PS5_COALESCE_BUFFER );
-    assert( wine_ps5_title_coalesce_decide( 2, 0x1002, 0x9000, 2, 1 ) ==
-            WINE_PS5_COALESCE_BUFFER );
-    assert( wine_ps5_title_coalesce_decide( 2, 0x1002, 0x1004, 2, 0 ) ==
-            WINE_PS5_COALESCE_FLUSH_BUFFER );
-    assert( wine_ps5_title_coalesce_decide( WINE_PS5_COALESCE_BUFFER_MAX - 1, 0x2000,
-                                            0x2000, 2, 0 ) ==
-            WINE_PS5_COALESCE_FLUSH_BUFFER );
-    assert( wine_ps5_title_coalesce_decide( 0, 0, 0, WINE_PS5_COALESCE_WRITE_MAX + 1, 0 ) ==
-            WINE_PS5_COALESCE_DIRECT );
-    assert( !wine_ps5_title_coalesce_idle( 2, 100, 100 + WINE_PS5_COALESCE_IDLE_US - 1 ) );
-    assert( wine_ps5_title_coalesce_idle( 2, 100, 100 + WINE_PS5_COALESCE_IDLE_US ) );
-    puts( "ps5 write coalescing: write-only access, sequential, overflow, gap and idle PASS" );
+    assert( wine_ps5_title_buffer_path(
+        "/data/forever/prefix/drive_c/Games/World of Warcraft/Data/data/data.000",
+        c_root, w_root ) );
+    assert( wine_ps5_title_buffer_path(
+        "/data/forever/Games/World of Warcraft/_retail_/Data/data/DATA.123",
+        c_root, w_root ) );
+    assert( wine_ps5_title_buffer_path(
+        "/data/forever/Games/World of Warcraft/_classic_era_/Data/data/data.999",
+        c_root, w_root ) );
+    assert( wine_ps5_title_buffer_path(
+        "/data/forever/custom/World of Warcraft/_future_channel_/Data/data/data.042",
+        c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/Games/World of Warcraft/Data/indices/00.idx", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/Games/World of Warcraft/Data/data/data.12", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/Games/World of Warcraft/Data/data/data.1234", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/tmp/World of Warcraft/Data/data/data.000", c_root, w_root ) );
+
+    assert( wine_ps5_title_buffer_decide( &state, 0x100, 0, 4096, 1 ) ==
+            WINE_PS5_TITLE_BUFFER_START );
+    state.handle = 0x100;
+    state.end = 4096;
+    state.length = 4096;
+    assert( wine_ps5_title_buffer_decide( &state, 0x100, 4096, 16384, 1 ) ==
+            WINE_PS5_TITLE_BUFFER_APPEND );
+    assert( wine_ps5_title_buffer_decide( &state, 0x104, 4096, 4096, 1 ) ==
+            WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT );
+    assert( wine_ps5_title_buffer_decide( &state, 0x100, 8192, 4096, 1 ) ==
+            WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT );
+    assert( wine_ps5_title_buffer_decide( &state, 0x100, 4096, 4096, 0 ) ==
+            WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT );
+    assert( !wine_ps5_title_buffer_idle( 4096, 100, 100 + WINE_PS5_TITLE_BUFFER_RESIDENCE_US - 1 ) );
+    assert( wine_ps5_title_buffer_idle( 4096, 100, 100 + WINE_PS5_TITLE_BUFFER_RESIDENCE_US ) );
+
+    assert( !wine_ps5_title_buffer_disable_for_section( 1, 0, 0 ) ); /* SEC_IMAGE */
+    assert( !wine_ps5_title_buffer_disable_for_section( 0, 1, 0 ) ); /* unrelated data */
+    assert( wine_ps5_title_buffer_disable_for_section( 0, 1, 1 ) );  /* direct match */
+    assert( wine_ps5_title_buffer_disable_for_section( 0, 0, 0 ) );  /* unresolved */
+    assert( wine_ps5_title_buffer_single_link( 1 ) );
+    assert( wine_ps5_title_buffer_single_link( 0 ) ); /* Prospero unknown-count sentinel */
+    assert( !wine_ps5_title_buffer_single_link( 2 ) );
+    assert( wine_ps5_title_buffer_rename_may_enter_scope(
+        "/data/forever/Games/World of Warcraft/Data", c_root, w_root, 1 ) );
+    assert( wine_ps5_title_buffer_rename_may_enter_scope(
+        "/data/forever/Games/Staging", c_root, w_root, 1 ) ); /* ancestor may contain WoW */
+    assert( wine_ps5_title_buffer_rename_may_enter_scope(
+        "/data/forever/Games/World of Warcraft/Data/data/data.321", c_root, w_root, 0 ) );
+    assert( !wine_ps5_title_buffer_rename_may_enter_scope(
+        "/data/forever/Games/World of Warcraft/Logs/log.txt", c_root, w_root, 0 ) );
+    assert( !wine_ps5_title_buffer_rename_may_enter_scope(
+        "/tmp/World of Warcraft/Data", c_root, w_root, 1 ) );
+    assert( wine_ps5_title_buffer_same_identity( 7, 11, 7, 11 ) );
+    assert( !wine_ps5_title_buffer_same_identity( 7, 11, 7, 12 ) );
+    assert( !wine_ps5_title_buffer_admit( 1, 0, 1 ) ); /* shutdown recheck */
+    assert( !wine_ps5_title_buffer_admit( 0, 1, 1 ) ); /* permanent disable */
+    assert( wine_ps5_title_buffer_admit( 0, 0, 1 ) );
+    puts( "ps5 single CASC buffer: exact data.NNN scope, same-handle continuation, "
+          "40-ms residence, identity, shutdown and fail-closed mapping policy PASS" );
 }
 
 static void test_dirquery_spin(void)

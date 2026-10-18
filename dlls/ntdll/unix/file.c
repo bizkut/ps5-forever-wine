@@ -132,6 +132,12 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+#ifdef __PROSPERO__
+static void title_buffer_begin_mutation(void);
+static void title_buffer_end_mutation( void *arg );
+static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native_worker );
+static NTSTATUS title_buffer_disable_for_link(void);
+#endif
 
 #ifdef __PROSPERO__
 /* libkernel_sys's *at, fchdir and statfs entry points are payload-only, and
@@ -3605,6 +3611,10 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
           handle, event, apc_routine, apc_context, io, buffer,
           length, info_class, single_entry, debugstr_us(mask),
           restart_scan);
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
+
 
     if (event || apc_routine)
     {
@@ -5590,8 +5600,20 @@ NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK acce
     struct object_attributes *objattr;
     unsigned int status;
     data_size_t len;
+#ifdef __PROSPERO__
+    sigset_t previous;
+#endif
 
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
+#ifdef __PROSPERO__
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_mutation();
+    pthread_cleanup_push( title_buffer_end_mutation, NULL );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    status = title_buffer_flush( 0, 0, 0 );
+    if (!status)
+    {
+#endif
 
     SERVER_START_REQ( create_file )
     {
@@ -5606,6 +5628,14 @@ NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK acce
         *handle = wine_server_ptr_handle( reply->handle );
     }
     SERVER_END_REQ;
+#ifdef __PROSPERO__
+    }
+#endif
+#ifdef __PROSPERO__
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, NULL );
+    pthread_cleanup_pop( 1 );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+#endif
     free( objattr );
 #ifdef __PROSPERO__
     if (!status)
@@ -5642,6 +5672,11 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     *handle = 0;
     if (!attr || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 )))
+        return io->Status = status;
+#endif
+
 
     if (alloc_size) FIXME( "alloc_size not supported\n" );
 
@@ -5794,6 +5829,9 @@ NTSTATUS WINAPI NtCreateMailslotFile( HANDLE *handle, ULONG access, OBJECT_ATTRI
 
     *handle = 0;
     if (!attr) return STATUS_INVALID_PARAMETER;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
 
     SERVER_START_REQ( create_mailslot )
@@ -5832,6 +5870,9 @@ NTSTATUS WINAPI NtCreateNamedPipeFile( HANDLE *handle, ULONG access, OBJECT_ATTR
            handle, access, debugstr_us(attr->ObjectName), io, sharing, dispo,
            options, pipe_type, read_mode, completion_mode, max_inst,
            inbound_quota, outbound_quota, timeout );
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
 
     /* assume we only get relative timeout */
     if (timeout && timeout->QuadPart > 0) FIXME( "Wrong time %s\n", wine_dbgstr_longlong(timeout->QuadPart) );
@@ -5876,6 +5917,10 @@ NTSTATUS WINAPI NtDeleteFile( OBJECT_ATTRIBUTES *attr )
     char *unix_name;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
+
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, FALSE )))
     {
@@ -5900,6 +5945,10 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
+
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
     {
@@ -5929,6 +5978,10 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
+
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
     {
@@ -6481,6 +6534,11 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             UNICODE_STRING name_str, nt_name;
             OBJECT_ATTRIBUTES attr;
             char *unix_name;
+#ifdef __PROSPERO__
+            struct stat rename_st;
+            int rename_fd, rename_close, directory = 0;
+            sigset_t rename_previous;
+#endif
 
             if (class == FileRenameInformation)
                 flags = info->ReplaceIfExists ? FILE_RENAME_REPLACE_IF_EXISTS : 0;
@@ -6497,6 +6555,26 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
             {
+#ifdef __PROSPERO__
+                if (!server_get_unix_fd( handle, 0, &rename_fd, &rename_close, NULL, NULL ))
+                {
+                    if (!fstat( rename_fd, &rename_st )) directory = S_ISDIR( rename_st.st_mode );
+                    if (rename_close) close( rename_fd );
+                }
+                if ((status = ps5_title_note_buffered_rename( unix_name, directory )))
+                {
+                    free( unix_name );
+                    free( nt_name.Buffer );
+                    return io->Status = status;
+                }
+                pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &rename_previous );
+                title_buffer_begin_mutation();
+                pthread_cleanup_push( title_buffer_end_mutation, NULL );
+                pthread_sigmask( SIG_SETMASK, &rename_previous, NULL );
+                status = title_buffer_flush( 0, 0, 0 );
+                if (!status)
+                {
+#endif
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( handle );
@@ -6509,7 +6587,15 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                     status = wine_server_call( req );
                 }
                 SERVER_END_REQ;
+#ifdef __PROSPERO__
+                }
+#endif
 
+#ifdef __PROSPERO__
+                pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, NULL );
+                pthread_cleanup_pop( 1 );
+                pthread_sigmask( SIG_SETMASK, &rename_previous, NULL );
+#endif
             }
             free( unix_name );
             free( nt_name.Buffer );
@@ -6542,6 +6628,14 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             status = get_nt_and_unix_names( &attr, &nt_name, &unix_name, FILE_OPEN_IF, TRUE );
             if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
             {
+#ifdef __PROSPERO__
+                if ((status = title_buffer_disable_for_link()))
+                {
+                    free( unix_name );
+                    free( nt_name.Buffer );
+                    return io->Status = status;
+                }
+#endif
                 SERVER_START_REQ( set_fd_name_info )
                 {
                     req->handle   = wine_server_obj_handle( handle );
@@ -7665,6 +7759,7 @@ static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply )
     LONG64 now = title_io_now_us();
     char *path = NULL;
     unsigned int index;
+    struct wine_ps5_title_lock lock;
     int result = 0;
 
     if (now < __atomic_load_n( &broker_retry_at, __ATOMIC_SEQ_CST )) goto done;
@@ -7673,7 +7768,7 @@ static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply )
     request.path_length = strlen( path );
     pthread_once( &broker_once, broker_init );
     index = broker_windows_index( GetCurrentThreadId() );
-    pthread_mutex_lock( &broker[index].lock );
+    wine_ps5_title_lock_mutex( &lock, &broker[index].lock, &ps5_title_block_set );
     if (broker_get_connection( index, now ) != -1)
     {
         if (broker_transfer( broker[index].fd, &request, sizeof(request), 1 ) ||
@@ -7685,7 +7780,7 @@ static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply )
         }
         else result = !reply->result;
     }
-    pthread_mutex_unlock( &broker[index].lock );
+    wine_ps5_title_unlock_mutex( &lock );
 done:
     free( path );
     if (!InterlockedExchange( result ? &logged_broker : &logged_synthetic, 1 ))
@@ -7746,6 +7841,7 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
     size_t path_length, done = 0;
     ssize_t ret = BROKER_UNAVAILABLE;
     unsigned int index;
+    struct wine_ps5_title_lock lock;
 
     if (!length || now < __atomic_load_n( &broker_retry_at, __ATOMIC_SEQ_CST ))
         return BROKER_UNAVAILABLE;
@@ -7764,7 +7860,7 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
     pthread_once( &broker_once, broker_init );
     index = known_path ? (uintptr_t)pthread_self() % BROKER_CONNECTIONS
                        : broker_windows_index( GetCurrentThreadId() );
-    pthread_mutex_lock( &broker[index].lock );
+    wine_ps5_title_lock_mutex( &lock, &broker[index].lock, &ps5_title_block_set );
     if (broker_get_connection( index, now ) != -1)
     {
         while (done < length)
@@ -7783,7 +7879,7 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
         }
         if (done == length) ret = length;
     }
-    pthread_mutex_unlock( &broker[index].lock );
+    wine_ps5_title_unlock_mutex( &lock );
     free( allocated_path );
     return ret;
 }
@@ -7893,411 +7989,628 @@ static ssize_t title_file_pwrite_native( HANDLE handle, int fd, const void *buff
     return title_file_pwrite_buffer( handle, fd, buffer, length, offset, 1, path );
 }
 
-struct title_coalesced_write
+/* WINE_PS5_SINGLE_BUFFER_TEST_BEGIN */
+struct title_single_buffer
 {
     pthread_mutex_t mutex;
-    HANDLE handle;
-    int fd, used, write_only;
+    HANDLE handle, error_handle;
+    int fd, flushing, active;
     off_t start, end;
     size_t length;
-    uint64_t last_us, lru;
-    char path[WB_MAX_PATH + 1];
-    DWORD owner;
+    uint64_t first_us, dev, ino;
     NTSTATUS pending_status;
-    ACCESS_MASK granted_access;
-    unsigned char data[WINE_PS5_COALESCE_BUFFER_MAX];
+    char path[WB_MAX_PATH + 1];
+    pthread_t flushing_thread;
+    int flushing_thread_valid;
+    unsigned char data[2][WINE_PS5_TITLE_BUFFER_MAX];
 };
 
-static struct title_coalesced_write title_coalesced[WINE_PS5_COALESCE_HANDLES];
-static pthread_mutex_t title_coalesce_table_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t title_coalesce_once = PTHREAD_ONCE_INIT;
-static LONG title_coalesce_ready, title_coalesce_shutdown, title_coalesce_active;
-static LONG title_coalesce_enabled_logged, title_coalesce_failed_logged;
-static LONG64 title_coalesce_lru, title_coalesce_idle_check_at;
-
-static void title_coalesce_flush_idle(void);
-static void *title_coalesce_thread( void *arg );
-
-static void title_coalesce_init(void)
+struct title_buffer_snapshot
 {
-    unsigned int i;
-    pthread_t thread;
+    HANDLE handle;
+    int fd, index, consume_error, owner;
+    off_t start, end;
+    size_t length, done;
+    uint64_t first_us, dev, ino;
+    char path[WB_MAX_PATH + 1];
+};
 
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
+static struct title_single_buffer title_buffer = {.mutex = PTHREAD_MUTEX_INITIALIZER, .fd = -1};
+static pthread_once_t title_buffer_once = PTHREAD_ONCE_INIT;
+static pthread_t title_buffer_thread_id;
+static LONG title_buffer_ready, title_buffer_shutdown, title_buffer_joined;
+static LONG title_buffer_disabled, title_buffer_enabled_logged, title_buffer_bypass_logged;
+static LONG title_buffer_disabled_logged, title_buffer_failure_logged;
+static LONG title_buffer_switch_mode = 1, title_buffer_mutations;
+static LONG64 title_buffer_switch_poll_us, title_buffer_mutation_generation;
+
+static void *title_buffer_thread( void *arg );
+
+static void title_buffer_log_state( LONG *once, const char *state,
+                                    const char *reason, LONG64 detail )
+{
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    char line[192];
+
+    if (InterlockedExchange( once, 1 )) return;
+    snprintf( line, sizeof(line),
+              "wine: title writebuf state=%s reason=%s detail=%lld pid=%d\n",
+              state, reason, (long long)detail, (int)getpid() );
+    sceKernelDebugOutText( 0, line );
+#else
+    (void)once;
+    (void)state;
+    (void)reason;
+    (void)detail;
+#endif
+}
+
+static void title_buffer_init(void)
+{
+    if (!pthread_create( &title_buffer_thread_id, NULL, title_buffer_thread, NULL ))
+        InterlockedExchange( &title_buffer_ready, 1 );
+}
+
+static int title_buffer_ensure(void)
+{
+#ifdef WINE_PS5_WRITE_BUFFER_TEST
+    return 1;
+#else
+    pthread_once( &title_buffer_once, title_buffer_init );
+    if (!InterlockedCompareExchange( &title_buffer_ready, 0, 0 ))
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "worker-create", 0 );
+    return InterlockedCompareExchange( &title_buffer_ready, 0, 0 );
+#endif
+}
+
+static int title_buffer_switch_enabled(void)
+{
+    const char *value = getenv( "WINEPS5_WRITE_BUFFER" );
+    LONG64 now = title_io_now_us();
+    LONG64 last = __atomic_load_n( &title_buffer_switch_poll_us, __ATOMIC_RELAXED );
+
+    if (value && (!strcmp( value, "0" ) || !strcmp( value, "off" )))
     {
-        pthread_mutex_init( &title_coalesced[i].mutex, NULL );
-        title_coalesced[i].fd = -1;
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "env-off", 0 );
+        return 0;
     }
-    InterlockedExchange( &title_coalesce_ready, 1 );
-    if (!pthread_create( &thread, NULL, title_coalesce_thread, NULL ))
-        pthread_detach( thread );
-}
-
-static int title_coalesce_ensure(void)
-{
-    pthread_once( &title_coalesce_once, title_coalesce_init );
-    return InterlockedCompareExchange( &title_coalesce_ready, 0, 0 ) &&
-           !InterlockedCompareExchange( &title_coalesce_shutdown, 0, 0 );
-}
-
-static void title_coalesce_log_failure( NTSTATUS status )
-{
-    if (!InterlockedExchange( &title_coalesce_failed_logged, 1 ))
+    if (now - last >= 1000000 &&
+        __atomic_compare_exchange_n( &title_buffer_switch_poll_us, &last, now, FALSE,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
     {
-        char line[112];
+        const char *root = ps5_title_drive( 'c' );
+        char path[PATH_MAX], text[1024], *line, *end;
+        ssize_t length;
+        int fd, path_len;
 
-        snprintf( line, sizeof(line), "wine: title write coalesce flush failed status=%08x pid=%d\n",
-                  status, (int)getpid() );
-        sceKernelDebugOutText( 0, line );
+        if (root && (path_len = snprintf( path, sizeof(path), "%s/wineps5-tune.txt", root )) >= 0 &&
+            path_len < (int)sizeof(path) && (fd = open( path, O_RDONLY )) != -1)
+        {
+            length = read( fd, text, sizeof(text) - 1 );
+            close( fd );
+            if (length >= 0)
+            {
+                text[length] = 0;
+                for (line = text; *line; line = end)
+                {
+                    if ((end = strchr( line, '\n' ))) *end++ = 0;
+                    else end = line + strlen( line );
+                    if (*line && line[strlen( line ) - 1] == '\r') line[strlen( line ) - 1] = 0;
+                    if (!strcmp( line, "write_buffer=off" ))
+                        __atomic_store_n( &title_buffer_switch_mode, 0, __ATOMIC_RELAXED );
+                    else if (!strcmp( line, "write_buffer=on" ))
+                        __atomic_store_n( &title_buffer_switch_mode, 1, __ATOMIC_RELAXED );
+                }
+            }
+        }
+    }
+    if (!__atomic_load_n( &title_buffer_switch_mode, __ATOMIC_RELAXED ))
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "tune-off", 0 );
+    return __atomic_load_n( &title_buffer_switch_mode, __ATOMIC_RELAXED );
+}
+
+static void title_buffer_lock( struct wine_ps5_title_lock *lock )
+{
+    wine_ps5_title_lock_mutex( lock, &title_buffer.mutex, &ps5_title_block_set );
+}
+
+static void title_buffer_unlock( struct wine_ps5_title_lock *lock )
+{
+    wine_ps5_title_unlock_mutex( lock );
+    lock->mutex = NULL;
+}
+
+static void title_buffer_wait_for_flush( struct wine_ps5_title_lock *lock )
+{
+    while (title_buffer.flushing)
+    {
+        title_buffer_unlock( lock );
+        usleep( 1000 );
+        title_buffer_lock( lock );
+    }
+}
+static void title_buffer_wait_for_admission( struct wine_ps5_title_lock *lock )
+{
+    while (title_buffer.flushing ||
+           InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ))
+    {
+#ifdef WINE_PS5_WRITE_BUFFER_TEST
+        title_buffer_test_wait_hook( title_buffer.flushing,
+                                     InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ) );
+#endif
+        title_buffer_unlock( lock );
+        usleep( 1000 );
+        title_buffer_lock( lock );
     }
 }
 
-static NTSTATUS title_coalesce_flush_locked( struct title_coalesced_write *entry )
+
+static void title_buffer_restore_snapshot_locked( struct title_buffer_snapshot *snapshot,
+                                                  NTSTATUS status )
 {
-    size_t done = 0, length = entry->length;
+    size_t left = snapshot->length - snapshot->done;
+
+    if (left)
+    {
+        if (snapshot->done)
+            memmove( title_buffer.data[snapshot->index],
+                     title_buffer.data[snapshot->index] + snapshot->done, left );
+        title_buffer.active = snapshot->index;
+        title_buffer.handle = snapshot->handle;
+        title_buffer.fd = snapshot->fd;
+        title_buffer.start = snapshot->start + snapshot->done;
+        title_buffer.end = snapshot->end;
+        title_buffer.length = left;
+        title_buffer.first_us = snapshot->first_us;
+        title_buffer.dev = snapshot->dev;
+        title_buffer.ino = snapshot->ino;
+        memcpy( title_buffer.path, snapshot->path, sizeof(title_buffer.path) );
+        if (!status) status = STATUS_UNSUCCESSFUL;
+        title_buffer.pending_status = status;
+        title_buffer.error_handle = snapshot->handle;
+        InterlockedExchange( &title_buffer_disabled, 1 );
+    }
+    else
+    {
+        close( snapshot->fd );
+        if (!snapshot->handle) title_buffer.pending_status = STATUS_SUCCESS;
+    }
+    title_buffer.flushing = 0;
+    title_buffer.flushing_thread_valid = 0;
+}
+
+static void title_buffer_flush_cleanup( void *arg )
+{
+    struct title_buffer_snapshot *snapshot = arg;
+    struct wine_ps5_title_lock lock;
+
+    title_buffer_lock( &lock );
+    title_buffer_restore_snapshot_locked( snapshot, STATUS_UNSUCCESSFUL );
+    title_buffer_unlock( &lock );
+}
+
+static int title_buffer_snapshot_path_matches( const struct title_buffer_snapshot *snapshot )
+{
+    struct stat st;
+    return snapshot->path[0] && !stat( snapshot->path, &st ) &&
+           wine_ps5_title_buffer_same_identity( snapshot->dev, snapshot->ino,
+                                                st.st_dev, st.st_ino );
+}
+
+static ssize_t title_buffer_write_snapshot( const struct title_buffer_snapshot *snapshot,
+                                            const void *bytes, size_t length, off_t offset,
+                                            int emergency )
+{
+    if (!emergency && title_buffer_snapshot_path_matches( snapshot ))
+        return title_file_pwrite_native( snapshot->handle, snapshot->fd, bytes, length,
+                                         offset, snapshot->path );
+    else
+    {
+        LONG64 started = title_io_now_us();
+        ssize_t ret = title_write_trace_pwrite( snapshot->fd, bytes, length, offset, NULL );
+        title_io_note( TITLE_IO_WRITE, ret, started );
+        return ret;
+    }
+}
+
+/* The run is detached and cleanup is armed while termination signals are
+ * blocked. Keep them blocked through backing I/O and the final state commit,
+ * so SIGQUIT cannot abandon either the run flag or the broker's own mutex. */
+static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native_worker )
+{
+    struct title_buffer_snapshot snapshot = {0};
+    struct wine_ps5_title_lock lock;
+    sigset_t previous_signals;
     NTSTATUS status = STATUS_SUCCESS;
 
-    while (done < length)
+    /* mode 1 is the normal native idle worker; mode 2 is shutdown-only pinned-fd I/O */
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_flush( &lock );
+    if (title_buffer.pending_status && caller && caller == title_buffer.error_handle)
     {
-        ssize_t ret = title_file_pwrite_native( entry->handle, entry->fd, entry->data + done,
-                                                length - done, entry->start + done, entry->path );
-
-        if (ret < 0)
-        {
-            status = errno_to_status( errno );
-            break;
-        }
-        if (!ret)
-        {
-            status = STATUS_DISK_FULL;
-            break;
-        }
-        done += ret;
+        status = title_buffer.pending_status;
+        if (consume_error) title_buffer.pending_status = STATUS_SUCCESS;
+        title_buffer_unlock( &lock );
+        return status;
     }
-    if (length) InterlockedDecrement( &title_coalesce_active );
-    entry->length = 0;
-    entry->owner = 0;
-    if (status)
+    if (!title_buffer.length)
     {
-        if (!entry->pending_status) entry->pending_status = status;
-        title_coalesce_log_failure( status );
-    }
-    return status;
-}
-
-static NTSTATUS title_coalesce_take_error_locked( struct title_coalesced_write *entry )
-{
-    NTSTATUS status = entry->pending_status;
-
-    entry->pending_status = STATUS_SUCCESS;
-    return status;
-}
-
-/* Returned entry is locked. A waiter means another writer was using the same
- * handle; its caller flushes the run and performs this write directly. */
-static struct title_coalesced_write *title_coalesce_lock_entry( HANDLE handle, int create, int fd,
-                                                                int *contended )
-{
-    struct title_coalesced_write *entry = NULL, *victim = NULL;
-    uint64_t oldest = UINT64_MAX, lru;
-    char *path = NULL;
-    OBJECT_BASIC_INFORMATION basic;
-    NTSTATUS query_status;
-    unsigned int i;
-
-    *contended = 0;
-    pthread_mutex_lock( &title_coalesce_table_mutex );
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
-    {
-        if (!title_coalesced[i].used || title_coalesced[i].handle != handle) continue;
-        entry = &title_coalesced[i];
-        if (pthread_mutex_trylock( &entry->mutex ))
-        {
-            pthread_mutex_unlock( &title_coalesce_table_mutex );
-            pthread_mutex_lock( &entry->mutex );
-            if (!entry->used || entry->handle != handle)
-            {
-                pthread_mutex_unlock( &entry->mutex );
-                return NULL;
-            }
-            *contended = 1;
-            __atomic_store_n( &entry->lru, InterlockedIncrement64( &title_coalesce_lru ),
-                              __ATOMIC_RELAXED );
-            return entry;
-        }
-        pthread_mutex_unlock( &title_coalesce_table_mutex );
-        __atomic_store_n( &entry->lru, InterlockedIncrement64( &title_coalesce_lru ),
-                          __ATOMIC_RELAXED );
-        return entry;
-    }
-    if (!create)
-    {
-        pthread_mutex_unlock( &title_coalesce_table_mutex );
-        return NULL;
-    }
-
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
-    {
-        if (!title_coalesced[i].used)
-        {
-            victim = &title_coalesced[i];
-            break;
-        }
-        lru = __atomic_load_n( &title_coalesced[i].lru, __ATOMIC_RELAXED );
-        if (!__atomic_load_n( &title_coalesced[i].pending_status, __ATOMIC_RELAXED ) &&
-            lru < oldest)
-        {
-            oldest = lru;
-            victim = &title_coalesced[i];
-        }
-    }
-    if (!victim)
-    {
-        pthread_mutex_unlock( &title_coalesce_table_mutex );
-        return NULL;
-    }
-    pthread_mutex_lock( &victim->mutex );
-    if (victim->used)
-    {
-        if (title_coalesce_flush_locked( victim ))
-        {
-            pthread_mutex_unlock( &victim->mutex );
-            pthread_mutex_unlock( &title_coalesce_table_mutex );
-            return NULL;
-        }
-        if (victim->fd != -1) close( victim->fd );
-    }
-
-    memset( &basic, 0, sizeof(basic) );
-    query_status = NtQueryObject( handle, ObjectBasicInformation, &basic, sizeof(basic), NULL );
-    victim->granted_access = query_status ? 0 : basic.GrantedAccess;
-    victim->write_only = !query_status &&
-                         wine_ps5_title_coalesce_write_only( victim->granted_access );
-    victim->fd = -1;
-    if (victim->write_only && (victim->fd = dup( fd )) == -1)
-    {
-        victim->used = 0;
-        pthread_mutex_unlock( &victim->mutex );
-        pthread_mutex_unlock( &title_coalesce_table_mutex );
-        return NULL;
-    }
-    victim->used = 1;
-    victim->handle = handle;
-    victim->path[0] = 0;
-    if (victim->write_only && !server_get_unix_name( handle, &path ) && path)
-    {
-        size_t path_length = strlen( path );
-
-        if (path_length <= WB_MAX_PATH) memcpy( victim->path, path, path_length + 1 );
-        free( path );
-    }
-    victim->start = victim->end = 0;
-    victim->length = 0;
-    victim->last_us = 0;
-    victim->owner = 0;
-    victim->pending_status = STATUS_SUCCESS;
-    __atomic_store_n( &victim->lru, InterlockedIncrement64( &title_coalesce_lru ),
-                      __ATOMIC_RELAXED );
-    pthread_mutex_unlock( &title_coalesce_table_mutex );
-    return victim;
-}
-
-static NTSTATUS title_coalesce_write( HANDLE handle, int fd, const void *buffer, size_t length,
-                                      off_t offset, int append, int *handled, off_t *new_pos )
-{
-    struct title_coalesced_write *entry;
-    enum wine_ps5_title_coalesce_action action;
-    DWORD thread = GetCurrentThreadId();
-    NTSTATUS status;
-    int contended;
-    off_t write_offset;
-
-    *handled = 0;
-    if (!length || !title_coalesce_ensure()) return STATUS_SUCCESS;
-    title_coalesce_flush_idle();
-    if (!(entry = title_coalesce_lock_entry( handle, 1, fd, &contended ))) return STATUS_SUCCESS;
-    if (!entry->write_only)
-    {
-        pthread_mutex_unlock( &entry->mutex );
+        title_buffer_unlock( &lock );
         return STATUS_SUCCESS;
     }
-    if (entry->pending_status)
+
+    snapshot.handle = title_buffer.handle;
+    snapshot.fd = title_buffer.fd;
+    snapshot.index = title_buffer.active;
+    snapshot.start = title_buffer.start;
+    snapshot.end = title_buffer.end;
+    snapshot.length = title_buffer.length;
+    snapshot.first_us = title_buffer.first_us;
+    snapshot.dev = title_buffer.dev;
+    snapshot.ino = title_buffer.ino;
+    snapshot.consume_error = consume_error;
+    snapshot.owner = caller && caller == title_buffer.handle;
+    memcpy( snapshot.path, title_buffer.path, sizeof(snapshot.path) );
+    title_buffer.flushing = 1;
+    title_buffer.flushing_thread = pthread_self();
+    title_buffer.flushing_thread_valid = 1;
+    title_buffer.handle = 0;
+    title_buffer.fd = -1;
+    title_buffer.start = title_buffer.end = 0;
+    title_buffer.length = 0;
+    title_buffer.first_us = 0;
+    title_buffer.path[0] = 0;
+    title_buffer.active ^= 1;
+
+    previous_signals = lock.signals;
+    pthread_cleanup_push( title_buffer_flush_cleanup, &snapshot );
+    pthread_mutex_unlock( &title_buffer.mutex );
+    lock.mutex = NULL;
+    while (snapshot.done < snapshot.length)
     {
-        status = title_coalesce_take_error_locked( entry );
-        pthread_mutex_unlock( &entry->mutex );
+        ssize_t ret = title_buffer_write_snapshot(
+            &snapshot, title_buffer.data[snapshot.index] + snapshot.done,
+            snapshot.length - snapshot.done, snapshot.start + snapshot.done,
+            native_worker == 2 );
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret < 0) { status = errno_to_status( errno ); break; }
+        if (!ret) { status = STATUS_DISK_FULL; break; }
+        snapshot.done += ret;
+    }
+
+    pthread_mutex_lock( &title_buffer.mutex );
+    lock.mutex = &title_buffer.mutex;
+    title_buffer_restore_snapshot_locked( &snapshot, status );
+    if (status)
+    {
+        if (!InterlockedExchange( &title_buffer_failure_logged, 1 ))
+            sceKernelDebugOutText( 0, "wine: title write buffer flush failed; buffering disabled\n" );
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "flush-error", status );
+        if (snapshot.consume_error && snapshot.owner)
+            title_buffer.pending_status = STATUS_SUCCESS;
+    }
+    pthread_cleanup_pop( 0 );
+    pthread_mutex_unlock( &title_buffer.mutex );
+    lock.mutex = NULL;
+    pthread_sigmask( SIG_SETMASK, &previous_signals, NULL );
+    return status;
+}
+
+static void title_buffer_begin_mutation(void)
+{
+    struct wine_ps5_title_lock lock;
+
+    title_buffer_lock( &lock );
+    InterlockedIncrement( &title_buffer_mutations );
+    title_buffer_mutation_generation++;
+    title_buffer_unlock( &lock );
+}
+
+static void title_buffer_end_mutation( void *arg )
+{
+    struct wine_ps5_title_lock lock;
+
+    (void)arg;
+    title_buffer_lock( &lock );
+    InterlockedDecrement( &title_buffer_mutations );
+    title_buffer_unlock( &lock );
+}
+
+static int title_buffer_needs_path( HANDLE handle, LONG64 *generation )
+{
+    struct wine_ps5_title_lock lock;
+    int need;
+
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_admission( &lock );
+    need = !title_buffer.length || title_buffer.handle != handle;
+    *generation = title_buffer_mutation_generation;
+    title_buffer_unlock( &lock );
+    return need;
+}
+static int title_buffer_resolve_start( HANDLE handle, int fd, int need_path,
+                                       char **path, uint64_t *dev, uint64_t *ino )
+{
+    struct stat fd_st, path_st;
+
+    *dev = *ino = 0;
+    if (!title_buffer_switch_enabled()) return 0;
+    if (!need_path) return 1;
+    if (server_get_unix_name( handle, path ) || !*path) return 0;
+    if (!wine_ps5_title_buffer_path( *path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) ))
+        return 0;
+    if (fstat( fd, &fd_st ))
+    {
+        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "fstat", errno );
+        return 0;
+    }
+    if (!S_ISREG( fd_st.st_mode ))
+    {
+        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "non-regular", fd_st.st_mode );
+        return 0;
+    }
+    if (!wine_ps5_title_buffer_single_link( fd_st.st_nlink ))
+    {
+        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "hardlink", fd_st.st_nlink );
+        return 0;
+    }
+    if (stat( *path, &path_st ))
+    {
+        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "path-stat", errno );
+        return 0;
+    }
+    if (!wine_ps5_title_buffer_same_identity( fd_st.st_dev, fd_st.st_ino,
+                                              path_st.st_dev, path_st.st_ino ))
+    {
+        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "identity", 0 );
+        return 0;
+    }
+    *dev = fd_st.st_dev;
+    *ino = fd_st.st_ino;
+    return 1;
+}
+
+static int title_buffer_maybe_continuation( HANDLE handle, size_t size,
+                                            const LARGE_INTEGER *offset )
+{
+    struct wine_ps5_title_lock lock;
+    int continuation;
+
+    if (!title_buffer_switch_enabled()) return 0;
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_admission( &lock );
+    continuation = wine_ps5_title_buffer_admit(
+            InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 ),
+            InterlockedCompareExchange( &title_buffer_disabled, 0, 0 ), 1 ) &&
+        title_buffer.length && title_buffer.handle == handle &&
+        size <= WINE_PS5_TITLE_BUFFER_MAX - title_buffer.length &&
+        ((!offset || offset->QuadPart == FILE_USE_FILE_POINTER_POSITION) ||
+         (offset->QuadPart >= 0 && offset->QuadPart == title_buffer.end));
+    title_buffer_unlock( &lock );
+    return continuation;
+}
+
+
+static NTSTATUS title_buffer_write( HANDLE handle, int fd, const void *bytes, size_t size,
+                                    off_t offset, const char *path, uint64_t dev, uint64_t ino,
+                                    LONG64 generation, int eligible, int *handled, off_t *new_pos )
+{
+    struct wine_ps5_title_buffer_state state;
+    enum wine_ps5_title_buffer_action action;
+    struct wine_ps5_title_lock lock;
+    NTSTATUS status;
+    int started = 0, new_fd;
+
+    *handled = 0;
+    if (!size || !eligible || !title_buffer_switch_enabled() || !title_buffer_ensure())
+        return title_buffer_flush( handle, 1, 0 );
+
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_admission( &lock );
+    if (title_buffer.pending_status && title_buffer.error_handle == handle)
+    {
+        status = title_buffer.pending_status;
+        title_buffer.pending_status = STATUS_SUCCESS;
+        title_buffer_unlock( &lock );
         *handled = 1;
         return status;
     }
-    if (contended || (entry->length && entry->owner != thread))
+    state.handle = (uintptr_t)title_buffer.handle;
+    state.end = title_buffer.end;
+    state.length = title_buffer.length;
+    action = wine_ps5_title_buffer_decide( &state, (uintptr_t)handle, offset, size,
+        eligible && generation == title_buffer_mutation_generation &&
+        wine_ps5_title_buffer_admit(
+            InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 ),
+            InterlockedCompareExchange( &title_buffer_disabled, 0, 0 ),
+            title_buffer_switch_enabled() ) );
+    if (action == WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT)
     {
-        status = title_coalesce_flush_locked( entry );
-        if (status) title_coalesce_take_error_locked( entry );
-        pthread_mutex_unlock( &entry->mutex );
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush( handle, 1, 0 );
         if (status) *handled = 1;
         return status;
     }
-
-    action = wine_ps5_title_coalesce_decide( entry->length, entry->end, offset, length, append );
-    if (action == WINE_PS5_COALESCE_DIRECT)
+    if (action == WINE_PS5_TITLE_BUFFER_START)
     {
-        pthread_mutex_unlock( &entry->mutex );
-        return STATUS_SUCCESS;
-    }
-    if (action == WINE_PS5_COALESCE_FLUSH_BUFFER)
-    {
-        if ((status = title_coalesce_flush_locked( entry )))
+        if (!path || strlen( path ) > WB_MAX_PATH || (new_fd = dup( fd )) == -1)
         {
-            title_coalesce_take_error_locked( entry );
-            pthread_mutex_unlock( &entry->mutex );
-            *handled = 1;
-            return status;
+            title_buffer_unlock( &lock );
+            return STATUS_SUCCESS;
         }
+        title_buffer.fd = new_fd;
+        title_buffer.handle = handle;
+        title_buffer.start = title_buffer.end = offset;
+        title_buffer.first_us = title_io_now_us();
+        title_buffer.dev = dev;
+        title_buffer.ino = ino;
+        strcpy( title_buffer.path, path );
+        started = 1;
     }
-
-    write_offset = append && entry->length ? entry->end : offset;
-    if (virtual_uninterrupted_read_memory( buffer, entry->data + entry->length, length ) != length)
+    if (virtual_uninterrupted_read_memory(
+        bytes, title_buffer.data[title_buffer.active] + title_buffer.length, size ) != size)
     {
-        pthread_mutex_unlock( &entry->mutex );
+        if (started)
+        {
+            close( title_buffer.fd );
+            title_buffer.fd = -1;
+            title_buffer.handle = 0;
+            title_buffer.start = title_buffer.end = 0;
+            title_buffer.first_us = 0;
+            title_buffer.dev = title_buffer.ino = 0;
+            title_buffer.path[0] = 0;
+        }
+        title_buffer_unlock( &lock );
         *handled = 1;
         return STATUS_INVALID_USER_BUFFER;
     }
-    if (!entry->length)
-    {
-        entry->start = write_offset;
-        entry->end = write_offset;
-        entry->owner = thread;
-        InterlockedIncrement( &title_coalesce_active );
-    }
-    entry->length += length;
-    entry->end += length;
-    *new_pos = entry->end;
-    entry->last_us = title_io_now_us();
-    __atomic_store_n( &entry->lru, InterlockedIncrement64( &title_coalesce_lru ),
-                      __ATOMIC_RELAXED );
+    title_buffer.length += size;
+    title_buffer.end += size;
     InterlockedIncrement64( &title_io_coalesced );
-    if (!InterlockedExchange( &title_coalesce_enabled_logged, 1 ))
-        sceKernelDebugOutText( 0, "wine: title write coalesce enabled\n" );
-    pthread_mutex_unlock( &entry->mutex );
+    *new_pos = title_buffer.end;
+    title_buffer_unlock( &lock );
+    title_buffer_log_state( &title_buffer_enabled_logged, "enabled", "eligible", 0 );
     *handled = 1;
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS title_buffer_disable_for_link(void)
+{
+    struct wine_ps5_title_lock lock;
+
+    title_buffer_lock( &lock );
+    InterlockedExchange( &title_buffer_disabled, 1 );
+    title_buffer_unlock( &lock );
+    title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "link-create", 0 );
+    return title_buffer_flush( 0, 0, 0 );
+}
+
+NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory )
+{
+    struct wine_ps5_title_lock lock;
+
+    if (!wine_ps5_title_buffer_rename_may_enter_scope(
+            path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ), directory ))
+        return STATUS_SUCCESS;
+    title_buffer_lock( &lock );
+    InterlockedExchange( &title_buffer_disabled, 1 );
+    title_buffer_unlock( &lock );
+    title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "rename-scope", 0 );
+    return title_buffer_flush( 0, 0, 0 );
+}
+
 NTSTATUS ps5_title_flush_coalesced_write( HANDLE handle )
 {
-    struct title_coalesced_write *entry;
-    NTSTATUS status;
-    int contended;
+    return title_buffer_flush( handle, 1, 0 );
+}
 
-    if (!InterlockedCompareExchange( &title_coalesce_ready, 0, 0 )) return STATUS_SUCCESS;
-    title_coalesce_flush_idle();
-    if (!(entry = title_coalesce_lock_entry( handle, 0, -1, &contended ))) return STATUS_SUCCESS;
-    if ((status = title_coalesce_take_error_locked( entry )))
-    {
-        pthread_mutex_unlock( &entry->mutex );
-        return status;
-    }
-    status = title_coalesce_flush_locked( entry );
-    if (status) title_coalesce_take_error_locked( entry );
-    pthread_mutex_unlock( &entry->mutex );
+NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags )
+{
+    struct wine_ps5_title_lock lock;
+    NTSTATUS status;
+    char *path = NULL;
+    int resolved, scoped = 0, disable;
+
+    if (sec_flags & SEC_IMAGE) return title_buffer_flush( handle, 1, 0 );
+    resolved = !server_get_unix_name( handle, &path ) && path;
+    if (resolved)
+        scoped = wine_ps5_title_buffer_path(
+            path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) );
+
+    title_buffer_lock( &lock );
+    disable = wine_ps5_title_buffer_disable_for_section( 0, resolved, scoped );
+    if (disable) InterlockedExchange( &title_buffer_disabled, 1 );
+    title_buffer_unlock( &lock );
+    if (disable)
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled",
+                                resolved ? "section-scoped" : "section-unresolved", 0 );
+
+    status = title_buffer_flush( handle, 1, 0 );
+    free( path );
     return status;
 }
 
 NTSTATUS ps5_title_close_coalesced_write( HANDLE handle )
 {
-    struct title_coalesced_write *entry = NULL;
-    NTSTATUS status = STATUS_SUCCESS;
-    unsigned int i;
+    struct wine_ps5_title_lock lock;
+    NTSTATUS status = title_buffer_flush( handle, 1, 0 );
 
-    if (!InterlockedCompareExchange( &title_coalesce_ready, 0, 0 )) return STATUS_SUCCESS;
-    pthread_mutex_lock( &title_coalesce_table_mutex );
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
-        if (title_coalesced[i].used && title_coalesced[i].handle == handle)
-        {
-            entry = &title_coalesced[i];
-            break;
-        }
-    if (entry)
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_flush( &lock );
+    if (title_buffer.handle == handle)
     {
-        pthread_mutex_lock( &entry->mutex );
-        if (!(status = title_coalesce_take_error_locked( entry )))
-        {
-            status = title_coalesce_flush_locked( entry );
-            if (status) title_coalesce_take_error_locked( entry );
-        }
-        if (entry->fd != -1) close( entry->fd );
-        entry->fd = -1;
-        entry->used = 0;
-        entry->length = 0;
-        pthread_mutex_unlock( &entry->mutex );
+        title_buffer.handle = 0;
+        title_buffer.error_handle = 0;
+        title_buffer.pending_status = STATUS_SUCCESS; /* close already reported it */
     }
-    pthread_mutex_unlock( &title_coalesce_table_mutex );
+    title_buffer_unlock( &lock );
     return status;
 }
 
 void ps5_title_stop_coalesced_writes(void)
 {
-    InterlockedExchange( &title_coalesce_shutdown, 1 );
+    InterlockedExchange( &title_buffer_shutdown, 1 );
 }
 
 void ps5_title_flush_all_coalesced_writes(void)
 {
-    unsigned int i;
+    struct wine_ps5_title_lock lock;
+    NTSTATUS status;
+    int retry = 0, current_flusher, current_worker;
 
     ps5_title_stop_coalesced_writes();
-    if (!InterlockedCompareExchange( &title_coalesce_ready, 0, 0 )) return;
-    pthread_mutex_lock( &title_coalesce_table_mutex );
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
+    title_buffer_lock( &lock );
+    current_flusher = title_buffer.flushing_thread_valid &&
+                      (uintptr_t)title_buffer.flushing_thread == (uintptr_t)pthread_self();
+    title_buffer_unlock( &lock );
+    current_worker = InterlockedCompareExchange( &title_buffer_ready, 0, 0 ) &&
+                     (uintptr_t)title_buffer_thread_id == (uintptr_t)pthread_self();
+    if (current_flusher || current_worker) return; /* cleanup drains after pthread_exit */
+    if (InterlockedCompareExchange( &title_buffer_ready, 0, 0 ) &&
+        !InterlockedExchange( &title_buffer_joined, 1 ))
+        pthread_join( title_buffer_thread_id, NULL );
+
+    title_buffer_lock( &lock );
+    title_buffer_wait_for_flush( &lock );
+    if (title_buffer.pending_status)
     {
-        if (!title_coalesced[i].used) continue;
-        pthread_mutex_lock( &title_coalesced[i].mutex );
-        title_coalesce_flush_locked( &title_coalesced[i] );
-        pthread_mutex_unlock( &title_coalesced[i].mutex );
+        title_buffer.pending_status = STATUS_SUCCESS;
+        retry = title_buffer.length != 0;
     }
-    pthread_mutex_unlock( &title_coalesce_table_mutex );
+    title_buffer_unlock( &lock );
+    status = title_buffer_flush( 0, 0, 2 );
+    if (status && !retry) status = title_buffer_flush( 0, 0, 2 );
+    if (status)
+        sceKernelDebugOutText( 0, "wine: title write buffer shutdown retry failed; bytes retained\n" );
 }
 
-static void title_coalesce_flush_idle(void)
+static void *title_buffer_thread( void *arg )
 {
-    LONG64 now, next;
-    unsigned int i;
+    NTSTATUS status;
 
-    if (!InterlockedCompareExchange( &title_coalesce_active, 0, 0 )) return;
-    now = title_io_now_us();
-    next = InterlockedCompareExchange64( &title_coalesce_idle_check_at, 0, 0 );
-
-    if (now < next ||
-        InterlockedCompareExchange64( &title_coalesce_idle_check_at, now + 10000, next ) != next)
-        return;
-    for (i = 0; i < WINE_PS5_COALESCE_HANDLES; i++)
-    {
-        struct title_coalesced_write *entry = &title_coalesced[i];
-
-        pthread_mutex_lock( &title_coalesce_table_mutex );
-        if (!entry->used)
-        {
-            pthread_mutex_unlock( &title_coalesce_table_mutex );
-            continue;
-        }
-        pthread_mutex_lock( &entry->mutex );
-        pthread_mutex_unlock( &title_coalesce_table_mutex );
-        if (entry->used &&
-            wine_ps5_title_coalesce_idle( entry->length, entry->last_us, now ))
-            title_coalesce_flush_locked( entry );
-        pthread_mutex_unlock( &entry->mutex );
-    }
-}
-
-static void *title_coalesce_thread( void *arg )
-{
     (void)arg;
     for (;;)
     {
+        struct wine_ps5_title_lock lock;
+        int due, stopping;
+
         usleep( 10000 );
-        if (InterlockedCompareExchange( &title_coalesce_shutdown, 0, 0 )) break;
-        title_coalesce_flush_idle();
+        title_buffer_lock( &lock );
+        title_buffer_wait_for_flush( &lock );
+        stopping = InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 );
+        due = wine_ps5_title_buffer_idle(
+            title_buffer.length, title_buffer.first_us, title_io_now_us() );
+        title_buffer_unlock( &lock );
+        if (due) (void)title_buffer_flush( 0, 0, stopping ? 2 : 1 );
+        if (stopping) break;
     }
+    status = title_buffer_flush( 0, 0, 2 );
+    if (status) status = title_buffer_flush( 0, 0, 2 );
+    if (status)
+        sceKernelDebugOutText( 0, "wine: title write buffer native shutdown retry failed; bytes retained\n" );
     return NULL;
 }
+/* WINE_PS5_SINGLE_BUFFER_TEST_END */
 #endif
 
 
@@ -8709,15 +9022,22 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
     BOOL send_completion = FALSE, async_write, append_write = FALSE, timeout_init_done = FALSE;
     LARGE_INTEGER offset_eof;
 #ifdef __PROSPERO__
-    int coalesced;
+    int coalesced, need_path, eligible;
+    uint64_t buffer_dev, buffer_ino;
+    LONG64 buffer_generation;
     off_t coalesced_pos;
+    char *buffer_path = NULL;
 #endif
-
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
 
     if (!io) return STATUS_ACCESS_VIOLATION;
 
+#ifdef __PROSPERO__
+    if (!title_buffer_maybe_continuation( handle, length, offset ) &&
+        (status = ps5_title_flush_coalesced_write( handle )))
+        return status;
+#endif
     status = server_get_unix_fd( handle, FILE_WRITE_DATA, &unix_handle, &needs_close, &type, &options );
     if (status == STATUS_ACCESS_DENIED)
     {
@@ -8763,6 +9083,9 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             if (offset->QuadPart == FILE_WRITE_TO_END_OF_FILE)
             {
                 struct stat st;
+#ifdef __PROSPERO__
+                if ((status = ps5_title_flush_coalesced_write( handle ))) goto done;
+#endif
 
                 if (fstat( unix_handle, &st ) == -1)
                 {
@@ -8780,12 +9103,18 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             /* async I/O doesn't make sense on regular files */
 #ifdef __PROSPERO__
             coalesced = 0;
-            if (!async_write &&
-                wine_ps5_title_coalesce_eligible( length, 1, 1 ))
-                status = title_coalesce_write( handle, unix_handle, buffer, length, off,
-                                               append_write, &coalesced, &coalesced_pos );
-            else
-                status = ps5_title_flush_coalesced_write( handle );
+            if (!async_write && offset->QuadPart != FILE_WRITE_TO_END_OF_FILE)
+            {
+                need_path = title_buffer_needs_path( handle, &buffer_generation );
+                eligible = title_buffer_resolve_start( handle, unix_handle, need_path,
+                                                       &buffer_path, &buffer_dev, &buffer_ino );
+                status = title_buffer_write( handle, unix_handle, buffer, length, off,
+                                             buffer_path, buffer_dev, buffer_ino, buffer_generation,
+                                             eligible, &coalesced, &coalesced_pos );
+                free( buffer_path );
+                buffer_path = NULL;
+            }
+            else status = ps5_title_flush_coalesced_write( handle );
             if (status) goto done;
             if (coalesced) result = length;
             else while ((result = title_file_pwrite( handle, unix_handle, buffer, length, off )) == -1)
@@ -8814,18 +9143,21 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
         }
 #ifdef __PROSPERO__
         if (!async_write && (!offset || offset->QuadPart == FILE_USE_FILE_POINTER_POSITION) &&
-            (ps5_direct_enabled() || wine_ps5_title_coalesce_eligible( length, 1, 1 )))
+            ps5_direct_enabled())
         {
             off_t pos = lseek( unix_handle, 0, SEEK_CUR );
 
             if (pos != -1)
             {
                 coalesced = 0;
-                if (wine_ps5_title_coalesce_eligible( length, 1, 1 ))
-                    status = title_coalesce_write( handle, unix_handle, buffer, length, pos, 0,
-                                                   &coalesced, &coalesced_pos );
-                else
-                    status = ps5_title_flush_coalesced_write( handle );
+                need_path = title_buffer_needs_path( handle, &buffer_generation );
+                eligible = title_buffer_resolve_start( handle, unix_handle, need_path,
+                                                       &buffer_path, &buffer_dev, &buffer_ino );
+                status = title_buffer_write( handle, unix_handle, buffer, length, pos,
+                                             buffer_path, buffer_dev, buffer_ino, buffer_generation,
+                                             eligible, &coalesced, &coalesced_pos );
+                free( buffer_path );
+                buffer_path = NULL;
                 if (status) goto done;
                 if (!coalesced &&
                     (result = title_file_pwrite( handle, unix_handle, buffer, length, pos )) == -1)
@@ -9097,6 +9429,9 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
      * and run slowly if we make a server call every time */
     if (HandleToLong( handle ) == ~0)
         return STATUS_INVALID_HANDLE;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle ))) return status;
+#endif
 
     switch (device)
     {
@@ -9202,6 +9537,9 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
            in_buffer, in_size, out_buffer, out_size );
 
     if (!io) return STATUS_INVALID_PARAMETER;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle ))) return status;
+#endif
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options );
     if (status && status != STATUS_BAD_DEVICE_TYPE)
@@ -9426,6 +9764,12 @@ static NTSTATUS cancel_io( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *
 NTSTATUS WINAPI NtCancelIoFile( HANDLE handle, IO_STATUS_BLOCK *io_status )
 {
     TRACE( "%p %p\n", handle, io_status );
+#ifdef __PROSPERO__
+    {
+        NTSTATUS status = ps5_title_flush_coalesced_write( handle );
+        if (status) return status;
+    }
+#endif
 
     return cancel_io( handle, NULL, io_status, TRUE );
 }
@@ -9437,6 +9781,12 @@ NTSTATUS WINAPI NtCancelIoFile( HANDLE handle, IO_STATUS_BLOCK *io_status )
 NTSTATUS WINAPI NtCancelIoFileEx( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *io_status )
 {
     TRACE( "%p %p %p\n", handle, io, io_status );
+#ifdef __PROSPERO__
+    {
+        NTSTATUS status = ps5_title_flush_coalesced_write( handle );
+        if (status) return status;
+    }
+#endif
 
     if (ac_odyssey && !cancel_async_file_read( handle, io ))
         return (io_status->Status = STATUS_SUCCESS);
@@ -9453,6 +9803,10 @@ NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, I
     unsigned int status;
 
     TRACE( "(%p %p %p)\n", handle, io, io_status );
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return io_status->Status = status;
+#endif
 
     SERVER_START_REQ( cancel_sync )
     {
@@ -9661,6 +10015,10 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
            handle, event, apc, apc_context, iosb, buffer, buffer_size, filter, subtree );
 
     if (!iosb) return STATUS_ACCESS_VIOLATION;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return iosb->Status = status;
+#endif
     if (filter == 0 || (filter & ~FILE_NOTIFY_ALL)) return STATUS_INVALID_PARAMETER;
 
     fileio = (struct async_fileio_read_changes *)alloc_fileio(
@@ -9902,6 +10260,10 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
     enum server_fd_type fd_type;
     int fd, needs_close;
     unsigned int status;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return io->Status = status;
+#endif
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, &fd_type, NULL );
     if (status == STATUS_BAD_DEVICE_TYPE)
@@ -10156,6 +10518,11 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
 NTSTATUS WINAPI NtSetVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io, void *info,
                                             ULONG length, FS_INFORMATION_CLASS class )
 {
+#ifdef __PROSPERO__
+    NTSTATUS status;
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return io->Status = status;
+#endif
     FIXME( "(%p,%p,%p,0x%08x,0x%08x) stub\n", handle, io, info, length, class );
     return STATUS_SUCCESS;
 }
@@ -10173,6 +10540,10 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
 
     FIXME( "(%p,%p,%p,%d,%d,%p,%d,%p,%d) semi-stub\n",
            handle, io, buffer, length, single_entry, list, list_len, index, restart );
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return io->Status = status;
+#endif
 
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
         return status;
@@ -10190,7 +10561,14 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
  */
 NTSTATUS WINAPI NtSetEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length )
 {
+#ifdef __PROSPERO__
+    NTSTATUS status;
+#endif
     FIXME( "(%p,%p,%p,%d) stub\n", handle, io, buffer, length );
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( handle )))
+        return io->Status = status;
+#endif
     return STATUS_ACCESS_DENIED;
 }
 

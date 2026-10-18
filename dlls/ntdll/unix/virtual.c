@@ -8955,6 +8955,9 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
     SIZE_T mask = granularity_mask;
     LARGE_INTEGER offset;
 
+#ifdef __PROSPERO__
+    if ((res = ps5_title_flush_coalesced_write( 0 ))) return res;
+#endif
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
     TRACE("handle=%p process=%p addr=%p off=%s size=0x%lx alloc_type=0x%x access=0x%x\n",
@@ -9040,6 +9043,9 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
 
     TRACE( "handle=%p process=%p addr=%p off=%s size=0x%lx alloc_type=0x%x access=0x%x\n",
            handle, process, *addr_ptr, wine_dbgstr_longlong(offset.QuadPart), *size_ptr, alloc_type, protect );
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
 
     status = get_extended_params( parameters, count, &limit_low, &limit_high,
                                   &align, &attributes, &machine );
@@ -9177,6 +9183,10 @@ done:
  */
 NTSTATUS WINAPI NtUnmapViewOfSection( HANDLE process, PVOID addr )
 {
+#ifdef __PROSPERO__
+    NTSTATUS status = ps5_title_flush_coalesced_write( 0 );
+    if (status) return status;
+#endif
     return unmap_view_of_section( process, addr, 0 );
 }
 
@@ -9187,6 +9197,10 @@ NTSTATUS WINAPI NtUnmapViewOfSection( HANDLE process, PVOID addr )
 NTSTATUS WINAPI NtUnmapViewOfSectionEx( HANDLE process, PVOID addr, ULONG flags )
 {
     static const ULONG type_mask = MEM_UNMAP_WITH_TRANSIENT_BOOST | MEM_PRESERVE_PLACEHOLDER;
+#ifdef __PROSPERO__
+    NTSTATUS status = ps5_title_flush_coalesced_write( 0 );
+    if (status) return status;
+#endif
 
     if (flags & ~type_mask)
     {
@@ -9240,6 +9254,9 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
 {
     unsigned int status;
     struct pe_image_info image_info;
+#ifdef __PROSPERO__
+    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+#endif
 
     switch (class)
     {
@@ -9780,6 +9797,10 @@ NTSTATUS WINAPI NtFlushProcessWriteBuffers(void)
 NTSTATUS WINAPI NtCreatePagingFile( UNICODE_STRING *name, LARGE_INTEGER *min_size,
                                     LARGE_INTEGER *max_size, LARGE_INTEGER *actual_size )
 {
+#ifdef __PROSPERO__
+    NTSTATUS status = ps5_title_flush_coalesced_write( 0 );
+    if (status) return status;
+#endif
     FIXME( "(%s %p %p %p) stub\n", debugstr_us(name), min_size, max_size, actual_size );
     return STATUS_SUCCESS;
 }

@@ -433,55 +433,140 @@ static inline const char *wine_ps5_write_trace_class( const char *path )
     return "title-other";
 }
 
-/* WoW error reports issue about 11,500 sequential 2-byte writes. Buffer only
- * synchronous regular-file calls, cap each run at 64 KiB, and idle-flush after
- * 50 ms so unrelated small random I/O keeps its ordinary ordering. */
-#define WINE_PS5_COALESCE_WRITE_MAX 4096u
-#define WINE_PS5_COALESCE_BUFFER_MAX (64u * 1024u)
-#define WINE_PS5_COALESCE_IDLE_US UINT64_C(50000)
-#define WINE_PS5_COALESCE_HANDLES 64u
+/* One process-wide deferred run, only for exact WoW CASC data.NNN archives. */
+#define WINE_PS5_TITLE_BUFFER_MAX (1024u * 1024u)
+#define WINE_PS5_TITLE_BUFFER_RESIDENCE_US UINT64_C(40000)
 
-enum wine_ps5_title_coalesce_action
+struct wine_ps5_title_buffer_state
 {
-    WINE_PS5_COALESCE_DIRECT,
-    WINE_PS5_COALESCE_BUFFER,
-    WINE_PS5_COALESCE_FLUSH_BUFFER
+    uintptr_t handle;
+    uint64_t end;
+    size_t length;
 };
 
-static inline int wine_ps5_title_coalesce_eligible( size_t size, int synchronous, int regular )
+enum wine_ps5_title_buffer_action
 {
-    return size && synchronous && regular && size <= WINE_PS5_COALESCE_WRITE_MAX;
+    WINE_PS5_TITLE_BUFFER_START,
+    WINE_PS5_TITLE_BUFFER_APPEND,
+    WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT
+};
+
+static inline unsigned char wine_ps5_title_buffer_lower( unsigned char ch )
+{
+    return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch;
 }
 
-#define WINE_PS5_ACCESS_FILE_READ_DATA  UINT32_C(0x00000001)
-#define WINE_PS5_ACCESS_FILE_WRITE_DATA UINT32_C(0x00000002)
-#define WINE_PS5_ACCESS_FILE_APPEND_DATA UINT32_C(0x00000004)
-#define WINE_PS5_ACCESS_SYNCHRONIZE      UINT32_C(0x00100000)
-#define WINE_PS5_ACCESS_GENERIC_ALL      UINT32_C(0x10000000)
-#define WINE_PS5_ACCESS_GENERIC_WRITE    UINT32_C(0x40000000)
-#define WINE_PS5_ACCESS_GENERIC_READ     UINT32_C(0x80000000)
-
-static inline int wine_ps5_title_coalesce_write_only( uint32_t granted_access )
+static inline int wine_ps5_title_buffer_component( const char *text, size_t length,
+                                                   const char *expected )
 {
-    return !(granted_access & (WINE_PS5_ACCESS_FILE_READ_DATA |
-                               WINE_PS5_ACCESS_GENERIC_READ |
-                               WINE_PS5_ACCESS_GENERIC_ALL));
+    size_t i;
+    for (i = 0; i < length && expected[i]; i++)
+        if (wine_ps5_title_buffer_lower( text[i] ) != (unsigned char)expected[i]) return 0;
+    return i == length && !expected[i];
 }
 
-static inline enum wine_ps5_title_coalesce_action wine_ps5_title_coalesce_decide(
-    size_t buffered, uint64_t end, uint64_t offset, size_t size, int append )
+static inline int wine_ps5_title_buffer_under_root( const char *path, const char *root )
 {
-    if (size > WINE_PS5_COALESCE_WRITE_MAX) return WINE_PS5_COALESCE_DIRECT;
-    if (!buffered) return WINE_PS5_COALESCE_BUFFER;
-    if (buffered > WINE_PS5_COALESCE_BUFFER_MAX || (!append && offset != end) ||
-        size > WINE_PS5_COALESCE_BUFFER_MAX - buffered)
-        return WINE_PS5_COALESCE_FLUSH_BUFFER;
-    return WINE_PS5_COALESCE_BUFFER;
+    size_t length;
+    if (!path || !root || !(length = strlen( root )) || strncmp( path, root, length )) return 0;
+    return !path[length] || path[length] == '/';
 }
 
-static inline int wine_ps5_title_coalesce_idle( size_t buffered, uint64_t last_us, uint64_t now_us )
+static inline int wine_ps5_title_buffer_path( const char *path, const char *c_root,
+                                              const char *w_root )
 {
-    return buffered && now_us >= last_us && now_us - last_us >= WINE_PS5_COALESCE_IDLE_US;
+    const char *part, *end, *next, *next_end, *leaf, *leaf_end, *name, *name_end;
+
+    if (!wine_ps5_title_buffer_under_root( path, c_root ) &&
+        !wine_ps5_title_buffer_under_root( path, w_root )) return 0;
+    for (part = path; *part; part = *end ? end + 1 : end)
+    {
+        while (*part == '/') part++;
+        for (end = part; *end && *end != '/'; end++);
+        if (!wine_ps5_title_buffer_component( part, end - part, "world of warcraft" )) continue;
+        next = end;
+        while (*next == '/') next++;
+        for (next_end = next; *next_end && *next_end != '/'; next_end++);
+        if (next_end - next >= 3 && next[0] == '_' && next_end[-1] == '_')
+        {
+            next = next_end;
+            while (*next == '/') next++;
+            for (next_end = next; *next_end && *next_end != '/'; next_end++);
+        }
+        if (!wine_ps5_title_buffer_component( next, next_end - next, "data" )) continue;
+        leaf = next_end;
+        while (*leaf == '/') leaf++;
+        for (leaf_end = leaf; *leaf_end && *leaf_end != '/'; leaf_end++);
+        if (!wine_ps5_title_buffer_component( leaf, leaf_end - leaf, "data" )) continue;
+        name = leaf_end;
+        while (*name == '/') name++;
+        for (name_end = name; *name_end && *name_end != '/'; name_end++);
+        return !*name_end && name_end - name == 8 &&
+               wine_ps5_title_buffer_lower( name[0] ) == 'd' &&
+               wine_ps5_title_buffer_lower( name[1] ) == 'a' &&
+               wine_ps5_title_buffer_lower( name[2] ) == 't' &&
+               wine_ps5_title_buffer_lower( name[3] ) == 'a' &&
+               name[4] == '.' && name[5] >= '0' && name[5] <= '9' &&
+               name[6] >= '0' && name[6] <= '9' && name[7] >= '0' && name[7] <= '9';
+    }
+    return 0;
+}
+
+static inline enum wine_ps5_title_buffer_action wine_ps5_title_buffer_decide(
+    const struct wine_ps5_title_buffer_state *state, uintptr_t handle, uint64_t offset,
+    size_t size, int eligible )
+{
+    if (!eligible || !size || size > WINE_PS5_TITLE_BUFFER_MAX)
+        return WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT;
+    if (!state->length) return WINE_PS5_TITLE_BUFFER_START;
+    if (state->handle == handle && state->end == offset &&
+        size <= WINE_PS5_TITLE_BUFFER_MAX - state->length)
+        return WINE_PS5_TITLE_BUFFER_APPEND;
+    return WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT;
+}
+
+static inline int wine_ps5_title_buffer_idle( size_t length, uint64_t first_us, uint64_t now_us )
+{
+    return length && now_us >= first_us &&
+           now_us - first_us >= WINE_PS5_TITLE_BUFFER_RESIDENCE_US;
+}
+
+static inline int wine_ps5_title_buffer_disable_for_section( int image, int resolved, int scoped )
+{
+    return !image && (!resolved || scoped);
+}
+
+static inline int wine_ps5_title_buffer_single_link( uint64_t links )
+{
+    /* Prospero may report zero for an ordinary title-storage file. Links
+     * created in this process disable buffering before creation; pre-existing
+     * or cross-process aliases are the documented residual exclusion. */
+    return links <= 1;
+}
+
+
+static inline int wine_ps5_title_buffer_rename_may_enter_scope(
+    const char *path, const char *c_root, const char *w_root, int directory )
+{
+    if (!wine_ps5_title_buffer_under_root( path, c_root ) &&
+        !wine_ps5_title_buffer_under_root( path, w_root )) return 0;
+    /*
+     * A renamed directory may contain an unseen World of Warcraft subtree;
+     * without an identity table, every directory rename on C:/W: is the
+     * conservative boundary. Files require the exact archive destination.
+     */
+    return directory || wine_ps5_title_buffer_path( path, c_root, w_root );
+}
+
+static inline int wine_ps5_title_buffer_same_identity( uint64_t left_dev, uint64_t left_ino,
+                                                       uint64_t right_dev, uint64_t right_ino )
+{
+    return left_dev == right_dev && left_ino == right_ino;
+}
+
+static inline int wine_ps5_title_buffer_admit( int shutdown, int disabled, int enabled )
+{
+    return !shutdown && !disabled && enabled;
 }
 
 /* Like server_block_set, a title's native critical sections must defer SIGQUIT
