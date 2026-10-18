@@ -222,6 +222,7 @@ struct ps5_title_map_sample
 };
 extern BOOL ps5_title_mapping_name( HANDLE handle, char *name, unsigned int size, uint64_t *id );
 extern void virtual_title_maps_report( uint64_t now );
+extern void virtual_title_vm_cpu_report( uint64_t now );
 enum ps5_title_host_call
 {
     PS5_TITLE_HOST_MAP,
@@ -450,6 +451,13 @@ extern BOOL ps5_direct_ensure_backed( struct ps5_direct_view *view, void *base, 
 extern BOOL ps5_direct_finish_commit( struct ps5_direct_view *view, void *base, size_t size, BOOL rollback );
 extern BOOL ps5_direct_drop_unit( struct ps5_direct_view *view, void *addr, BOOL reserve );
 extern int ps5_direct_protect( struct ps5_direct_view *view, void *base, size_t size, int prot );
+extern BOOL ps5_direct_is_whole_backed( const struct ps5_direct_view *view, void *base, size_t size );
+extern BOOL ps5_direct_release_whole( struct ps5_direct_view *view );
+extern BOOL ps5_direct_cache_enabled(void);
+extern BOOL ps5_title_agent_process;
+extern BOOL ps5_direct_cache_pressure(void);
+extern BOOL virtual_title_direct_cache_trim(void);
+extern void ps5_direct_fail_fast(void) DECLSPEC_NORETURN;
 #endif
 extern ULONG_PTR get_system_affinity_mask(void);
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );

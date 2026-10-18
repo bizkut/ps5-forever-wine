@@ -92,6 +92,9 @@ extern int ps5_openat( int, const char *, int, ... );
 
 #include "fsync.h"
 
+#ifdef __PROSPERO__
+#include "wine/ps5_request_profile.h"
+#endif
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 
 /* The PS5's file systems report owners and modes that say nothing about the
@@ -220,6 +223,32 @@ static unsigned int title_wake_metadata_lost;
 static void title_main_capture( struct ps5_title_wait_scope *scope );
 static void title_main_wait_record( struct ps5_title_wait_scope *scope, uint64_t ns );
 static void title_main_wait_take( unsigned int bank );
+/* Cumulative per-process snapshots, enabled only by WINEPS5_PROFILE. Unlike
+ * select's eventual wake, this is exactly send_request -> wait_reply. */
+static struct title_wake_stat title_request_latency[REQ_NB_REQUESTS];
+static const char *title_request_names[REQ_NB_REQUESTS];
+static unsigned int title_request_pid;
+
+static void title_request_note( unsigned int req, const char *name, uint64_t started )
+{
+    struct title_wake_stat *stat;
+    uint64_t ended = ps5_title_profile_now_ns(), us, previous;
+    unsigned int bin = 0;
+
+    if (req >= REQ_NB_REQUESTS || ended < started) return;
+    if (!__atomic_load_n( &title_request_pid, __ATOMIC_RELAXED ))
+        __atomic_store_n( &title_request_pid, GetCurrentProcessId(), __ATOMIC_RELAXED );
+    stat = &title_request_latency[req];
+    us = (ended - started) / 1000;
+    while (bin < TITLE_WAKE_BINS - 1 && us > ((uint64_t)1 << bin)) bin++;
+    __atomic_store_n( &title_request_names[req], name, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &stat->us, us, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &stat->bins[bin], 1, __ATOMIC_RELAXED );
+    previous = __atomic_load_n( &stat->max, __ATOMIC_RELAXED );
+    while (previous < us && !__atomic_compare_exchange_n( &stat->max, &previous, us, 0,
+                                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED )) {}
+    __atomic_add_fetch( &stat->count, 1, __ATOMIC_RELEASE );
+}
 static void title_main_wait_emit( unsigned long long ms );
 
 BOOL ps5_title_mapping_name( HANDLE handle, char *name, unsigned int size, uint64_t *id )
@@ -371,7 +400,7 @@ static void title_wait_wake( unsigned int token, const void *cookie )
     unsigned long long sent;
     unsigned int bin = 0, waker;
 
-    if (!token || !(data = ps5_title_profile_thread_data()) ||
+    if (!token || !ps5_server_wake_info || !(data = ps5_title_profile_thread_data()) ||
         !(slot = title_wait_get_thread( data ))) return;
     now = ps5_title_profile_now_ns();
     if (!now || !ps5_server_wake_info( token, wine_server_client_ptr( cookie ), data->title_thread.id,
@@ -419,6 +448,34 @@ static uint64_t title_wake_percentile( const struct title_wake_stat *stat, unsig
         if (count >= target) return min( (uint64_t)1 << i, stat->max );
     }
     return stat->max;
+}
+
+static void title_request_report(void)
+{
+    unsigned int i, j;
+    char line[320];
+
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+    {
+        struct title_wake_stat *src = &title_request_latency[i], stat;
+        const char *name;
+
+        if (!(stat.count = __atomic_load_n( &src->count, __ATOMIC_ACQUIRE ))) continue;
+        name = __atomic_load_n( &title_request_names[i], __ATOMIC_RELAXED );
+        stat.us = __atomic_load_n( &src->us, __ATOMIC_RELAXED );
+        stat.max = __atomic_load_n( &src->max, __ATOMIC_RELAXED );
+        for (j = 0; j < TITLE_WAKE_BINS; j++)
+            stat.bins[j] = __atomic_load_n( &src->bins[j], __ATOMIC_RELAXED );
+        snprintf( line, sizeof(line), "title request latency pid=%04x type=%s cumulative=1 count=%llu "
+                  "mean_us=%llu p50_us=%llu p99_us=%llu max_us=%llu\n",
+                  __atomic_load_n( &title_request_pid, __ATOMIC_RELAXED ),
+                  name ? name : "unknown", (unsigned long long)stat.count,
+                  (unsigned long long)(stat.us / stat.count),
+                  (unsigned long long)title_wake_percentile( &stat, 50 ),
+                  (unsigned long long)title_wake_percentile( &stat, 99 ),
+                  (unsigned long long)stat.max );
+        sceKernelDebugOutText( 0, line );
+    }
 }
 
 static void title_wait_emit_wake( const struct title_wake_stat *stat, const char *tid,
@@ -536,6 +593,8 @@ static void title_wait_emit_window(void)
     title_wait_emit_wake( &all, "all", ms );
     title_main_wait_emit( ms );
     virtual_title_maps_report( now );
+    virtual_title_vm_cpu_report( now );
+    title_request_report();
     if ((overflow = __atomic_exchange_n( &title_wake_metadata_lost, 0, __ATOMIC_RELAXED )))
     {
         snprintf( line, sizeof(line), "title wake metadata window_ms=%llu unavailable=%u\n", ms, overflow );
@@ -1135,6 +1194,9 @@ unsigned int server_call_unlocked( void *req_ptr )
     const char *previous_profile_request = NULL;
     unsigned int previous_profile_request_id = 0;
     BOOL profile_active = title_profile_is_enabled();
+    unsigned int profile_req = req->u.req.request_header.req;
+    const char *profile_name = req->name;
+    uint64_t profile_started = 0;
 
 
     if (profile_active)
@@ -1161,13 +1223,21 @@ unsigned int server_call_unlocked( void *req_ptr )
 #endif
 
     FTRACE_BLOCK_START("req %s", req->name)
-    TRACE_(client)("%s start\n", req->name); \
+    TRACE_(client)("%s start\n", req->name);
+#ifdef __PROSPERO__
+    if (profile_active)
+    {
+        profile_started = ps5_title_profile_now_ns();
+        wine_ps5_request_profile_stamp( &req->u.req, profile_started );
+    }
+#endif
     if (!(ret = send_request( req )))
         ret = wait_reply( req );
     TRACE_(client)("%s end\n", req->name);
     FTRACE_BLOCK_END()
 #ifdef __PROSPERO__
 done:
+    if (profile_started) title_request_note( profile_req, profile_name, profile_started );
     if (profile_active)
     {
         __atomic_store_n( &profile_data->profile_request_id,
@@ -3766,6 +3836,30 @@ static void publish_title_startup_channel( enum wine_ps5_title_startup_channel c
     if (ret) fatal_perror( "cannot publish title startup channel" );
 }
 
+static void init_title_profile( void *module )
+{
+    if (title_runtime.vulkan_proc && getenv( "WINEPS5_PROFILE" ) &&
+        !strcmp( getenv( "WINEPS5_PROFILE" ), "1" ) &&
+        (ps5_set_thread_profile =
+         (void (*)( void (*)(void) ))title_runtime.vulkan_proc( "wineSetThreadProfile" )))
+    {
+        /* Children share the server by socket, not by address space. Their
+         * CPU/transport samples work without parent-only object metadata. */
+        if (module &&
+            (!(ps5_server_mapping_name = dlsym( module, "wineserver_title_mapping_name" )) ||
+             !(ps5_server_wake_info = dlsym( module, "wineserver_title_wake_info" ))))
+            fatal_error( "private title wineserver lacks profile metadata callbacks\n" );
+        ps5_profile_cpu_time =
+            (int (*)( uint64_t * ))title_runtime.vulkan_proc( "wineGetCurrentThreadCpuTime" );
+        ps5_profile_clock_id =
+            (int (*)( pthread_t, int * ))title_runtime.vulkan_proc( "wineGetThreadCpuClockId" );
+        title_event_report_ns = ps5_title_profile_now_ns();
+        title_wait_report_ns = title_event_report_ns;
+        __atomic_store_n( &title_profile_enabled, 1, __ATOMIC_RELEASE );
+        ps5_set_thread_profile( ps5_sample_title_profile );
+    }
+}
+
 static int connect_title_server(void)
 {
     char path[PATH_MAX], nls[PATH_MAX];
@@ -3811,23 +3905,7 @@ static int connect_title_server(void)
          (void (*)( void (*)( unsigned int, unsigned int ) ))
          title_runtime.vulkan_proc( "wineSetHangDiagnostic" )))
         ps5_set_hang_diagnostic( ps5_dump_title_hang );
-    if (title_runtime.vulkan_proc && getenv( "WINEPS5_PROFILE" ) &&
-        !strcmp( getenv( "WINEPS5_PROFILE" ), "1" ) &&
-        (ps5_set_thread_profile =
-         (void (*)( void (*)(void) ))title_runtime.vulkan_proc( "wineSetThreadProfile" )))
-    {
-        if (!(ps5_server_mapping_name = dlsym( module, "wineserver_title_mapping_name" )) ||
-            !(ps5_server_wake_info = dlsym( module, "wineserver_title_wake_info" )))
-            fatal_error( "private title wineserver lacks profile metadata callbacks\n" );
-        ps5_profile_cpu_time =
-            (int (*)( uint64_t * ))title_runtime.vulkan_proc( "wineGetCurrentThreadCpuTime" );
-        ps5_profile_clock_id =
-            (int (*)( pthread_t, int * ))title_runtime.vulkan_proc( "wineGetThreadCpuClockId" );
-        title_event_report_ns = ps5_title_profile_now_ns();
-        title_wait_report_ns = title_event_report_ns;
-        __atomic_store_n( &title_profile_enabled, 1, __ATOMIC_RELEASE );
-        ps5_set_thread_profile( ps5_sample_title_profile );
-    }
+    init_title_profile( module );
     return pair[0];  /* both endpoints belong to this process; don't close pair[1] */
 }
 #endif
@@ -3960,6 +4038,7 @@ static int server_connect(void)
             /* Trusted bootstrap descriptor; no private server or pathname
              * reconnect. Cancellation must also wake this initial channel. */
             publish_title_startup_channel( WINE_PS5_TITLE_STARTUP_MESSAGE, title_runtime.server_socket );
+            init_title_profile( NULL );
             return title_runtime.server_socket;
         }
         return connect_title_server();

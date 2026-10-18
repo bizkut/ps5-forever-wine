@@ -991,6 +991,7 @@ SOURCES = \
 	wine/ps5_input.h \
 	wine/ps5_spawn.h \
 	wine/ps5_suspend.h \
+	wine/ps5_request_profile.h \
 	wine/ps5_title.h \
 	wine/ps5_title_gamepad.h \
 	wine/ps5_title_input.h \

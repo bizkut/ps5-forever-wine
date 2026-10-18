@@ -700,6 +700,13 @@ static inline const char *wine_ps5_title_refused_program( const uint16_t *image,
     return NULL;
 }
 
+/* Restrict the scan workspace optimization to Agent.exe. Reuse
+ * the existing exact, case-insensitive UTF-16 image-leaf rule, not argv[0]. */
+static inline int wine_ps5_title_direct_cache_image( const uint16_t *image, size_t length )
+{
+    return wine_ps5_title_refused_program( image, length, "Agent.exe", NULL ) != NULL;
+}
+
 /* Battle.net's real WoW game images are drive-qualified Wow*.exe files with
  * a sibling <name>_loader.dll. The caller supplies the translated Unix image
  * and performs the filesystem check, keeping this predicate host-testable. */

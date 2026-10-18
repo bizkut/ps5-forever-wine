@@ -263,8 +263,14 @@ struct file_view
 #ifdef __PROSPERO__
     struct ps5_direct_view *direct; /* shared unit ownership for direct-backed split views */
     unsigned int map_profile;     /* fixed title mapping-profile slot + 1, zero if untracked */
+    struct file_view *cache_next; /* detached, private direct-region cache linkage */
 #endif
 };
+
+#ifdef __PROSPERO__
+static BOOL title_direct_cache_put( struct file_view *view );
+static BOOL title_direct_cache_evict_range( void *base, size_t size );
+#endif
 
 /* per-page protection flags */
 #define VPROT_READ       0x01
@@ -2637,6 +2643,11 @@ static void *map_alloc_area( const struct alloc_area *area, void *base )
         errno = EEXIST;
         return MAP_FAILED;
     }
+    if (!title_direct_cache_evict_range( base, area->size ))
+    {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
     ret = area->direct ? ps5_direct_reserve( base, area->size ) :
                         anon_mmap_tryfixed( base, area->size, area->unix_prot, 0 );
     if (ret != MAP_FAILED) ps5_title_note_reservation( ret, area->size );
@@ -2830,6 +2841,7 @@ static NTSTATUS ps5_free_pages( struct file_view *view, char *base, size_t size 
 static NTSTATUS delete_view( struct file_view *view ) /* [in] View */
 {
 #ifdef __PROSPERO__
+    if (title_direct_cache_put( view )) return STATUS_SUCCESS;
     if (view->protect & VPROT_PS5_DIRECT)
     {
         NTSTATUS status = ps5_free_pages( view, view->base, view->size );
@@ -2922,6 +2934,337 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     *view_ret = view;
     return STATUS_SUCCESS;
 }
+
+#ifdef __PROSPERO__
+/* WINE_PS5_VM_CPU_TEST_BEGIN */
+enum title_vm_cpu_kind { TITLE_VM_ALLOCATE, TITLE_VM_FREE, TITLE_VM_CACHE_ZERO, TITLE_VM_CPU_KINDS };
+struct title_vm_cpu_scope
+{
+    uint64_t cpu, wall;
+    BOOL cpu_valid;
+};
+static struct
+{
+    uint64_t calls, cpu_calls, cpu_ns, wall_ns, bytes, failures;
+} title_vm_cpu_stats[TITLE_VM_CPU_KINDS];
+static unsigned int title_vm_cpu_pid;
+
+static struct title_vm_cpu_scope title_vm_cpu_begin(void)
+{
+    struct title_vm_cpu_scope scope = {0};
+    int saved_errno = errno;
+
+    if (title_profile_is_enabled())
+    {
+        scope.cpu_valid = ps5_title_profile_read_cpu( &scope.cpu, &scope.wall );
+        if (!scope.wall) scope.wall = ps5_title_profile_now_ns();
+        if (!__atomic_load_n( &title_vm_cpu_pid, __ATOMIC_RELAXED ))
+            __atomic_store_n( &title_vm_cpu_pid, GetCurrentProcessId(), __ATOMIC_RELAXED );
+    }
+    errno = saved_errno;
+    return scope;
+}
+
+static void title_vm_cpu_end( enum title_vm_cpu_kind kind, struct title_vm_cpu_scope scope,
+                              uint64_t bytes, NTSTATUS status )
+{
+    uint64_t cpu = 0, wall = 0;
+    BOOL valid;
+    int saved_errno = errno;
+
+    if (!scope.wall) return;
+    valid = ps5_title_profile_read_cpu( &cpu, &wall );
+    if (!wall) wall = ps5_title_profile_now_ns();
+    if (scope.cpu_valid && valid && cpu >= scope.cpu)
+    {
+        __atomic_add_fetch( &title_vm_cpu_stats[kind].cpu_ns, cpu - scope.cpu, __ATOMIC_RELAXED );
+        __atomic_add_fetch( &title_vm_cpu_stats[kind].cpu_calls, 1, __ATOMIC_RELAXED );
+    }
+    if (wall >= scope.wall)
+        __atomic_add_fetch( &title_vm_cpu_stats[kind].wall_ns, wall - scope.wall, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &title_vm_cpu_stats[kind].bytes, bytes, __ATOMIC_RELAXED );
+    if (status) __atomic_add_fetch( &title_vm_cpu_stats[kind].failures, 1, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &title_vm_cpu_stats[kind].calls, 1, __ATOMIC_RELEASE );
+    errno = saved_errno;
+}
+
+/* Completed-operation CPU counters, not sampled-PC attribution. Cache zero is
+ * a subset of allocate, so its CPU must not be added to the allocate total. */
+void virtual_title_vm_cpu_report( uint64_t now )
+{
+    static const char * const names[] = { "allocate", "free", "cache-zero" };
+    unsigned int i;
+    char line[384];
+
+    for (i = 0; i < TITLE_VM_CPU_KINDS; i++)
+    {
+        uint64_t calls = __atomic_load_n( &title_vm_cpu_stats[i].calls, __ATOMIC_ACQUIRE );
+        if (!calls) continue;
+        snprintf( line, sizeof(line), "title vm cpu pid=%04x kind=%s cumulative=1 now_ns=%llu calls=%llu "
+                  "cpu_calls=%llu cpu_ns=%llu wall_ns=%llu bytes=%llu failures=%llu\n",
+                  __atomic_load_n( &title_vm_cpu_pid, __ATOMIC_RELAXED ), names[i],
+                  (unsigned long long)now, (unsigned long long)calls,
+                  (unsigned long long)__atomic_load_n( &title_vm_cpu_stats[i].cpu_calls, __ATOMIC_RELAXED ),
+                  (unsigned long long)__atomic_load_n( &title_vm_cpu_stats[i].cpu_ns, __ATOMIC_RELAXED ),
+                  (unsigned long long)__atomic_load_n( &title_vm_cpu_stats[i].wall_ns, __ATOMIC_RELAXED ),
+                  (unsigned long long)__atomic_load_n( &title_vm_cpu_stats[i].bytes, __ATOMIC_RELAXED ),
+                  (unsigned long long)__atomic_load_n( &title_vm_cpu_stats[i].failures, __ATOMIC_RELAXED ) );
+        sceKernelDebugOutText( 0, line );
+    }
+}
+/* WINE_PS5_VM_CPU_TEST_END */
+
+/* WINE_PS5_DIRECT_CACHE_TEST_BEGIN */
+/* Two nominal 32-MiB workspaces can each include one native alignment unit.
+ * Retained native bytes, not requested bytes, are charged to this bound. */
+#define TITLE_DIRECT_CACHE_LIMIT (((size_t)64 << 20) + 2 * (granularity_mask + 1))
+#define TITLE_DIRECT_CACHE_REGION_MAX ((size_t)64 << 20)
+#define TITLE_DIRECT_CACHE_REGION_MIN ((size_t)1 << 20)
+#define TITLE_DIRECT_CACHE_ENTRIES 4
+static struct file_view *title_direct_cache;
+static size_t title_direct_cache_bytes;
+static unsigned int title_direct_cache_count;
+static uint64_t title_direct_cache_pressure_ns;
+static BOOL title_direct_cache_under_pressure;
+static struct
+{
+    uint64_t since, hits, puts, misses, evictions, failures, zero_ns, zero_bytes;
+} title_direct_cache_stats;
+
+static size_t title_direct_cache_size( const struct file_view *view )
+{
+    return ROUND_SIZE( 0, view->size, granularity_mask );
+}
+
+static void title_direct_cache_report(void)
+{
+    uint64_t now;
+    char line[384];
+
+    if (!title_profile_is_enabled()) return;
+    now = ps5_title_profile_now_ns();
+    if (!title_direct_cache_stats.since) title_direct_cache_stats.since = now;
+    if (now - title_direct_cache_stats.since < UINT64_C(10000000000)) return;
+    snprintf( line, sizeof(line), "title direct cache pid=%04x window_ms=%llu hits=%llu puts=%llu misses=%llu "
+              "evictions=%llu failures=%llu retained_kib=%llu entries=%u zero_mib=%llu zero_ms=%llu\n",
+              __atomic_load_n( &title_vm_cpu_pid, __ATOMIC_RELAXED ),
+              (unsigned long long)((now - title_direct_cache_stats.since) / 1000000),
+              (unsigned long long)title_direct_cache_stats.hits,
+              (unsigned long long)title_direct_cache_stats.puts,
+              (unsigned long long)title_direct_cache_stats.misses,
+              (unsigned long long)title_direct_cache_stats.evictions,
+              (unsigned long long)title_direct_cache_stats.failures,
+              (unsigned long long)(title_direct_cache_bytes / 1024), title_direct_cache_count,
+              (unsigned long long)(title_direct_cache_stats.zero_bytes >> 20),
+              (unsigned long long)(title_direct_cache_stats.zero_ns / 1000000) );
+    sceKernelDebugOutText( 0, line );
+    memset( &title_direct_cache_stats, 0, sizeof(title_direct_cache_stats) );
+    title_direct_cache_stats.since = now;
+}
+
+/* Cached views have already left views_tree. Never use ps5_free_pages here:
+ * its split-view neighbour checks require a live RB-tree entry. */
+static BOOL title_direct_cache_evict_range( void *base, size_t size )
+{
+    struct file_view **prev = &title_direct_cache, *view;
+    UINT_PTR low = (UINT_PTR)base;
+    BOOL ret = TRUE;
+
+    while ((view = *prev))
+    {
+        size_t native_size = title_direct_cache_size( view );
+        UINT_PTR cached = (UINT_PTR)view->base;
+
+        if (base && (cached >= low + size || cached + native_size <= low))
+        {
+            prev = &view->cache_next;
+            continue;
+        }
+        if (!ps5_direct_release_whole( view->direct ))
+        {
+            title_direct_cache_stats.failures++;
+            ret = FALSE;
+            prev = &view->cache_next;
+            continue;
+        }
+        *prev = view->cache_next;
+        title_direct_cache_bytes -= native_size;
+        title_direct_cache_count--;
+        title_direct_cache_stats.evictions++;
+        free_view( view );
+    }
+    return ret;
+}
+
+/* A failed range protection may have changed a prefix. A detached free
+ * address must be inaccessible before we return, even if both close and
+ * ownership-preserving reclamation encounter failures. */
+static void title_direct_cache_close_failed_take( struct file_view *view )
+{
+    size_t native_size = title_direct_cache_size( view );
+
+    if (!ps5_direct_protect( view->direct, view->base, native_size, PROT_NONE )) return;
+    if (title_direct_cache_evict_range( view->base, native_size )) return;
+    /* A partial eviction may leave only a few mapped units. Protect those;
+     * physical-release failures after successful unmaps are already safe. */
+    if (!ps5_direct_protect( view->direct, view->base, native_size, PROT_NONE )) return;
+    ps5_direct_fail_fast();
+}
+
+BOOL virtual_title_direct_cache_trim(void)
+{
+    BOOL retained = !!title_direct_cache;
+
+    title_direct_cache_evict_range( NULL, 0 );
+    return retained; /* A physical-allocation failure gets one retry after reclamation. */
+}
+
+static BOOL title_direct_cache_available(void)
+{
+    uint64_t now;
+
+    if (!ps5_direct_cache_enabled())
+    {
+        title_direct_cache_evict_range( NULL, 0 );
+        return FALSE;
+    }
+    now = ps5_title_profile_now_ns();
+    if (!title_direct_cache_pressure_ns ||
+        now - title_direct_cache_pressure_ns >= UINT64_C(1000000000))
+    {
+        title_direct_cache_under_pressure = ps5_direct_cache_pressure();
+        title_direct_cache_pressure_ns = now;
+    }
+    if (title_direct_cache_under_pressure)
+    {
+        title_direct_cache_evict_range( NULL, 0 );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL title_direct_cache_put( struct file_view *view )
+{
+    struct file_view *oldest;
+    size_t native_size;
+    BYTE vprot;
+
+    if (!(view->protect & VPROT_PS5_DIRECT) || !title_direct_cache_available()) return FALSE;
+    native_size = title_direct_cache_size( view );
+    if (view->protect != (VPROT_PS5_DIRECT | VPROT_READ | VPROT_WRITE | VPROT_COMMITTED) ||
+        force_exec_prot || native_size < TITLE_DIRECT_CACHE_REGION_MIN ||
+        native_size > TITLE_DIRECT_CACHE_REGION_MAX ||
+        get_vprot_range_size( view->base, view->size, 0xff, &vprot ) != view->size ||
+        vprot != (VPROT_READ | VPROT_WRITE | VPROT_COMMITTED) ||
+        !ps5_direct_is_whole_backed( view->direct, view->base, native_size ))
+        return FALSE;
+
+    while (title_direct_cache_bytes + native_size > TITLE_DIRECT_CACHE_LIMIT ||
+           title_direct_cache_count >= TITLE_DIRECT_CACHE_ENTRIES)
+    {
+        for (oldest = title_direct_cache; oldest && oldest->cache_next; oldest = oldest->cache_next) {}
+        if (!oldest || !title_direct_cache_evict_range( oldest->base, title_direct_cache_size( oldest ) ))
+            return FALSE;
+    }
+    /* Freed addresses must fault, even though their backing stays owned.
+     * Cache operations never add execute permission. */
+    if (ps5_direct_protect( view->direct, view->base, native_size, PROT_NONE ))
+    {
+        title_direct_cache_stats.failures++;
+        return FALSE;
+    }
+    set_page_vprot( view->base, view->size, 0 );
+    if (title_profile_is_enabled()) title_map_unmapped( view );
+    unregister_view( view );
+    view->map_profile = 0;
+    view->cache_next = title_direct_cache;
+    title_direct_cache = view;
+    title_direct_cache_bytes += native_size;
+    title_direct_cache_count++;
+    title_direct_cache_stats.puts++;
+    title_direct_cache_report();
+    return TRUE;
+}
+
+/* Limits are an exclusive native address range, after map_view's normal
+ * Windows validation. A miss follows the unchanged allocation search. */
+static NTSTATUS title_direct_cache_take( struct file_view **view_ret, void *base, size_t size,
+                                        unsigned int vprot, UINT_PTR low, UINT_PTR high,
+                                        UINT_PTR align_mask, BOOL top_down )
+{
+    struct file_view **prev, **chosen = NULL, *view;
+    struct title_vm_cpu_scope zero_scope;
+    size_t native_size, logical_host_size;
+    uint64_t started;
+    UINT_PTR addr;
+    BOOL profile = title_profile_is_enabled();
+
+    /* MEM_TOP_DOWN must consult the complete free-range search, not just the
+     * highest retained entry. Its unchanged path evicts an overlap if needed. */
+    if (!title_direct_cache_available() || force_exec_prot || top_down ||
+        vprot != (VPROT_PS5_DIRECT | VPROT_READ | VPROT_WRITE | VPROT_COMMITTED))
+        return STATUS_NOT_FOUND;
+    for (prev = &title_direct_cache; (view = *prev); prev = &view->cache_next)
+    {
+        addr = (UINT_PTR)view->base;
+        native_size = title_direct_cache_size( view );
+        if (view->size != size || (base && view->base != base) || addr < low ||
+            addr > high || native_size > high - addr || (addr & align_mask) ||
+            !ps5_direct_is_whole_backed( view->direct, view->base, native_size ))
+            continue;
+        if (ps5_title_radv_ranges && wine_ps5_title_radv_overlap( addr, native_size, NULL, NULL ))
+            continue;
+        if (!chosen || addr < (UINT_PTR)(*chosen)->base)
+            chosen = prev;
+    }
+    if (!chosen)
+    {
+        title_direct_cache_stats.misses++;
+        title_direct_cache_report();
+        return STATUS_NOT_FOUND;
+    }
+    view = *chosen;
+    native_size = title_direct_cache_size( view );
+    if (ps5_direct_protect( view->direct, view->base, native_size, PROT_READ | PROT_WRITE ))
+    {
+        title_direct_cache_close_failed_take( view );
+        title_direct_cache_stats.failures++;
+        return STATUS_ACCESS_DENIED;
+    }
+    started = profile ? ps5_title_profile_now_ns() : 0;
+    if (profile) zero_scope = title_vm_cpu_begin();
+    memset( view->base, 0, native_size ); /* Fresh private commits always read as zero. */
+    if (profile)
+    {
+        title_vm_cpu_end( TITLE_VM_CACHE_ZERO, zero_scope, native_size, STATUS_SUCCESS );
+        title_direct_cache_stats.zero_ns += ps5_title_profile_now_ns() - started;
+    }
+    logical_host_size = ROUND_SIZE( 0, size, host_page_mask );
+    if (logical_host_size < native_size &&
+        ps5_direct_protect( view->direct, (char *)view->base + logical_host_size,
+                            native_size - logical_host_size, PROT_NONE ))
+    {
+        title_direct_cache_close_failed_take( view );
+        title_direct_cache_stats.failures++;
+        return STATUS_ACCESS_DENIED;
+    }
+    *chosen = view->cache_next;
+    title_direct_cache_bytes -= native_size;
+    title_direct_cache_count--;
+    view->cache_next = NULL;
+    view->protect = vprot;
+    set_page_vprot( view->base, size, vprot );
+    register_view( view );
+    kernel_writewatch_register_range( view, view->base, size );
+    title_direct_cache_stats.hits++;
+    title_direct_cache_stats.zero_bytes += native_size;
+    title_direct_cache_report();
+    *view_ret = view;
+    return STATUS_SUCCESS;
+}
+/* WINE_PS5_DIRECT_CACHE_TEST_END */
+#endif
+
 
 
 /***********************************************************************
@@ -3729,6 +4072,8 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot, unsigned
     /* Reserved areas are not mapped there (ps5_reserve_free_ranges): map
      * only where the range is still free, never over what the system put
      * there since. */
+    if (!title_direct_cache_evict_range( base, ROUND_SIZE( 0, size, granularity_mask ) ))
+        return STATUS_NO_MEMORY;
     if (vprot & VPROT_PS5_DIRECT)
     {
         if ((UINT_PTR)base & granularity_mask) return STATUS_CONFLICTING_ADDRESSES;
@@ -3891,6 +4236,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if ((vprot & VPROT_PS5_DIRECT) && is_beyond_limit( base, host_size, host_addr_space_limit ))
             return STATUS_CONFLICTING_ADDRESSES;
 #endif
+#ifdef __PROSPERO__
+        status = title_direct_cache_take( view_ret, base, size, vprot, (UINT_PTR)base,
+                                          (UINT_PTR)base + host_size, align_mask, top_down );
+        if (status != STATUS_NOT_FOUND) return status;
+#endif
         if ((status = map_fixed_area( base, size, unix_prot, vprot ))) return status;
         if (is_beyond_limit( base, size, working_set_limit )) working_set_limit = address_space_limit;
         ptr = base;
@@ -3902,6 +4252,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+#ifdef __PROSPERO__
+        status = title_direct_cache_take( view_ret, NULL, size, vprot, (UINT_PTR)start,
+                                          (UINT_PTR)end, align_mask, top_down );
+        if (status != STATUS_NOT_FOUND) return status;
+#endif
 
         if (!(ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask, vprot )))
         {
@@ -7588,6 +7943,9 @@ void virtual_enable_write_exceptions( BOOL enable )
 static void free_reserved_memory( char *base, char *limit )
 {
     struct reserved_area *area;
+#ifdef __PROSPERO__
+    if (!title_direct_cache_evict_range( base, (UINT_PTR)limit - (UINT_PTR)base )) return;
+#endif
 
     for (;;)
     {
@@ -7683,9 +8041,15 @@ void virtual_set_large_address_space(void)
  *
  * NtAllocateVirtualMemory[Ex] implementation.
  */
+#ifdef __PROSPERO__
+static NTSTATUS title_allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
+                                               ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                               ULONG_PTR align, ULONG attributes )
+#else
 static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
                                          ULONG_PTR limit_low, ULONG_PTR limit_high,
                                          ULONG_PTR align, ULONG attributes )
+#endif
 {
     void *base;
     unsigned int vprot;
@@ -7812,6 +8176,29 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     return status;
 }
+
+#ifdef __PROSPERO__
+static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
+                                         ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                         ULONG_PTR align, ULONG attributes )
+{
+    struct title_vm_cpu_scope scope;
+    uint64_t bytes;
+    NTSTATUS status;
+
+    if (!title_profile_is_enabled())
+        return title_allocate_virtual_memory( ret, size_ptr, type, protect,
+                                               limit_low, limit_high, align, attributes );
+    scope = title_vm_cpu_begin();
+    bytes = *size_ptr;
+    status = title_allocate_virtual_memory( ret, size_ptr, type, protect,
+                                            limit_low, limit_high, align, attributes );
+
+    title_vm_cpu_end( TITLE_VM_ALLOCATE, scope, bytes, status );
+    return status;
+}
+#endif
+
 
 
 /***********************************************************************
@@ -8016,7 +8403,11 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
  *             NtFreeVirtualMemory   (NTDLL.@)
  *             ZwFreeVirtualMemory   (NTDLL.@)
  */
+#ifdef __PROSPERO__
+static NTSTATUS title_free_virtual_memory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
+#else
 NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
+#endif
 {
     struct file_view *view;
     char *base;
@@ -8104,6 +8495,22 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     }
     return status;
 }
+
+#ifdef __PROSPERO__
+NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
+{
+    struct title_vm_cpu_scope scope;
+    NTSTATUS status;
+
+    if (!title_profile_is_enabled()) return title_free_virtual_memory( process, addr_ptr, size_ptr, type );
+    scope = title_vm_cpu_begin();
+    status = title_free_virtual_memory( process, addr_ptr, size_ptr, type );
+
+    title_vm_cpu_end( TITLE_VM_FREE, scope, status ? 0 : *size_ptr, status );
+    return status;
+}
+#endif
+
 
 
 /***********************************************************************

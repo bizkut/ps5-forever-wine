@@ -26,12 +26,17 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <ps5platform/kernel.h>
 #include <ps5platform/klog.h>
 
@@ -87,6 +92,42 @@ static int64_t direct_memory_size;
 static char *metadata_next, *metadata_end;
 static struct ps5_direct_view *free_metadata;
 
+/* Allocation-stage census for CPU profiling. virtual_mutex serializes every
+ * writer; disabled titles pay no clock reads or diagnostic native calls. */
+static struct
+{
+    uint64_t since, views, requested_units, metadata_capacity, metadata_ns;
+    uint64_t backing_ns, units, allocate_ns, map_ns, zero_ns, hide_ns, largest_units, hide_calls;
+} direct_profile;
+
+static void direct_profile_report( uint64_t now )
+{
+    char line[512];
+
+    if (!direct_profile.since) direct_profile.since = now;
+    if (now - direct_profile.since < UINT64_C(10000000000)) return;
+    snprintf( line, sizeof(line),
+              "title direct allocation window_ms=%llu views=%llu requested_kib=%llu "
+              "metadata_capacity_kib=%llu metadata_ms=%llu backing_ms=%llu units=%llu "
+              "allocate_ms=%llu map_ms=%llu zero_ms=%llu hide_ms=%llu largest_kib=%llu hide_calls=%llu\n",
+              (unsigned long long)((now - direct_profile.since) / 1000000),
+              (unsigned long long)direct_profile.views,
+              (unsigned long long)(direct_profile.requested_units * DIRECT_UNIT_SIZE / 1024),
+              (unsigned long long)(direct_profile.metadata_capacity * DIRECT_UNIT_SIZE / 1024),
+              (unsigned long long)(direct_profile.metadata_ns / 1000000),
+              (unsigned long long)(direct_profile.backing_ns / 1000000),
+              (unsigned long long)direct_profile.units,
+              (unsigned long long)(direct_profile.allocate_ns / 1000000),
+              (unsigned long long)(direct_profile.map_ns / 1000000),
+              (unsigned long long)(direct_profile.zero_ns / 1000000),
+              (unsigned long long)(direct_profile.hide_ns / 1000000),
+              (unsigned long long)(direct_profile.largest_units * DIRECT_UNIT_SIZE / 1024),
+              (unsigned long long)direct_profile.hide_calls );
+    sceKernelDebugOutText( 0, line );
+    memset( &direct_profile, 0, sizeof(direct_profile) );
+    direct_profile.since = now;
+}
+
 /* stderr is a pipe in the title; its undrained tail is lost at process exit. */
 static void __attribute__((format(printf, 1, 2))) direct_log( const char *format, ... )
 {
@@ -113,6 +154,17 @@ static int32_t direct_wrong_address( const char *stage, const char *operation,
                 "exact=0 expected=%p actual=%p\n", stage, operation, expected, actual );
     return -1;
 }
+
+/* WINE_PS5_DIRECT_FAIL_FAST_TEST_BEGIN */
+void ps5_direct_fail_fast(void)
+{
+    /* SIGKILL applies to the native process, even when sent to this thread.
+     * It cannot enter Wine/loader exit callbacks or wait for children/menu. */
+    sceKernelDebugOutText( 0, "wine: fatal direct memory state; SIGKILL current native process\n" );
+    pthread_kill( pthread_self(), SIGKILL );
+    __builtin_trap(); /* Never select orderly shutdown if signal dispatch returns. */
+}
+/* WINE_PS5_DIRECT_FAIL_FAST_TEST_END */
 
 static BYTE *direct_bitmap( const struct ps5_direct_view *view, unsigned int bitmap )
 {
@@ -254,6 +306,7 @@ struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size )
     struct ps5_direct_view *view, **prev;
     size_t units = size / DIRECT_UNIT_SIZE, capacity = (units + 63) & ~(size_t)63;
     size_t bytes = sizeof(*view) + capacity * sizeof(view->physical[0]) + 3 * capacity / 8;
+    uint64_t profile_started = title_profile_is_enabled() ? ps5_title_profile_now_ns() : 0;
 
     assert( direct_memory_enabled && !(size % DIRECT_UNIT_SIZE) );
     for (prev = &free_metadata; (view = *prev); prev = &view->next)
@@ -279,6 +332,14 @@ struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size )
     memset( view->physical, 0xff, capacity * sizeof(view->physical[0]) );
     memset( direct_bitmap( view, 0 ), 0xff, capacity / 8 );
     memset( direct_bitmap( view, 1 ), 0, 2 * capacity / 8 );
+    if (profile_started)
+    {
+        direct_profile.views++;
+        direct_profile.requested_units += units;
+        direct_profile.metadata_capacity += capacity;
+        if (units > direct_profile.largest_units) direct_profile.largest_units = units;
+        direct_profile.metadata_ns += ps5_title_profile_now_ns() - profile_started;
+    }
     return view;
 }
 
@@ -386,6 +447,99 @@ BOOL ps5_direct_drop_unit( struct ps5_direct_view *view, void *addr, BOOL reserv
     return ret;
 }
 
+BOOL ps5_direct_is_whole_backed( const struct ps5_direct_view *view, void *base, size_t size )
+{
+    size_t i;
+
+    if (view->refs != 1 || view->base != base || view->units * DIRECT_UNIT_SIZE != size ||
+        view->failed_unit != view->units || view->unexpected_mapping || view->unexpected_reservation)
+        return FALSE;
+    for (i = 0; i < view->units; i++)
+        if (!direct_bit( view, 0, i ) || !direct_bit( view, 1, i ) ||
+            direct_bit( view, 2, i ) || view->physical[i] < 0) return FALSE;
+    return TRUE;
+}
+
+/* Detached cached views have no RB-tree neighbours. Release only their own
+ * retained units; a failed unmap/release remains represented for retry. */
+BOOL ps5_direct_release_whole( struct ps5_direct_view *view )
+{
+    size_t i;
+    BOOL ret = TRUE;
+
+    assert( view->refs == 1 );
+    for (i = 0; i < view->units; i++)
+        if (!ps5_direct_drop_unit( view, (char *)view->base + i * DIRECT_UNIT_SIZE, FALSE ))
+            ret = FALSE;
+    return ret;
+}
+
+BOOL ps5_direct_cache_pressure(void)
+{
+    int64_t physical = 0;
+    size_t largest = 0;
+
+    /* Conservative under fragmentation or a failed query: never retain a
+     * cache when even a 256-MiB direct allocation cannot be satisfied. */
+    return sceKernelAvailableDirectMemorySize( 0, direct_memory_size, DIRECT_UNIT_SIZE,
+                                               &physical, &largest ) || largest < ((size_t)256 << 20);
+}
+
+/* Captured from the actual loaded image before entering Windows code.
+ * Unknown images, Battle.net and CEF retain the ordinary allocation path. */
+BOOL ps5_title_agent_process;
+
+/* WINE_PS5_DIRECT_TUNE_TEST_BEGIN */
+static uint64_t direct_commit_tune_ns;
+static int direct_commit_batch = 1;
+static int direct_cache = 1;
+
+/* Same exact-line, once-per-second Unix-side tune convention as file.c. */
+static void title_direct_tune_poll(void)
+{
+    uint64_t now;
+    const char *root;
+    char path[PATH_MAX], text[1024], *line, *next;
+    ssize_t length;
+    int fd, path_len;
+
+    if (!__wine_ps5_is_title() || !(root = ps5_title_drive( 'c' ))) return;
+    now = ps5_title_profile_now_ns();
+    if (direct_commit_tune_ns && now - direct_commit_tune_ns < UINT64_C(1000000000)) return;
+    direct_commit_tune_ns = now;
+    if ((path_len = snprintf( path, sizeof(path), "%s/wineps5-tune.txt", root )) < 0 ||
+        path_len >= (int)sizeof(path) || (fd = open( path, O_RDONLY )) == -1) return;
+    length = read( fd, text, sizeof(text) - 1 );
+    close( fd );
+    if (length <= 0) return;
+    text[length] = 0;
+    for (line = text; *line; line = next)
+    {
+        next = strchr( line, '\n' );
+        if (next) *next++ = 0;
+        else next = line + strlen( line );
+        if (*line && line[strlen( line ) - 1] == '\r') line[strlen( line ) - 1] = 0;
+        if (!strcmp( line, "direct_commit_batch=off" )) direct_commit_batch = 0;
+        else if (!strcmp( line, "direct_commit_batch=on" )) direct_commit_batch = 1;
+        else if (!strcmp( line, "direct_cache=off" )) direct_cache = 0;
+        else if (!strcmp( line, "direct_cache=on" )) direct_cache = 1;
+    }
+}
+
+static int title_direct_commit_batch_enabled(void)
+{
+    title_direct_tune_poll();
+    return __wine_ps5_is_title() && direct_commit_batch;
+}
+
+BOOL ps5_direct_cache_enabled(void)
+{
+    if (!__atomic_load_n( &ps5_title_agent_process, __ATOMIC_ACQUIRE )) return FALSE;
+    title_direct_tune_poll();
+    return __wine_ps5_is_title() && direct_cache;
+}
+/* WINE_PS5_DIRECT_TUNE_TEST_END */
+
 BOOL ps5_direct_finish_commit( struct ps5_direct_view *view, void *base, size_t size, BOOL rollback )
 {
     size_t first = direct_unit_index( view, base );
@@ -412,6 +566,11 @@ BOOL ps5_direct_ensure_backed( struct ps5_direct_view *view, void *base, size_t 
     void *addr, *placed;
     int32_t result;
     int64_t physical;
+    uint64_t profile_started = title_profile_is_enabled() ? ps5_title_profile_now_ns() : 0;
+    uint64_t stage_started = 0;
+    char *hide_start = NULL;
+    size_t hide_size = 0;
+    BOOL batch = title_direct_commit_batch_enabled();
 
     /* Retry ownership-preserving cleanup from a previous failed rollback
      * before starting a new transaction on those units. */
@@ -422,8 +581,17 @@ BOOL ps5_direct_ensure_backed( struct ps5_direct_view *view, void *base, size_t 
         addr = (char *)view->base + i * DIRECT_UNIT_SIZE;
         if ((!direct_bit( view, 0, i ) || view->physical[i] >= 0) &&
             !ps5_direct_drop_unit( view, addr, TRUE )) goto failed;
+        if (profile_started) stage_started = ps5_title_profile_now_ns();
         result = sceKernelAllocateDirectMemory( 0, direct_memory_size, DIRECT_UNIT_SIZE, DIRECT_UNIT_SIZE,
                                                 PS5_KERNEL_DIRECT_TYPE_CPU, &physical );
+        if (result && virtual_title_direct_cache_trim())
+            result = sceKernelAllocateDirectMemory( 0, direct_memory_size, DIRECT_UNIT_SIZE, DIRECT_UNIT_SIZE,
+                                                    PS5_KERNEL_DIRECT_TYPE_CPU, &physical );
+        if (profile_started)
+        {
+            direct_profile.allocate_ns += ps5_title_profile_now_ns() - stage_started;
+            stage_started = ps5_title_profile_now_ns();
+        }
         if (result)
         {
             direct_error( "view-commit", "allocate", result );
@@ -434,6 +602,7 @@ BOOL ps5_direct_ensure_backed( struct ps5_direct_view *view, void *base, size_t 
         placed = addr;
         result = sceKernelMapDirectMemory( &placed, DIRECT_UNIT_SIZE, DIRECT_RW, PS5_KERNEL_MAP_FIXED,
                                            view->physical[i], PS5_KERNEL_PAGE_SIZE );
+        if (profile_started) direct_profile.map_ns += ps5_title_profile_now_ns() - stage_started;
         if (result)
         {
             direct_error( "view-commit", "map", result );
@@ -450,17 +619,59 @@ BOOL ps5_direct_ensure_backed( struct ps5_direct_view *view, void *base, size_t 
         /* Recycled physical memory is dirty. Map RW, zero, then hide every
          * page; virtual.c applies the prospective 4 KiB vprot host-page union.
          * In particular, execute is added only by mprotect, never at map time. */
+        if (profile_started) stage_started = ps5_title_profile_now_ns();
         memset( addr, 0, DIRECT_UNIT_SIZE );
-        if ((result = sceKernelMprotect( addr, DIRECT_UNIT_SIZE, 0 )))
+        if (profile_started)
         {
-            direct_error( "view-commit", "protect-uncommitted", result );
-            goto failed;
+            direct_profile.zero_ns += ps5_title_profile_now_ns() - stage_started;
+            stage_started = ps5_title_profile_now_ns();
         }
+        if (!hide_start) hide_start = addr;
+        hide_size += DIRECT_UNIT_SIZE;
+        /* Only newly backed, NX units belong to this transaction. Never
+         * reclose an existing committed neighbour, even in a mixed range. */
+        if (!batch || i == last || direct_bit( view, 1, i + 1 ))
+        {
+            if ((result = sceKernelMprotect( hide_start, hide_size, 0 )))
+            {
+                direct_error( "view-commit", "protect-uncommitted", result );
+                goto failed;
+            }
+            if (profile_started)
+            {
+                direct_profile.hide_ns += ps5_title_profile_now_ns() - stage_started;
+                direct_profile.hide_calls++;
+            }
+            hide_start = NULL;
+            hide_size = 0;
+        }
+        if (profile_started) direct_profile.units++;
+    }
+    if (profile_started)
+    {
+        uint64_t now = ps5_title_profile_now_ns();
+        direct_profile.backing_ns += now - profile_started;
+        direct_profile_report( now );
     }
     return TRUE;
 
 failed:
-    ps5_direct_finish_commit( view, base, size, TRUE );
+    /* A later allocation/map failure can leave a batched run RW. Close it
+     * before rollback: a failed unmap deliberately preserves its ownership. */
+    if (hide_start && hide_size && (result = sceKernelMprotect( hide_start, hide_size, 0 )))
+        direct_error( "view-commit", "close-unhidden-rollback", result );
+    if (!ps5_direct_finish_commit( view, base, size, TRUE ))
+    {
+        for (i = first; i <= last; i++)
+        {
+            if (!direct_bit( view, 2, i ) || !direct_bit( view, 1, i )) continue;
+            addr = (char *)view->base + i * DIRECT_UNIT_SIZE;
+            if ((result = sceKernelMprotect( addr, DIRECT_UNIT_SIZE, 0 )))
+            {
+                ps5_direct_fail_fast(); /* No callback waits while virtual_mutex is held. */
+            }
+        }
+    }
     return FALSE;
 }
 

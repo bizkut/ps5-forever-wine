@@ -77,6 +77,9 @@
 #include "security.h"
 #include "handle.h"
 #include "request_handlers.h"
+#ifdef __PROSPERO__
+#include "wine/ps5_request_profile.h"
+#endif
 
 /* Some versions of glibc don't define this */
 #ifndef SCM_RIGHTS
@@ -384,6 +387,43 @@ static unsigned long long census_us[REQ_NB_REQUESTS];
 static unsigned int census_blocked;
 static unsigned int census_direct, census_queued;
 static unsigned long long census_since;
+struct request_queue_stat
+{
+    unsigned long long count, us, max, bins[32];
+};
+static struct request_queue_stat request_queue_stats[REQ_NB_REQUESTS];
+
+static void request_queue_note( const union generic_request *req )
+{
+    struct request_queue_stat *stat;
+    struct timespec now;
+    unsigned long long started, ns, us;
+    unsigned int bin = 0;
+
+    if (!inprocess_wait_profile || !(started = wine_ps5_request_profile_started( req ))) return;
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    ns = now.tv_sec * 1000000000ull + now.tv_nsec;
+    if (ns < started) return;
+    us = (ns - started) / 1000;
+    stat = &request_queue_stats[req->request_header.req];
+    while (bin < 31 && us > (1ull << bin)) bin++;
+    stat->count++;
+    stat->us += us;
+    stat->bins[bin]++;
+    if (us > stat->max) stat->max = us;
+}
+
+static unsigned long long request_queue_percentile( const struct request_queue_stat *stat, unsigned int pct )
+{
+    unsigned long long count = 0, target = (stat->count * pct + 99) / 100;
+    unsigned int i;
+    for (i = 0; i < 32; i++)
+    {
+        count += stat->bins[i];
+        if (count >= target) return (1ull << i) < stat->max ? (1ull << i) : stat->max;
+    }
+    return stat->max;
+}
 
 static unsigned long long census_now_us(void)
 {
@@ -425,6 +465,17 @@ static void census_note( enum request req, unsigned long long started, unsigned 
                          census_count[top[j]], census_us[top[j]] / 1000 );
     inprocess_trace( "%s\n", line );
     directory_entries_census_flush();
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+    {
+        struct request_queue_stat *stat = &request_queue_stats[i];
+        if (!stat->count) continue;
+        inprocess_trace( "server queue window_ms=%llu type=%s count=%llu mean_us=%llu "
+                         "p50_us=%llu p99_us=%llu max_us=%llu\n",
+                         (now - census_since) / 1000, get_request_name( i ), stat->count,
+                         stat->us / stat->count, request_queue_percentile( stat, 50 ),
+                         request_queue_percentile( stat, 99 ), stat->max );
+    }
+    memset( request_queue_stats, 0, sizeof(request_queue_stats) );
     memset( census_count, 0, sizeof(census_count) );
     memset( census_us, 0, sizeof(census_us) );
     census_blocked = 0;
@@ -438,6 +489,9 @@ static void call_req_handler( struct thread *thread )
 {
     union generic_reply reply;
     enum request req = thread->req.request_header.req;
+#ifdef __PROSPERO__
+    if (inprocess_server) request_queue_note( &thread->req );
+#endif
 
     current = thread;
     current->reply_size = 0;

@@ -990,6 +990,39 @@ static void test_radv_windows(void)
     assert( !wine_ps5_title_radv_overlap( UINT64_MAX, UINT64_MAX, NULL, NULL ));
 }
 
+static void test_direct_cache_image_gate(void)
+{
+    static const struct { const char *image; int allowed; } cases[] = {
+        { "C:\\ProgramData\\Battle.net\\Agent\\Agent.9824\\Agent.exe", 1 },
+        { "C:\\Agent.exe", 1 }, /* The independent scan probe uses this image spelling. */
+        { "aGeNt.ExE", 1 },
+        { "/prefix/drive_c/Agent.exe", 1 },
+        { "C:\\Program Files (x86)\\Battle.net\\Battle.net.exe", 0 },
+        { "C:\\ProgramData\\Battle.net\\Agent\\AgentHelper.exe", 0 },
+        { "C:\\Agent.exe\\Battle.net.exe", 0 },
+        { "C:\\NotAgent.exe", 0 },
+        { "C:\\Agent.exe.old", 0 },
+        { "Agent.exe --type=renderer", 0 },
+        { "\"C:\\Agent.exe\"", 0 },
+        { "C:Agent.exe", 0 },
+        { "", 0 }
+    };
+    uint16_t image[256];
+    size_t i, j, length;
+
+    assert( !wine_ps5_title_direct_cache_image( NULL, 0 ));
+    assert( !wine_ps5_title_direct_cache_image( NULL, 9 ));
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        length = strlen( cases[i].image );
+        assert( length < sizeof(image) / sizeof(image[0]) );
+        for (j = 0; j < length; j++) image[j] = (unsigned char)cases[i].image[j];
+        image[length] = 0xa55a; /* UNICODE_STRING length, not an argv/NUL-string scan. */
+        assert( wine_ps5_title_direct_cache_image( image, length ) == cases[i].allowed );
+    }
+    puts( "ps5 direct cache image: exact Agent.exe leaf=1 cef_excluded=1 helper_excluded=1 bounded_utf16=1 PASS" );
+}
+
 static void test_title_driver_load(void)
 {
     assert( wine_ps5_title_driver_loaded( 0, 1 ));
@@ -2402,6 +2435,7 @@ int main(void)
     test_directory_output();
     test_directory_fault();
     test_radv_windows();
+    test_direct_cache_image_gate();
     test_title_driver_load();
     test_title_stdout_binding();
     test_generic_identity();

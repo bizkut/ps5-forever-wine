@@ -2726,6 +2726,12 @@ static void start_main_thread(void)
     mallopt( M_PERTURB, 0xff );
 #endif
     init_startup_info();
+#ifdef __PROSPERO__
+    __atomic_store_n( &ps5_title_agent_process,
+        __wine_ps5_is_title() && wine_ps5_title_direct_cache_image(
+            peb->ProcessParameters->ImagePathName.Buffer,
+            peb->ProcessParameters->ImagePathName.Length / sizeof(WCHAR) ), __ATOMIC_RELEASE );
+#endif
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
     init_thread_stack( teb, 0, 0, 0 );
