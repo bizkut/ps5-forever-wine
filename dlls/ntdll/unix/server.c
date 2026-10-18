@@ -4473,8 +4473,13 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
 
     if (dest) *dest = 0;
 #ifdef __PROSPERO__
-    if ((ret = ps5_title_flush_coalesced_write(
-            source_process == NtCurrentProcess() ? source : 0 ))) return ret;
+    if (source_process == NtCurrentProcess())
+        ret = ps5_title_flush_coalesced_write_reason(
+            source, WINE_PS5_TITLE_BUFFER_BARRIER_DUPLICATE );
+    else
+        ret = ps5_title_flush_all_coalesced_writes_reason(
+            WINE_PS5_TITLE_BUFFER_BARRIER_DUPLICATE );
+    if (ret) return ret;
 #endif
 
     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())

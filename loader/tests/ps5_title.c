@@ -1587,6 +1587,8 @@ static void test_write_coalescing(void)
     static const char c_root[] = "/data/forever/prefix/drive_c";
     static const char w_root[] = "/data/forever";
     struct wine_ps5_title_buffer_state state = {0};
+    assert( WINE_PS5_TITLE_BUFFER_RUNS == 8 );
+    assert( WINE_PS5_TITLE_BUFFER_TOTAL_MAX == 8u * 1024u * 1024u );
 
     assert( wine_ps5_title_buffer_path(
         "/data/forever/prefix/drive_c/Games/World of Warcraft/Data/data/data.000",
@@ -1647,8 +1649,9 @@ static void test_write_coalescing(void)
     assert( !wine_ps5_title_buffer_admit( 1, 0, 1 ) ); /* shutdown recheck */
     assert( !wine_ps5_title_buffer_admit( 0, 1, 1 ) ); /* permanent disable */
     assert( wine_ps5_title_buffer_admit( 0, 0, 1 ) );
-    puts( "ps5 single CASC buffer: exact data.NNN scope, same-handle continuation, "
-          "40-ms residence, identity, shutdown and fail-closed mapping policy PASS" );
+    assert( WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE == 4 );
+    puts( "ps5 CASC buffers: exact data.NNN scope, 8 MiB cap, four extents/handle, "
+          "continuation/residence, identity, shutdown and fail-closed mapping/link policy PASS" );
 }
 
 static void test_dirquery_spin(void)

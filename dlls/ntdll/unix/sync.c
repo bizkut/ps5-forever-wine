@@ -3345,7 +3345,8 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
     *handle = 0;
 #ifdef __PROSPERO__
     if (file) ret = ps5_title_prepare_buffered_section( file, sec_flags );
-    else ret = ps5_title_flush_coalesced_write( 0 );
+    else ret = ps5_title_flush_coalesced_write_reason(
+        0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
     if (ret) return ret;
 #endif
 
@@ -3411,7 +3412,8 @@ NTSTATUS WINAPI NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 
     *handle = 0;
 #ifdef __PROSPERO__
-    if ((ret = ps5_title_flush_coalesced_write( 0 ))) return ret;
+    if ((ret = ps5_title_flush_coalesced_write_reason(
+            0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION ))) return ret;
 #endif
     if ((ret = validate_open_object_attributes( attr ))) return ret;
 

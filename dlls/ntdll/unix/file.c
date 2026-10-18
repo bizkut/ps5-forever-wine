@@ -135,7 +135,14 @@ WINE_DECLARE_DEBUG_CHANNEL(winediag);
 #ifdef __PROSPERO__
 static void title_buffer_begin_mutation(void);
 static void title_buffer_end_mutation( void *arg );
+static void title_buffer_end_optional_mutation( void *arg );
 static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native_worker );
+static NTSTATUS title_buffer_flush_reason( HANDLE caller, int consume_error,
+                                           int native_worker, unsigned int reason );
+static NTSTATUS title_buffer_flush_path_reason( const char *path, unsigned int reason );
+static int title_buffer_path_needs_mutation( const char *path );
+static NTSTATUS title_buffer_flush_directory_reason( const char *path, unsigned int reason );
+static NTSTATUS title_buffer_flush_fd_reason( HANDLE handle, int fd, unsigned int reason );
 static NTSTATUS title_buffer_disable_for_link(void);
 #endif
 
@@ -3611,9 +3618,6 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
           handle, event, apc_routine, apc_context, io, buffer,
           length, info_class, single_entry, debugstr_us(mask),
           restart_scan);
-#ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
-#endif
 
 
     if (event || apc_routine)
@@ -3646,6 +3650,26 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
         return STATUS_INVALID_INFO_CLASS;
     }
     if (!buffer) return STATUS_ACCESS_VIOLATION;
+#ifdef __PROSPERO__
+    if (info_class != FileNamesInformation)
+    {
+        char *directory_path;
+
+        if (!title_directory_path( handle, &directory_path ))
+        {
+            status = title_buffer_flush_directory_reason(
+                directory_path, WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY );
+            free( directory_path );
+            if (status) return status;
+        }
+        else
+            ps5_title_flush_coalesced_write_reason(
+                0, WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY );
+    }
+    else
+        ps5_title_flush_coalesced_write_reason(
+            0, WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY );
+#endif
 
     if ((status = server_get_unix_fd( handle, FILE_LIST_DIRECTORY, &fd, &needs_close, &type, NULL )))
     {
@@ -5601,16 +5625,22 @@ NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK acce
     unsigned int status;
     data_size_t len;
 #ifdef __PROSPERO__
+    int mutation = (disposition == FILE_SUPERSEDE || disposition == FILE_OVERWRITE ||
+                    disposition == FILE_OVERWRITE_IF) &&
+                   title_buffer_path_needs_mutation( unix_name );
     sigset_t previous;
 #endif
 
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
 #ifdef __PROSPERO__
     pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
-    title_buffer_begin_mutation();
-    pthread_cleanup_push( title_buffer_end_mutation, NULL );
+    if (mutation) title_buffer_begin_mutation();
+    pthread_cleanup_push( title_buffer_end_optional_mutation, &mutation );
     pthread_sigmask( SIG_SETMASK, &previous, NULL );
-    status = title_buffer_flush( 0, 0, 0 );
+    status = mutation
+             ? title_buffer_flush_path_reason( unix_name, WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN )
+             : ps5_title_flush_coalesced_write_reason(
+                   0, WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN );
     if (!status)
     {
 #endif
@@ -5672,10 +5702,6 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     *handle = 0;
     if (!attr || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
-#ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 )))
-        return io->Status = status;
-#endif
 
 
     if (alloc_size) FIXME( "alloc_size not supported\n" );
@@ -5830,7 +5856,8 @@ NTSTATUS WINAPI NtCreateMailslotFile( HANDLE *handle, ULONG access, OBJECT_ATTRI
     *handle = 0;
     if (!attr) return STATUS_INVALID_PARAMETER;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            0, WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN ))) return status;
 #endif
     if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
 
@@ -5871,7 +5898,8 @@ NTSTATUS WINAPI NtCreateNamedPipeFile( HANDLE *handle, ULONG access, OBJECT_ATTR
            options, pipe_type, read_mode, completion_mode, max_inst,
            inbound_quota, outbound_quota, timeout );
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            0, WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN ))) return status;
 #endif
 
     /* assume we only get relative timeout */
@@ -5918,7 +5946,8 @@ NTSTATUS WINAPI NtDeleteFile( OBJECT_ATTRIBUTES *attr )
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE ))) return status;
 #endif
 
 
@@ -5945,9 +5974,6 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
-#ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
-#endif
 
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
@@ -5955,6 +5981,11 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
         ULONG attributes;
         struct stat st;
 
+#ifdef __PROSPERO__
+        if ((status = title_buffer_flush_path_reason(
+                unix_name, WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES ))) {}
+        else
+#endif
         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
@@ -5978,9 +6009,6 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
-#ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( 0 ))) return status;
-#endif
 
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
@@ -5988,6 +6016,11 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
         ULONG attributes;
         struct stat st;
 
+#ifdef __PROSPERO__
+        if ((status = title_buffer_flush_path_reason(
+                unix_name, WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES ))) {}
+        else
+#endif
         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
@@ -6101,7 +6134,8 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     io->Information = 0;
 #ifdef __PROSPERO__
     title_write_trace_op_begin( handle, WINE_PS5_WRITE_TRACE_QUERY );
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_QUERY )))
         return io->Status = status;
 #endif
 
@@ -6279,6 +6313,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     LONG64 trace_started = 0;
     LONGLONG trace_value = 0;
     enum wine_ps5_write_trace_op trace_op = WINE_PS5_WRITE_TRACE_SEEK;
+    unsigned int barrier_reason = WINE_PS5_TITLE_BUFFER_BARRIER_QUERY;
 #endif
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class );
@@ -6292,7 +6327,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         if (trace_started && len >= sizeof(LARGE_INTEGER))
             memcpy( &trace_value, ptr, sizeof(trace_value) );
     }
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if (class == FileEndOfFileInformation || class == FileAllocationInformation)
+        barrier_reason = WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH;
+    else if (class == FileDispositionInformation || class == FileDispositionInformationEx ||
+             class == FileRenameInformation || class == FileRenameInformationEx ||
+             class == FileLinkInformation || class == FileLinkInformationEx)
+        barrier_reason = WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE;
+    if ((status = ps5_title_flush_coalesced_write_reason( handle, barrier_reason )))
     {
         title_write_trace_op_end( handle, trace_op, trace_started, status, trace_value );
         return io->Status = status;
@@ -6571,7 +6612,8 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 title_buffer_begin_mutation();
                 pthread_cleanup_push( title_buffer_end_mutation, NULL );
                 pthread_sigmask( SIG_SETMASK, &rename_previous, NULL );
-                status = title_buffer_flush( 0, 0, 0 );
+                status = title_buffer_flush_reason( 0, 0, 0,
+                                                    WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
                 if (!status)
                 {
 #endif
@@ -7989,33 +8031,80 @@ static ssize_t title_file_pwrite_native( HANDLE handle, int fd, const void *buff
     return title_file_pwrite_buffer( handle, fd, buffer, length, offset, 1, path );
 }
 
-/* WINE_PS5_SINGLE_BUFFER_TEST_BEGIN */
-struct title_single_buffer
+/* WINE_PS5_MULTI_BUFFER_TEST_BEGIN */
+#define TITLE_BUFFER_DIAG_DISTINCT 32
+#define TITLE_BUFFER_DIAG_SAMPLE_HANDLES WINE_PS5_TITLE_BUFFER_RUNS
+#define TITLE_BUFFER_DIAG_SAMPLES 64
+
+struct title_buffer_run
 {
-    pthread_mutex_t mutex;
     HANDLE handle, error_handle;
-    int fd, flushing, active;
+    int fd, flushing;
     off_t start, end;
     size_t length;
-    uint64_t first_us, dev, ino;
+    uint64_t first_us, sequence, dev, ino;
     NTSTATUS pending_status;
     char path[WB_MAX_PATH + 1];
     pthread_t flushing_thread;
     int flushing_thread_valid;
-    unsigned char data[2][WINE_PS5_TITLE_BUFFER_MAX];
+    unsigned char data[WINE_PS5_TITLE_BUFFER_MAX];
+};
+
+struct title_buffer_table
+{
+    pthread_mutex_t mutex;
+    struct title_buffer_run runs[WINE_PS5_TITLE_BUFFER_RUNS];
+    uint64_t next_sequence;
+    int barrier_count, barrier_active;
 };
 
 struct title_buffer_snapshot
 {
     HANDLE handle;
-    int fd, index, consume_error, owner;
+    int run, fd, consume_error, owner;
+    unsigned int flush_reason;
     off_t start, end;
     size_t length, done;
-    uint64_t first_us, dev, ino;
+    uint64_t first_us, sequence, dev, ino;
     char path[WB_MAX_PATH + 1];
 };
 
-static struct title_single_buffer title_buffer = {.mutex = PTHREAD_MUTEX_INITIALIZER, .fd = -1};
+enum title_buffer_match
+{
+    TITLE_BUFFER_MATCH_ALL,
+    TITLE_BUFFER_MATCH_HANDLE,
+    TITLE_BUFFER_MATCH_IDENTITY
+};
+
+struct title_buffer_diag_samples
+{
+    uintptr_t handle;
+    unsigned int count;
+    int have_last30;
+    off_t last30_end;
+    off_t offsets[TITLE_BUFFER_DIAG_SAMPLES];
+    uint32_t lengths[TITLE_BUFFER_DIAG_SAMPLES];
+};
+
+struct title_buffer_diag
+{
+    uint64_t last_us;
+    uint64_t writes, sizes[5];
+    uint64_t other_handle, other_identity, noncontiguous, capacity, total_cap, idle;
+    uint64_t extents_opened, handle_evictions, global_evictions;
+    uint64_t extends_eof, beyond_physical_eof, gap30[8];
+    uint64_t barriers[WINE_PS5_TITLE_BUFFER_BARRIERS];
+    uint64_t flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIERS];
+    uint64_t flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIERS];
+    uintptr_t handles[TITLE_BUFFER_DIAG_DISTINCT];
+    uint64_t identity_dev[TITLE_BUFFER_DIAG_DISTINCT];
+    uint64_t identity_ino[TITLE_BUFFER_DIAG_DISTINCT];
+    unsigned int handle_count, identity_count, sample_handle_count;
+    struct title_buffer_diag_samples samples[TITLE_BUFFER_DIAG_SAMPLE_HANDLES];
+};
+
+static struct title_buffer_table title_buffer = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+static struct title_buffer_diag title_buffer_diag;
 static pthread_once_t title_buffer_once = PTHREAD_ONCE_INIT;
 static pthread_t title_buffer_thread_id;
 static LONG title_buffer_ready, title_buffer_shutdown, title_buffer_joined;
@@ -8038,15 +8127,358 @@ static void title_buffer_log_state( LONG *once, const char *state,
               state, reason, (long long)detail, (int)getpid() );
     sceKernelDebugOutText( 0, line );
 #else
-    (void)once;
-    (void)state;
-    (void)reason;
-    (void)detail;
+    (void)once; (void)state; (void)reason; (void)detail;
 #endif
 }
 
+static void title_buffer_lock( struct wine_ps5_title_lock *lock )
+{
+    wine_ps5_title_lock_mutex( lock, &title_buffer.mutex, &ps5_title_block_set );
+}
+
+static void title_buffer_unlock( struct wine_ps5_title_lock *lock )
+{
+    wine_ps5_title_unlock_mutex( lock );
+    lock->mutex = NULL;
+}
+
+static unsigned int title_buffer_pending_count_locked(void)
+{
+    unsigned int i, count = 0;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].length) count++;
+    return count;
+}
+
+
+static int title_buffer_any_flushing_locked(void)
+{
+    unsigned int i;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].flushing) return 1;
+    return 0;
+}
+
+static void title_buffer_wait_for_admission( struct wine_ps5_title_lock *lock )
+{
+    while (title_buffer.barrier_count ||
+           InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ))
+    {
+#ifdef WINE_PS5_WRITE_BUFFER_TEST
+        title_buffer_test_wait_hook( title_buffer_any_flushing_locked(),
+                                     InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ) );
+#endif
+        title_buffer_unlock( lock );
+        usleep( 1000 );
+        title_buffer_lock( lock );
+    }
+}
+
+static void title_buffer_wait_run( struct wine_ps5_title_lock *lock, unsigned int index )
+{
+    while (title_buffer.runs[index].flushing)
+    {
+        title_buffer_unlock( lock );
+        usleep( 1000 );
+        title_buffer_lock( lock );
+    }
+}
+
+static int title_buffer_find_handle_locked( HANDLE handle )
+{
+    unsigned int i;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].length && title_buffer.runs[i].handle == handle) return i;
+    return -1;
+}
+
+static int title_buffer_find_identity_locked( uint64_t dev, uint64_t ino )
+{
+    unsigned int i;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].length && title_buffer.runs[i].dev == dev &&
+            title_buffer.runs[i].ino == ino) return i;
+    return -1;
+}
+
+static int title_buffer_find_free_locked(void)
+{
+    unsigned int i;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (!title_buffer.runs[i].length && !title_buffer.runs[i].flushing &&
+            !title_buffer.runs[i].pending_status) return i;
+    return -1;
+}
+
+static int title_buffer_match_run( const struct title_buffer_run *run,
+                                   enum title_buffer_match match, HANDLE handle,
+                                   uint64_t dev, uint64_t ino )
+{
+    if (!run->length) return 0;
+    if (match == TITLE_BUFFER_MATCH_ALL) return 1;
+    if (match == TITLE_BUFFER_MATCH_HANDLE) return run->handle == handle;
+    return run->dev == dev && run->ino == ino;
+}
+
+static int title_buffer_find_earliest_locked( enum title_buffer_match match, HANDLE handle,
+                                              uint64_t dev, uint64_t ino,
+                                              unsigned int attempted )
+{
+    uint64_t earliest = UINT64_MAX;
+    int found = -1;
+    unsigned int i;
+
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+    {
+        struct title_buffer_run *run = &title_buffer.runs[i];
+        if ((attempted & (1u << i)) || !title_buffer_match_run( run, match, handle, dev, ino ))
+            continue;
+        if (run->sequence < earliest) { earliest = run->sequence; found = i; }
+    }
+    return found;
+}
+
+static void title_buffer_diag_reset_locked( uint64_t now )
+{
+    memset( &title_buffer_diag, 0, sizeof(title_buffer_diag) );
+    title_buffer_diag.last_us = now;
+}
+
+static void title_buffer_diag_report_locked( uint64_t now )
+{
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    struct title_buffer_diag *d = &title_buffer_diag;
+    unsigned int i, j;
+    char line[2048];
+
+    if (!d->last_us) { d->last_us = now; return; }
+    if (now - d->last_us < 10000000) return;
+    snprintf( line, sizeof(line),
+              "wine: title writebuf diag pid=%d window_ms=%llu handles=%u identities=%u "
+              "writes=%llu sizes=%llu/%llu/%llu/%llu/%llu "
+              "mix=other_handle:%llu breaks=other_identity:%llu,overlap:%llu,capacity:%llu,total:%llu,idle:%llu "
+              "calls=read:%llu,query:%llu,idx:%llu,close:%llu,section:%llu,process:%llu,"
+              "create:%llu,attr:%llu,dir:%llu,volume:%llu,lock:%llu,control:%llu,cancel:%llu,"
+              "duplicate:%llu,namespace:%llu,virtual:%llu,nonfile:%llu,close_unrelated:%llu,other:%llu\n",
+              (int)getpid(), (unsigned long long)(now - d->last_us) / 1000,
+              d->handle_count, d->identity_count, (unsigned long long)d->writes,
+              (unsigned long long)d->sizes[0], (unsigned long long)d->sizes[1],
+              (unsigned long long)d->sizes[2], (unsigned long long)d->sizes[3],
+              (unsigned long long)d->sizes[4], (unsigned long long)d->other_handle,
+              (unsigned long long)d->other_identity, (unsigned long long)d->noncontiguous,
+              (unsigned long long)d->capacity, (unsigned long long)d->total_cap,
+              (unsigned long long)d->idle,
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_READ],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_QUERY],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_CLOSE],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_SECTION],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_DUPLICATE],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_VIRTUAL],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_EVENT_NONFILE_WRITE],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_EVENT_CLOSE_UNRELATED],
+              (unsigned long long)d->barriers[WINE_PS5_TITLE_BUFFER_BARRIER_OTHER] );
+    sceKernelDebugOutText( 0, line );
+    snprintf( line, sizeof(line),
+              "wine: title writebuf drained pid=%d "
+              "runs=read:%llu,query:%llu,idx:%llu,close:%llu,section:%llu,process:%llu,"
+              "create:%llu,attr:%llu,dir:%llu,volume:%llu,lock:%llu,control:%llu,cancel:%llu,"
+              "duplicate:%llu,namespace:%llu,virtual:%llu,nonfile:%llu,close_unrelated:%llu,other:%llu "
+              "bytes=read:%llu,query:%llu,idx:%llu,close:%llu,section:%llu,process:%llu,"
+              "create:%llu,attr:%llu,dir:%llu,volume:%llu,lock:%llu,control:%llu,cancel:%llu,"
+              "duplicate:%llu,namespace:%llu,virtual:%llu,nonfile:%llu,close_unrelated:%llu,other:%llu\n",
+              (int)getpid(),
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_READ],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_QUERY],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_CLOSE],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_SECTION],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_DUPLICATE],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_VIRTUAL],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_EVENT_NONFILE_WRITE],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_EVENT_CLOSE_UNRELATED],
+              (unsigned long long)d->flushed_runs[WINE_PS5_TITLE_BUFFER_BARRIER_OTHER],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_READ],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_QUERY],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_CLOSE],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_SECTION],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_DUPLICATE],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_VIRTUAL],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_EVENT_NONFILE_WRITE],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_EVENT_CLOSE_UNRELATED],
+              (unsigned long long)d->flushed_bytes[WINE_PS5_TITLE_BUFFER_BARRIER_OTHER] );
+    sceKernelDebugOutText( 0, line );
+    snprintf( line, sizeof(line),
+              "wine: title writebuf extents pid=%d opened=%llu handle_evict=%llu "
+              "global_evict=%llu extends_eof=%llu beyond_physical=%llu "
+              "gap30=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu\n",
+              (int)getpid(), (unsigned long long)d->extents_opened,
+              (unsigned long long)d->handle_evictions,
+              (unsigned long long)d->global_evictions,
+              (unsigned long long)d->extends_eof,
+              (unsigned long long)d->beyond_physical_eof,
+              (unsigned long long)d->gap30[0], (unsigned long long)d->gap30[1],
+              (unsigned long long)d->gap30[2], (unsigned long long)d->gap30[3],
+              (unsigned long long)d->gap30[4], (unsigned long long)d->gap30[5],
+              (unsigned long long)d->gap30[6], (unsigned long long)d->gap30[7] );
+    sceKernelDebugOutText( 0, line );
+    for (i = 0; i < d->sample_handle_count; i++)
+    {
+        size_t used = snprintf( line, sizeof(line),
+                                "wine: title writebuf offsets pid=%d handle=%llx count=%u pairs=",
+                                (int)getpid(), (unsigned long long)d->samples[i].handle,
+                                d->samples[i].count );
+        for (j = 0; j < d->samples[i].count && used < sizeof(line) - 32; j++)
+            used += snprintf( line + used, sizeof(line) - used, "%s%lld+%u", j ? "," : "",
+                              (long long)d->samples[i].offsets[j], d->samples[i].lengths[j] );
+        snprintf( line + used, sizeof(line) - used, "\n" );
+        sceKernelDebugOutText( 0, line );
+    }
+    title_buffer_diag_reset_locked( now );
+#else
+    (void)now;
+#endif
+}
+
+static void title_buffer_diag_write_locked( HANDLE handle, uint64_t dev, uint64_t ino,
+                                            size_t size, off_t offset, off_t physical_eof )
+{
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    struct title_buffer_diag *d = &title_buffer_diag;
+    struct title_buffer_diag_samples *sample;
+    unsigned int i;
+    title_buffer_diag_report_locked( title_io_now_us() );
+
+    d->writes++;
+    d->sizes[size <= 4096 ? 0 : size <= 16384 ? 1 : size <= 65536 ? 2 :
+             size <= 262144 ? 3 : 4]++;
+    if (physical_eof >= 0 && offset >= 0)
+    {
+        uint64_t end = (uint64_t)offset + size;
+        uint64_t logical_eof = physical_eof;
+
+        if (end >= (uint64_t)offset)
+        {
+            if (end > (uint64_t)physical_eof) d->beyond_physical_eof++;
+            for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+            {
+                const struct title_buffer_run *run = &title_buffer.runs[i];
+                if (!run->length) continue;
+                if (run->handle != handle && (!dev || !ino || run->dev != dev || run->ino != ino))
+                    continue;
+                if ((uint64_t)run->end > logical_eof) logical_eof = run->end;
+            }
+            if (end > logical_eof) d->extends_eof++;
+        }
+    }
+    for (i = 0; i < d->handle_count; i++)
+        if (d->handles[i] == (uintptr_t)handle) break;
+    if (i == d->handle_count && i < TITLE_BUFFER_DIAG_DISTINCT)
+        d->handles[d->handle_count++] = (uintptr_t)handle;
+    for (i = 0; i < d->identity_count; i++)
+        if (d->identity_dev[i] == dev && d->identity_ino[i] == ino) break;
+    if (i == d->identity_count && i < TITLE_BUFFER_DIAG_DISTINCT)
+    {
+        d->identity_dev[i] = dev;
+        d->identity_ino[i] = ino;
+        d->identity_count++;
+    }
+    for (i = 0; i < d->sample_handle_count; i++)
+        if (d->samples[i].handle == (uintptr_t)handle) break;
+    if (i == d->sample_handle_count && i < TITLE_BUFFER_DIAG_SAMPLE_HANDLES)
+    {
+        d->samples[i].handle = (uintptr_t)handle;
+        d->sample_handle_count++;
+    }
+    if (i < d->sample_handle_count)
+    {
+        sample = &d->samples[i];
+        if (size == 30 && offset >= 0)
+        {
+            if (sample->have_last30)
+            {
+                uint64_t gap;
+                if (offset < sample->last30_end) d->gap30[7]++;
+                else
+                {
+                    gap = offset - sample->last30_end;
+                    d->gap30[gap == 0 ? 0 : gap <= 256 ? 1 : gap <= 1024 ? 2 :
+                             gap <= 4096 ? 3 : gap <= 16384 ? 4 :
+                             gap <= 65536 ? 5 : 6]++;
+                }
+            }
+            sample->have_last30 = 1;
+            sample->last30_end = offset + size;
+        }
+        if (sample->count < TITLE_BUFFER_DIAG_SAMPLES)
+        {
+            sample->offsets[sample->count] = offset;
+            sample->lengths[sample->count] = size > UINT32_MAX ? UINT32_MAX : size;
+            sample->count++;
+        }
+    }
+#else
+    (void)handle; (void)dev; (void)ino; (void)size; (void)offset; (void)physical_eof;
+#endif
+}
+
+static void title_buffer_diag_barrier_locked( unsigned int reason )
+{
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    if (reason >= WINE_PS5_TITLE_BUFFER_BARRIERS)
+        reason = WINE_PS5_TITLE_BUFFER_BARRIER_OTHER;
+    title_buffer_diag_report_locked( title_io_now_us() );
+    title_buffer_diag.barriers[reason]++;
+#else
+    (void)reason;
+#endif
+}
+static void title_buffer_diag_flushed_locked( unsigned int reason, uint64_t runs,
+                                              uint64_t bytes )
+{
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    if (reason >= WINE_PS5_TITLE_BUFFER_BARRIERS) return;
+    title_buffer_diag.flushed_runs[reason] += runs;
+    title_buffer_diag.flushed_bytes[reason] += bytes;
+#else
+    (void)reason; (void)runs; (void)bytes;
+#endif
+}
+
+
 static void title_buffer_init(void)
 {
+    unsigned int i;
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++) title_buffer.runs[i].fd = -1;
+    title_buffer.next_sequence = 1;
     if (!pthread_create( &title_buffer_thread_id, NULL, title_buffer_thread, NULL ))
         InterlockedExchange( &title_buffer_ready, 1 );
 }
@@ -8094,8 +8526,8 @@ static int title_buffer_switch_enabled(void)
                 for (line = text; *line; line = end)
                 {
                     if ((end = strchr( line, '\n' ))) *end++ = 0;
-                    else end = line + strlen( line );
-                    if (*line && line[strlen( line ) - 1] == '\r') line[strlen( line ) - 1] = 0;
+                    else end = line + strlen(line);
+                    if (*line && line[strlen(line) - 1] == '\r') line[strlen(line) - 1] = 0;
                     if (!strcmp( line, "write_buffer=off" ))
                         __atomic_store_n( &title_buffer_switch_mode, 0, __ATOMIC_RELAXED );
                     else if (!strcmp( line, "write_buffer=on" ))
@@ -8109,82 +8541,64 @@ static int title_buffer_switch_enabled(void)
     return __atomic_load_n( &title_buffer_switch_mode, __ATOMIC_RELAXED );
 }
 
-static void title_buffer_lock( struct wine_ps5_title_lock *lock )
+static void title_buffer_clear_run_locked( struct title_buffer_run *run )
 {
-    wine_ps5_title_lock_mutex( lock, &title_buffer.mutex, &ps5_title_block_set );
+    run->handle = run->error_handle = 0;
+    run->fd = -1;
+    run->flushing = run->flushing_thread_valid = 0;
+    run->start = run->end = 0;
+    run->length = 0;
+    run->first_us = run->sequence = run->dev = run->ino = 0;
+    run->pending_status = STATUS_SUCCESS;
+    run->path[0] = 0;
 }
-
-static void title_buffer_unlock( struct wine_ps5_title_lock *lock )
-{
-    wine_ps5_title_unlock_mutex( lock );
-    lock->mutex = NULL;
-}
-
-static void title_buffer_wait_for_flush( struct wine_ps5_title_lock *lock )
-{
-    while (title_buffer.flushing)
-    {
-        title_buffer_unlock( lock );
-        usleep( 1000 );
-        title_buffer_lock( lock );
-    }
-}
-static void title_buffer_wait_for_admission( struct wine_ps5_title_lock *lock )
-{
-    while (title_buffer.flushing ||
-           InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ))
-    {
-#ifdef WINE_PS5_WRITE_BUFFER_TEST
-        title_buffer_test_wait_hook( title_buffer.flushing,
-                                     InterlockedCompareExchange( &title_buffer_mutations, 0, 0 ) );
-#endif
-        title_buffer_unlock( lock );
-        usleep( 1000 );
-        title_buffer_lock( lock );
-    }
-}
-
 
 static void title_buffer_restore_snapshot_locked( struct title_buffer_snapshot *snapshot,
                                                   NTSTATUS status )
 {
+    struct title_buffer_run *run = &title_buffer.runs[snapshot->run];
     size_t left = snapshot->length - snapshot->done;
+    NTSTATUS pending = run->pending_status;
+    HANDLE error_handle = run->error_handle;
 
     if (left)
     {
-        if (snapshot->done)
-            memmove( title_buffer.data[snapshot->index],
-                     title_buffer.data[snapshot->index] + snapshot->done, left );
-        title_buffer.active = snapshot->index;
-        title_buffer.handle = snapshot->handle;
-        title_buffer.fd = snapshot->fd;
-        title_buffer.start = snapshot->start + snapshot->done;
-        title_buffer.end = snapshot->end;
-        title_buffer.length = left;
-        title_buffer.first_us = snapshot->first_us;
-        title_buffer.dev = snapshot->dev;
-        title_buffer.ino = snapshot->ino;
-        memcpy( title_buffer.path, snapshot->path, sizeof(title_buffer.path) );
+        if (snapshot->done) memmove( run->data, run->data + snapshot->done, left );
+        run->handle = snapshot->handle;
+        run->fd = snapshot->fd;
+        run->start = snapshot->start + snapshot->done;
+        run->end = snapshot->end;
+        run->length = left;
+        run->first_us = snapshot->first_us;
+        run->sequence = snapshot->sequence;
+        run->dev = snapshot->dev;
+        run->ino = snapshot->ino;
+        memcpy( run->path, snapshot->path, sizeof(run->path) );
         if (!status) status = STATUS_UNSUCCESSFUL;
-        title_buffer.pending_status = status;
-        title_buffer.error_handle = snapshot->handle;
+        run->pending_status = status;
+        run->error_handle = snapshot->handle;
+        run->flushing = run->flushing_thread_valid = 0;
         InterlockedExchange( &title_buffer_disabled, 1 );
     }
     else
     {
         close( snapshot->fd );
-        if (!snapshot->handle) title_buffer.pending_status = STATUS_SUCCESS;
+        title_buffer_clear_run_locked( run );
+        if (snapshot->handle)
+        {
+            run->pending_status = pending;
+            run->error_handle = error_handle;
+        }
     }
-    title_buffer.flushing = 0;
-    title_buffer.flushing_thread_valid = 0;
 }
 
 static void title_buffer_flush_cleanup( void *arg )
 {
     struct title_buffer_snapshot *snapshot = arg;
     struct wine_ps5_title_lock lock;
-
     title_buffer_lock( &lock );
+    if (snapshot->done)
+        title_buffer_diag_flushed_locked( snapshot->flush_reason, 1, snapshot->done );
     title_buffer_restore_snapshot_locked( snapshot, STATUS_UNSUCCESSFUL );
     title_buffer_unlock( &lock );
 }
@@ -8196,6 +8610,7 @@ static int title_buffer_snapshot_path_matches( const struct title_buffer_snapsho
            wine_ps5_title_buffer_same_identity( snapshot->dev, snapshot->ino,
                                                 st.st_dev, st.st_ino );
 }
+
 
 static ssize_t title_buffer_write_snapshot( const struct title_buffer_snapshot *snapshot,
                                             const void *bytes, size_t length, off_t offset,
@@ -8213,54 +8628,50 @@ static ssize_t title_buffer_write_snapshot( const struct title_buffer_snapshot *
     }
 }
 
-/* The run is detached and cleanup is armed while termination signals are
- * blocked. Keep them blocked through backing I/O and the final state commit,
- * so SIGQUIT cannot abandon either the run flag or the broker's own mutex. */
-static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native_worker )
+/* Lock order: mutation/barrier state and every run use the table mutex.
+ * A run sets flushing, releases the table, and only then enters broker I/O. */
+static NTSTATUS title_buffer_flush_run( unsigned int index, uint64_t expected_sequence,
+                                        HANDLE caller, int consume_error, int native_worker,
+                                        unsigned int reason )
 {
     struct title_buffer_snapshot snapshot = {0};
     struct wine_ps5_title_lock lock;
+    struct title_buffer_run *run;
     sigset_t previous_signals;
     NTSTATUS status = STATUS_SUCCESS;
 
-    /* mode 1 is the normal native idle worker; mode 2 is shutdown-only pinned-fd I/O */
     title_buffer_lock( &lock );
-    title_buffer_wait_for_flush( &lock );
-    if (title_buffer.pending_status && caller && caller == title_buffer.error_handle)
-    {
-        status = title_buffer.pending_status;
-        if (consume_error) title_buffer.pending_status = STATUS_SUCCESS;
-        title_buffer_unlock( &lock );
-        return status;
-    }
-    if (!title_buffer.length)
+    title_buffer_wait_run( &lock, index );
+    run = &title_buffer.runs[index];
+    if (!run->length || run->sequence != expected_sequence)
     {
         title_buffer_unlock( &lock );
         return STATUS_SUCCESS;
     }
-
-    snapshot.handle = title_buffer.handle;
-    snapshot.fd = title_buffer.fd;
-    snapshot.index = title_buffer.active;
-    snapshot.start = title_buffer.start;
-    snapshot.end = title_buffer.end;
-    snapshot.length = title_buffer.length;
-    snapshot.first_us = title_buffer.first_us;
-    snapshot.dev = title_buffer.dev;
-    snapshot.ino = title_buffer.ino;
+    if (run->pending_status && caller && caller == run->error_handle)
+    {
+        status = run->pending_status;
+        if (consume_error) run->pending_status = STATUS_SUCCESS;
+        title_buffer_unlock( &lock );
+        return status;
+    }
+    snapshot.run = index;
+    snapshot.handle = run->handle;
+    snapshot.fd = run->fd;
+    snapshot.start = run->start;
+    snapshot.end = run->end;
+    snapshot.length = run->length;
+    snapshot.first_us = run->first_us;
+    snapshot.sequence = run->sequence;
+    snapshot.dev = run->dev;
+    snapshot.ino = run->ino;
     snapshot.consume_error = consume_error;
-    snapshot.owner = caller && caller == title_buffer.handle;
-    memcpy( snapshot.path, title_buffer.path, sizeof(snapshot.path) );
-    title_buffer.flushing = 1;
-    title_buffer.flushing_thread = pthread_self();
-    title_buffer.flushing_thread_valid = 1;
-    title_buffer.handle = 0;
-    title_buffer.fd = -1;
-    title_buffer.start = title_buffer.end = 0;
-    title_buffer.length = 0;
-    title_buffer.first_us = 0;
-    title_buffer.path[0] = 0;
-    title_buffer.active ^= 1;
+    snapshot.owner = caller && caller == run->handle;
+    snapshot.flush_reason = reason;
+    memcpy( snapshot.path, run->path, sizeof(snapshot.path) );
+    run->flushing = 1;
+    run->flushing_thread = pthread_self();
+    run->flushing_thread_valid = 1;
 
     previous_signals = lock.signals;
     pthread_cleanup_push( title_buffer_flush_cleanup, &snapshot );
@@ -8269,7 +8680,7 @@ static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native
     while (snapshot.done < snapshot.length)
     {
         ssize_t ret = title_buffer_write_snapshot(
-            &snapshot, title_buffer.data[snapshot.index] + snapshot.done,
+            &snapshot, title_buffer.runs[index].data + snapshot.done,
             snapshot.length - snapshot.done, snapshot.start + snapshot.done,
             native_worker == 2 );
         if (ret < 0 && errno == EINTR) continue;
@@ -8277,9 +8688,10 @@ static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native
         if (!ret) { status = STATUS_DISK_FULL; break; }
         snapshot.done += ret;
     }
-
     pthread_mutex_lock( &title_buffer.mutex );
     lock.mutex = &title_buffer.mutex;
+    if (snapshot.done)
+        title_buffer_diag_flushed_locked( snapshot.flush_reason, 1, snapshot.done );
     title_buffer_restore_snapshot_locked( &snapshot, status );
     if (status)
     {
@@ -8287,7 +8699,7 @@ static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native
             sceKernelDebugOutText( 0, "wine: title write buffer flush failed; buffering disabled\n" );
         title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "flush-error", status );
         if (snapshot.consume_error && snapshot.owner)
-            title_buffer.pending_status = STATUS_SUCCESS;
+            title_buffer.runs[index].pending_status = STATUS_SUCCESS;
     }
     pthread_cleanup_pop( 0 );
     pthread_mutex_unlock( &title_buffer.mutex );
@@ -8296,10 +8708,379 @@ static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native
     return status;
 }
 
-static void title_buffer_begin_mutation(void)
+static NTSTATUS title_buffer_flush_matching( enum title_buffer_match match, HANDLE handle,
+                                             uint64_t dev, uint64_t ino, int consume_error,
+                                             int native_worker, unsigned int reason )
+{
+    struct wine_ps5_title_lock lock;
+    NTSTATUS first_status = STATUS_SUCCESS, status;
+    uint64_t group_dev = dev, group_ino = ino;
+    unsigned int attempted = 0;
+    int have_group = match != TITLE_BUFFER_MATCH_ALL;
+
+    for (;;)
+    {
+        off_t highest_end = -1;
+        uint64_t sequence = 0;
+        int index = -1, seed;
+        unsigned int i;
+
+        title_buffer_lock( &lock );
+        if (!have_group)
+        {
+            seed = title_buffer_find_earliest_locked(
+                TITLE_BUFFER_MATCH_ALL, 0, 0, 0, attempted );
+            if (seed == -1) { title_buffer_unlock( &lock ); break; }
+            group_dev = title_buffer.runs[seed].dev;
+            group_ino = title_buffer.runs[seed].ino;
+            have_group = 1;
+        }
+        for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        {
+            struct title_buffer_run *run = &title_buffer.runs[i];
+            if ((attempted & (1u << i)) ||
+                !title_buffer_match_run( run, match, handle, dev, ino )) continue;
+            if (match == TITLE_BUFFER_MATCH_ALL &&
+                (run->dev != group_dev || run->ino != group_ino)) continue;
+            if (index == -1 || run->end > highest_end ||
+                (run->end == highest_end && run->sequence < sequence))
+            {
+                highest_end = run->end;
+                sequence = run->sequence;
+                index = i;
+            }
+        }
+        if (index == -1)
+        {
+            if (match == TITLE_BUFFER_MATCH_ALL)
+            {
+                have_group = 0;
+                title_buffer_unlock( &lock );
+                continue;
+            }
+            title_buffer_unlock( &lock );
+            break;
+        }
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush_run( index, sequence, handle, consume_error,
+                                         native_worker, reason );
+        attempted |= 1u << index;
+        if (status)
+        {
+            if (!first_status) first_status = status;
+            if (match != TITLE_BUFFER_MATCH_ALL) break;
+            title_buffer_lock( &lock );
+            for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+                if (title_buffer.runs[i].length &&
+                    title_buffer.runs[i].dev == group_dev &&
+                    title_buffer.runs[i].ino == group_ino)
+                    attempted |= 1u << i;
+            title_buffer_unlock( &lock );
+            have_group = 0;
+        }
+    }
+    return first_status;
+}
+
+static void title_buffer_begin_barrier( unsigned int reason, int invalidate )
+{
+    struct wine_ps5_title_lock lock;
+    title_buffer_lock( &lock );
+    title_buffer.barrier_count++;
+    if (invalidate) title_buffer_mutation_generation++;
+    while (title_buffer.barrier_active)
+    {
+        title_buffer_unlock( &lock );
+        usleep( 1000 );
+        title_buffer_lock( &lock );
+    }
+    title_buffer.barrier_active = 1;
+    title_buffer_diag_barrier_locked( reason );
+    title_buffer_unlock( &lock );
+}
+
+static void title_buffer_end_barrier(void)
+{
+    struct wine_ps5_title_lock lock;
+    title_buffer_lock( &lock );
+    title_buffer.barrier_active = 0;
+    title_buffer.barrier_count--;
+    title_buffer_unlock( &lock );
+}
+
+static NTSTATUS title_buffer_take_error( HANDLE caller, int consume_error )
+{
+    struct wine_ps5_title_lock lock;
+    NTSTATUS status = STATUS_SUCCESS;
+    unsigned int i;
+
+    if (!caller) return STATUS_SUCCESS;
+    title_buffer_lock( &lock );
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].pending_status &&
+            title_buffer.runs[i].error_handle == caller)
+        {
+            status = title_buffer.runs[i].pending_status;
+            if (consume_error) title_buffer.runs[i].pending_status = STATUS_SUCCESS;
+            break;
+        }
+    title_buffer_unlock( &lock );
+    return status;
+}
+
+static NTSTATUS title_buffer_flush_reason( HANDLE caller, int consume_error,
+                                           int native_worker, unsigned int reason )
+{
+    sigset_t previous;
+    NTSTATUS pending_status, flush_status;
+
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_barrier( reason, 1 );
+    pending_status = title_buffer_take_error( caller, consume_error );
+    flush_status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_ALL, caller, 0, 0,
+                                                consume_error, native_worker, reason );
+    title_buffer_end_barrier();
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return pending_status ? pending_status : flush_status;
+}
+static void title_buffer_note_reason( unsigned int reason )
 {
     struct wine_ps5_title_lock lock;
 
+    title_buffer_lock( &lock );
+    title_buffer_diag_barrier_locked( reason );
+    title_buffer_unlock( &lock );
+}
+static int title_buffer_handle_pending( HANDLE handle )
+{
+    struct wine_ps5_title_lock lock;
+    int found;
+
+    title_buffer_lock( &lock );
+    found = title_buffer_find_handle_locked( handle ) != -1;
+    title_buffer_unlock( &lock );
+    return found;
+}
+static int title_buffer_identity_pending( uint64_t dev, uint64_t ino )
+{
+    struct wine_ps5_title_lock lock;
+    int found;
+
+    title_buffer_lock( &lock );
+    found = title_buffer_find_identity_locked( dev, ino ) != -1;
+    title_buffer_unlock( &lock );
+    return found;
+}
+
+
+
+static int title_buffer_resolve_handle_identity( HANDLE handle, uint64_t *dev, uint64_t *ino )
+{
+    struct wine_ps5_title_lock lock;
+    struct stat st;
+    int fd, needs_close, index;
+    NTSTATUS status;
+
+    if (!handle) return 0;
+    title_buffer_lock( &lock );
+    index = title_buffer_find_handle_locked( handle );
+    if (index != -1)
+    {
+        *dev = title_buffer.runs[index].dev;
+        *ino = title_buffer.runs[index].ino;
+        title_buffer_unlock( &lock );
+        return 1;
+    }
+    title_buffer_unlock( &lock );
+
+    status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL );
+    if (status) return 0;
+    status = fstat( fd, &st ) || !S_ISREG( st.st_mode );
+    if (needs_close) close( fd );
+    if (status) return 0;
+    *dev = st.st_dev;
+    *ino = st.st_ino;
+    return 1;
+}
+
+static NTSTATUS title_buffer_flush_scoped_identity( HANDLE caller, uint64_t dev, uint64_t ino,
+                                                    unsigned int reason )
+{
+    sigset_t previous;
+    NTSTATUS pending_status, flush_status;
+
+    if (!title_buffer_identity_pending( dev, ino ))
+    {
+        title_buffer_note_reason( reason );
+        return title_buffer_take_error( caller, 1 );
+    }
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_barrier( reason, 1 );
+    pending_status = title_buffer_take_error( caller, 1 );
+    flush_status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, caller, dev, ino,
+                                                1, 0, reason );
+    title_buffer_end_barrier();
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return pending_status ? pending_status : flush_status;
+}
+static NTSTATUS title_buffer_flush_fd_reason( HANDLE handle, int fd, unsigned int reason )
+{
+    struct stat st;
+
+    if (fstat( fd, &st ) || !S_ISREG( st.st_mode ))
+    {
+        title_buffer_note_reason( reason );
+        return title_buffer_take_error( handle, 1 );
+    }
+    return title_buffer_flush_scoped_identity( handle, st.st_dev, st.st_ino, reason );
+}
+
+
+static NTSTATUS title_buffer_flush_scoped_handle( HANDLE handle, unsigned int reason )
+{
+    uint64_t dev, ino;
+
+    if (!title_buffer_resolve_handle_identity( handle, &dev, &ino ))
+    {
+        title_buffer_note_reason( reason );
+        return title_buffer_take_error( handle, 1 );
+    }
+    return title_buffer_flush_scoped_identity( handle, dev, ino, reason );
+}
+
+static NTSTATUS title_buffer_flush_path_reason( const char *path, unsigned int reason )
+{
+    struct stat st;
+
+    if (path && !stat( path, &st ) && S_ISREG( st.st_mode ))
+        return title_buffer_flush_scoped_identity( 0, st.st_dev, st.st_ino, reason );
+    if (path && wine_ps5_title_buffer_path(
+            path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) ))
+        return title_buffer_flush_reason( 0, 0, 0, reason );
+    title_buffer_note_reason( reason );
+    return STATUS_SUCCESS;
+}
+static int title_buffer_path_needs_mutation( const char *path )
+{
+    struct wine_ps5_title_lock lock;
+    struct stat st;
+    int found;
+
+    if (!path) return 0;
+    if (wine_ps5_title_buffer_path( path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) ))
+        return 1;
+    if (stat( path, &st ) || !S_ISREG( st.st_mode )) return 0;
+    title_buffer_lock( &lock );
+    found = title_buffer_find_identity_locked( st.st_dev, st.st_ino ) != -1;
+    title_buffer_unlock( &lock );
+    return found;
+}
+static int title_buffer_path_in_directory( const char *path, const char *directory )
+{
+    const char *slash;
+    size_t length;
+
+    if (!path || !directory || !(slash = strrchr( path, '/' ))) return 0;
+    length = strlen( directory );
+    while (length > 1 && directory[length - 1] == '/') length--;
+    if (length == 1 && directory[0] == '/') return slash == path;
+    return (size_t)(slash - path) == length && !memcmp( path, directory, length );
+}
+
+static NTSTATUS title_buffer_flush_directory_reason( const char *path, unsigned int reason )
+{
+    struct wine_ps5_title_lock lock;
+    NTSTATUS first_status = STATUS_SUCCESS, status;
+    uint64_t attempted_dev[WINE_PS5_TITLE_BUFFER_RUNS];
+    uint64_t attempted_ino[WINE_PS5_TITLE_BUFFER_RUNS];
+    unsigned int attempted_count = 0, i, j;
+    sigset_t previous;
+    int found = 0;
+
+    title_buffer_lock( &lock );
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].length &&
+            title_buffer_path_in_directory( title_buffer.runs[i].path, path ))
+        {
+            found = 1;
+            break;
+        }
+    title_buffer_unlock( &lock );
+    if (!found)
+    {
+        title_buffer_note_reason( reason );
+        return STATUS_SUCCESS;
+    }
+
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_barrier( reason, 1 );
+    for (;;)
+    {
+        uint64_t sequence = UINT64_MAX, dev = 0, ino = 0;
+        int index = -1;
+
+        title_buffer_lock( &lock );
+        for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        {
+            struct title_buffer_run *run = &title_buffer.runs[i];
+            int attempted = 0;
+
+            if (!run->length || !title_buffer_path_in_directory( run->path, path )) continue;
+            for (j = 0; j < attempted_count; j++)
+                if (attempted_dev[j] == run->dev && attempted_ino[j] == run->ino)
+                {
+                    attempted = 1;
+                    break;
+                }
+            if (attempted) continue;
+            if (run->sequence < sequence)
+            {
+                sequence = run->sequence;
+                dev = run->dev;
+                ino = run->ino;
+                index = i;
+            }
+        }
+        title_buffer_unlock( &lock );
+        if (index == -1) break;
+        attempted_dev[attempted_count] = dev;
+        attempted_ino[attempted_count++] = ino;
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, 0, dev, ino,
+                                              0, 0, reason );
+        if (status && !first_status) first_status = status;
+    }
+    title_buffer_end_barrier();
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return first_status;
+}
+
+
+
+static NTSTATUS title_buffer_flush_handle_runs( HANDLE handle, unsigned int reason )
+{
+    sigset_t previous;
+    NTSTATUS pending_status, flush_status;
+
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_barrier( reason, 1 );
+    pending_status = title_buffer_take_error( handle, 1 );
+    flush_status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0,
+                                                1, 0, reason );
+    title_buffer_end_barrier();
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return pending_status ? pending_status : flush_status;
+}
+
+
+static NTSTATUS title_buffer_flush( HANDLE caller, int consume_error, int native_worker )
+{
+    return title_buffer_flush_reason( caller, consume_error, native_worker,
+                                      WINE_PS5_TITLE_BUFFER_BARRIER_OTHER );
+}
+
+static void title_buffer_begin_mutation(void)
+{
+    struct wine_ps5_title_lock lock;
     title_buffer_lock( &lock );
     InterlockedIncrement( &title_buffer_mutations );
     title_buffer_mutation_generation++;
@@ -8309,186 +9090,313 @@ static void title_buffer_begin_mutation(void)
 static void title_buffer_end_mutation( void *arg )
 {
     struct wine_ps5_title_lock lock;
-
     (void)arg;
     title_buffer_lock( &lock );
     InterlockedDecrement( &title_buffer_mutations );
     title_buffer_unlock( &lock );
 }
+static void title_buffer_end_optional_mutation( void *arg )
+{
+    if (*(const int *)arg) title_buffer_end_mutation( NULL );
+}
+
 
 static int title_buffer_needs_path( HANDLE handle, LONG64 *generation )
 {
     struct wine_ps5_title_lock lock;
-    int need;
-
+    int index, need;
+retry:
     title_buffer_lock( &lock );
     title_buffer_wait_for_admission( &lock );
-    need = !title_buffer.length || title_buffer.handle != handle;
+    index = title_buffer_find_handle_locked( handle );
+    if (index != -1 && title_buffer.runs[index].flushing)
+    {
+        title_buffer_unlock( &lock );
+        usleep( 1000 );
+        goto retry;
+    }
+    need = index == -1;
     *generation = title_buffer_mutation_generation;
     title_buffer_unlock( &lock );
     return need;
 }
+
 static int title_buffer_resolve_start( HANDLE handle, int fd, int need_path,
                                        char **path, uint64_t *dev, uint64_t *ino )
 {
     struct stat fd_st, path_st;
-
     *dev = *ino = 0;
+#ifndef WINE_PS5_WRITE_BUFFER_DIAG
     if (!title_buffer_switch_enabled()) return 0;
+#endif
     if (!need_path) return 1;
     if (server_get_unix_name( handle, path ) || !*path) return 0;
     if (!wine_ps5_title_buffer_path( *path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) ))
         return 0;
-    if (fstat( fd, &fd_st ))
-    {
-        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "fstat", errno );
-        return 0;
-    }
-    if (!S_ISREG( fd_st.st_mode ))
-    {
-        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "non-regular", fd_st.st_mode );
-        return 0;
-    }
-    if (!wine_ps5_title_buffer_single_link( fd_st.st_nlink ))
-    {
-        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "hardlink", fd_st.st_nlink );
-        return 0;
-    }
-    if (stat( *path, &path_st ))
-    {
-        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "path-stat", errno );
-        return 0;
-    }
-    if (!wine_ps5_title_buffer_same_identity( fd_st.st_dev, fd_st.st_ino,
-                                              path_st.st_dev, path_st.st_ino ))
-    {
-        title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "identity", 0 );
-        return 0;
-    }
+    if (fstat( fd, &fd_st )) { title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "fstat", errno ); return 0; }
+    if (!S_ISREG( fd_st.st_mode )) { title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "non-regular", fd_st.st_mode ); return 0; }
+    if (!wine_ps5_title_buffer_single_link( fd_st.st_nlink )) { title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "hardlink", fd_st.st_nlink ); return 0; }
+    if (stat( *path, &path_st )) { title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "path-stat", errno ); return 0; }
+    if (!wine_ps5_title_buffer_same_identity( fd_st.st_dev, fd_st.st_ino, path_st.st_dev, path_st.st_ino ))
+    { title_buffer_log_state( &title_buffer_bypass_logged, "bypass", "identity", 0 ); return 0; }
     *dev = fd_st.st_dev;
     *ino = fd_st.st_ino;
     return 1;
 }
 
-static int title_buffer_maybe_continuation( HANDLE handle, size_t size,
-                                            const LARGE_INTEGER *offset )
+static int title_buffer_write_overlaps( const struct title_buffer_run *run,
+                                        off_t offset, size_t size )
 {
-    struct wine_ps5_title_lock lock;
-    int continuation;
+    uint64_t start, end;
 
-    if (!title_buffer_switch_enabled()) return 0;
-    title_buffer_lock( &lock );
-    title_buffer_wait_for_admission( &lock );
-    continuation = wine_ps5_title_buffer_admit(
-            InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 ),
-            InterlockedCompareExchange( &title_buffer_disabled, 0, 0 ), 1 ) &&
-        title_buffer.length && title_buffer.handle == handle &&
-        size <= WINE_PS5_TITLE_BUFFER_MAX - title_buffer.length &&
-        ((!offset || offset->QuadPart == FILE_USE_FILE_POINTER_POSITION) ||
-         (offset->QuadPart >= 0 && offset->QuadPart == title_buffer.end));
-    title_buffer_unlock( &lock );
-    return continuation;
+    if (offset < 0) return 1;
+    start = offset;
+    end = start + size;
+    if (end < start) return 1;
+    return start < (uint64_t)run->end && end > (uint64_t)run->start;
 }
-
 
 static NTSTATUS title_buffer_write( HANDLE handle, int fd, const void *bytes, size_t size,
                                     off_t offset, const char *path, uint64_t dev, uint64_t ino,
                                     LONG64 generation, int eligible, int *handled, off_t *new_pos )
 {
-    struct wine_ps5_title_buffer_state state;
-    enum wine_ps5_title_buffer_action action;
     struct wine_ps5_title_lock lock;
     NTSTATUS status;
-    int started = 0, new_fd;
+    int handle_index, identity_index, free_index, first_handle, append_index;
+    int capacity_index, overlap, identity_mismatch, noted = 0;
+    unsigned int handle_count;
+    off_t diag_eof = -1;
+    char retained_path[WB_MAX_PATH + 1];
+    const char *admission_path = path;
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    struct stat diag_st;
+#endif
 
     *handled = 0;
-    if (!size || !eligible || !title_buffer_switch_enabled() || !title_buffer_ensure())
-        return title_buffer_flush( handle, 1, 0 );
-
+#ifdef WINE_PS5_WRITE_BUFFER_DIAG
+    if (size && !fstat( fd, &diag_st )) diag_eof = diag_st.st_size;
+#endif
+    if (size && eligible)
+    {
+        title_buffer_lock( &lock );
+        handle_index = title_buffer_find_handle_locked( handle );
+        if (handle_index != -1)
+            title_buffer_diag_write_locked( handle, title_buffer.runs[handle_index].dev,
+                                            title_buffer.runs[handle_index].ino, size, offset,
+                                            diag_eof );
+        else
+            title_buffer_diag_write_locked( handle, dev, ino, size, offset, diag_eof );
+        title_buffer_unlock( &lock );
+        noted = 1;
+    }
+    if (!size || !title_buffer_switch_enabled() || !title_buffer_ensure() || !eligible)
+        return title_buffer_flush_reason( handle, 1, 0,
+                                          WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE );
+retry:
     title_buffer_lock( &lock );
     title_buffer_wait_for_admission( &lock );
-    if (title_buffer.pending_status && title_buffer.error_handle == handle)
+    if (InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 ) ||
+        InterlockedCompareExchange( &title_buffer_disabled, 0, 0 ))
     {
-        status = title_buffer.pending_status;
-        title_buffer.pending_status = STATUS_SUCCESS;
         title_buffer_unlock( &lock );
-        *handled = 1;
-        return status;
+        return title_buffer_flush_reason( handle, 1, 0,
+                                          WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE );
     }
-    state.handle = (uintptr_t)title_buffer.handle;
-    state.end = title_buffer.end;
-    state.length = title_buffer.length;
-    action = wine_ps5_title_buffer_decide( &state, (uintptr_t)handle, offset, size,
-        eligible && generation == title_buffer_mutation_generation &&
-        wine_ps5_title_buffer_admit(
-            InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 ),
-            InterlockedCompareExchange( &title_buffer_disabled, 0, 0 ),
-            title_buffer_switch_enabled() ) );
-    if (action == WINE_PS5_TITLE_BUFFER_FLUSH_DIRECT)
+    if (generation != title_buffer_mutation_generation)
     {
         title_buffer_unlock( &lock );
-        status = title_buffer_flush( handle, 1, 0 );
+        return title_buffer_flush_scoped_handle(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_OTHER );
+    }
+    for (free_index = 0; free_index < (int)WINE_PS5_TITLE_BUFFER_RUNS; free_index++)
+        if (title_buffer.runs[free_index].pending_status &&
+            title_buffer.runs[free_index].error_handle == handle)
+        {
+            status = title_buffer.runs[free_index].pending_status;
+            title_buffer.runs[free_index].pending_status = STATUS_SUCCESS;
+            title_buffer_unlock( &lock );
+            *handled = 1;
+            return status;
+        }
+    first_handle = append_index = capacity_index = -1;
+    handle_count = overlap = identity_mismatch = 0;
+    for (free_index = 0; free_index < (int)WINE_PS5_TITLE_BUFFER_RUNS; free_index++)
+    {
+        struct title_buffer_run *run = &title_buffer.runs[free_index];
+
+        if (!run->length || run->handle != handle) continue;
+        if (run->flushing) { title_buffer_unlock( &lock ); usleep( 1000 ); goto retry; }
+        if (first_handle == -1) first_handle = free_index;
+        handle_count++;
+        if (dev && ino && (run->dev != dev || run->ino != ino)) identity_mismatch = 1;
+        if (run->end == offset)
+        {
+            if (size <= WINE_PS5_TITLE_BUFFER_MAX - run->length) append_index = free_index;
+            else capacity_index = free_index;
+        }
+        if (title_buffer_write_overlaps( run, offset, size )) overlap = 1;
+    }
+    if (first_handle != -1)
+    {
+        dev = title_buffer.runs[first_handle].dev;
+        ino = title_buffer.runs[first_handle].ino;
+    }
+    if (first_handle != -1 && !admission_path)
+    {
+        strcpy( retained_path, title_buffer.runs[first_handle].path );
+        admission_path = retained_path;
+    }
+    if (first_handle != -1 && !noted)
+    {
+        struct title_buffer_run *run = &title_buffer.runs[first_handle];
+        title_buffer_diag_write_locked( handle, run->dev, run->ino, size, offset, diag_eof );
+        noted = 1;
+    }
+    if (identity_mismatch)
+    {
+        title_buffer_diag.other_identity++;
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0,
+                                              1, 0, WINE_PS5_TITLE_BUFFER_BARRIERS );
         if (status) *handled = 1;
         return status;
     }
-    if (action == WINE_PS5_TITLE_BUFFER_START)
+    if (overlap)
     {
-        if (!path || strlen( path ) > WB_MAX_PATH || (new_fd = dup( fd )) == -1)
-        {
-            title_buffer_unlock( &lock );
-            return STATUS_SUCCESS;
-        }
-        title_buffer.fd = new_fd;
-        title_buffer.handle = handle;
-        title_buffer.start = title_buffer.end = offset;
-        title_buffer.first_us = title_io_now_us();
-        title_buffer.dev = dev;
-        title_buffer.ino = ino;
-        strcpy( title_buffer.path, path );
-        started = 1;
-    }
-    if (virtual_uninterrupted_read_memory(
-        bytes, title_buffer.data[title_buffer.active] + title_buffer.length, size ) != size)
-    {
-        if (started)
-        {
-            close( title_buffer.fd );
-            title_buffer.fd = -1;
-            title_buffer.handle = 0;
-            title_buffer.start = title_buffer.end = 0;
-            title_buffer.first_us = 0;
-            title_buffer.dev = title_buffer.ino = 0;
-            title_buffer.path[0] = 0;
-        }
+        title_buffer_diag.noncontiguous++;
         title_buffer_unlock( &lock );
-        *handled = 1;
-        return STATUS_INVALID_USER_BUFFER;
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0,
+                                              1, 0, WINE_PS5_TITLE_BUFFER_BARRIERS );
+        if (status) *handled = 1;
+        return status;
     }
-    title_buffer.length += size;
-    title_buffer.end += size;
-    InterlockedIncrement64( &title_io_coalesced );
-    *new_pos = title_buffer.end;
-    title_buffer_unlock( &lock );
-    title_buffer_log_state( &title_buffer_enabled_logged, "enabled", "eligible", 0 );
-    *handled = 1;
-    return STATUS_SUCCESS;
+    if (append_index != -1)
+    {
+        struct title_buffer_run *run = &title_buffer.runs[append_index];
+
+        if (virtual_uninterrupted_read_memory( bytes, run->data + run->length, size ) != size)
+        { title_buffer_unlock( &lock ); *handled = 1; return STATUS_INVALID_USER_BUFFER; }
+        run->length += size;
+        run->end += size;
+        *new_pos = run->end;
+        InterlockedIncrement64( &title_io_coalesced );
+        title_buffer_unlock( &lock );
+        title_buffer_log_state( &title_buffer_enabled_logged, "enabled", "eligible", 0 );
+        *handled = 1;
+        return STATUS_SUCCESS;
+    }
+    if (capacity_index != -1)
+    {
+        uint64_t flush_dev = title_buffer.runs[capacity_index].dev;
+        uint64_t flush_ino = title_buffer.runs[capacity_index].ino;
+        title_buffer_diag.capacity++;
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, handle,
+                                              flush_dev, flush_ino, 1, 0,
+                                              WINE_PS5_TITLE_BUFFER_BARRIERS );
+        if (status) *handled = 1;
+        return status;
+    }
+    if (handle_count >= WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE)
+    {
+        title_buffer_diag.total_cap++;
+        title_buffer_diag.handle_evictions++;
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0,
+                                              1, 0, WINE_PS5_TITLE_BUFFER_BARRIERS );
+        if (status) { *handled = 1; return status; }
+        goto retry;
+    }
+    if (!noted)
+    {
+        title_buffer_diag_write_locked( handle, dev, ino, size, offset, diag_eof );
+        noted = 1;
+    }
+    if (!handle_count)
+    {
+        identity_index = title_buffer_find_identity_locked( dev, ino );
+        if (identity_index != -1)
+        {
+            title_buffer_diag.other_identity++;
+            title_buffer_unlock( &lock );
+            status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, handle, dev, ino,
+                                                  1, 0, WINE_PS5_TITLE_BUFFER_BARRIERS );
+            if (status) { *handled = 1; return status; }
+            goto retry;
+        }
+    }
+    if (size > WINE_PS5_TITLE_BUFFER_MAX)
+    {
+        title_buffer_diag.capacity++;
+        title_buffer_unlock( &lock );
+        return STATUS_SUCCESS;
+    }
+    if (title_buffer_pending_count_locked() > handle_count)
+        title_buffer_diag.other_handle++;
+    free_index = title_buffer_find_free_locked();
+    if (free_index == -1)
+    {
+        int oldest = title_buffer_find_earliest_locked( TITLE_BUFFER_MATCH_ALL, 0, 0, 0, 0 );
+        uint64_t flush_dev = title_buffer.runs[oldest].dev;
+        uint64_t flush_ino = title_buffer.runs[oldest].ino;
+        title_buffer_diag.total_cap++;
+        title_buffer_diag.global_evictions++;
+        title_buffer_unlock( &lock );
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, 0,
+                                              flush_dev, flush_ino, 0, 0,
+                                              WINE_PS5_TITLE_BUFFER_BARRIERS );
+        if (status) { *handled = 1; return status; }
+        goto retry;
+    }
+    else
+    {
+        struct title_buffer_run *run = &title_buffer.runs[free_index];
+        const char *run_path = admission_path;
+        int new_fd;
+
+        if (!run_path || strlen( run_path ) > WB_MAX_PATH || (new_fd = dup( fd )) == -1)
+        { title_buffer_unlock( &lock ); return STATUS_SUCCESS; }
+        run->handle = handle;
+        run->fd = new_fd;
+        run->start = run->end = offset;
+        run->first_us = title_io_now_us();
+        run->sequence = title_buffer.next_sequence++;
+        run->dev = dev;
+        run->ino = ino;
+        strcpy( run->path, run_path );
+        if (virtual_uninterrupted_read_memory( bytes, run->data, size ) != size)
+        {
+            close( run->fd );
+            title_buffer_clear_run_locked( run );
+            title_buffer_unlock( &lock );
+            *handled = 1;
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        run->length = size;
+        title_buffer_diag.extents_opened++;
+        run->end += size;
+        *new_pos = run->end;
+        InterlockedIncrement64( &title_io_coalesced );
+        title_buffer_unlock( &lock );
+        title_buffer_log_state( &title_buffer_enabled_logged, "enabled", "eligible", 0 );
+        *handled = 1;
+        return STATUS_SUCCESS;
+    }
 }
 
 static NTSTATUS title_buffer_disable_for_link(void)
 {
     struct wine_ps5_title_lock lock;
-
     title_buffer_lock( &lock );
     InterlockedExchange( &title_buffer_disabled, 1 );
     title_buffer_unlock( &lock );
     title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "link-create", 0 );
-    return title_buffer_flush( 0, 0, 0 );
+    return title_buffer_flush_reason( 0, 0, 0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
 }
 
 NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory )
 {
     struct wine_ps5_title_lock lock;
-
     if (!wine_ps5_title_buffer_rename_may_enter_scope(
             path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ), directory ))
         return STATUS_SUCCESS;
@@ -8496,12 +9404,60 @@ NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory )
     InterlockedExchange( &title_buffer_disabled, 1 );
     title_buffer_unlock( &lock );
     title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "rename-scope", 0 );
-    return title_buffer_flush( 0, 0, 0 );
+    return title_buffer_flush_reason( 0, 0, 0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
 }
+
+static NTSTATUS title_buffer_fence_nonfile( HANDLE handle, int regular_file )
+{
+    if (regular_file) return STATUS_SUCCESS;
+    return title_buffer_flush_reason( handle, 1, 0,
+                                      WINE_PS5_TITLE_BUFFER_EVENT_NONFILE_WRITE );
+}
+
+NTSTATUS ps5_title_flush_coalesced_write_reason( HANDLE handle, unsigned int reason )
+{
+    switch (reason)
+    {
+    case WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_SECTION:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE:
+        return title_buffer_flush_reason( handle, 1, 0, reason );
+    case WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL:
+        if (title_buffer_handle_pending( handle ))
+            return title_buffer_flush_scoped_handle( handle, reason );
+        title_buffer_note_reason( reason );
+        return title_buffer_take_error( handle, 1 );
+    case WINE_PS5_TITLE_BUFFER_BARRIER_CREATE_OPEN:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_ATTRIBUTES:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME:
+    case WINE_PS5_TITLE_BUFFER_BARRIER_VIRTUAL:
+    case WINE_PS5_TITLE_BUFFER_EVENT_CLOSE_UNRELATED:
+        title_buffer_note_reason( reason );
+        return title_buffer_take_error( handle, 1 );
+    default:
+        return title_buffer_flush_scoped_handle( handle, reason );
+    }
+}
+static NTSTATUS title_buffer_device_control_barrier( HANDLE handle, int identity_sensitive )
+{
+    if (identity_sensitive)
+        return title_buffer_flush_scoped_handle(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL );
+    return ps5_title_flush_coalesced_write_reason(
+        handle, WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL );
+}
+
 
 NTSTATUS ps5_title_flush_coalesced_write( HANDLE handle )
 {
-    return title_buffer_flush( handle, 1, 0 );
+    return ps5_title_flush_coalesced_write_reason( handle, WINE_PS5_TITLE_BUFFER_BARRIER_VIRTUAL );
+}
+
+NTSTATUS ps5_title_flush_all_coalesced_writes_reason( unsigned int reason )
+{
+    return title_buffer_flush_reason( 0, 0, 0, reason );
 }
 
 NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags )
@@ -8510,22 +9466,18 @@ NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags )
     NTSTATUS status;
     char *path = NULL;
     int resolved, scoped = 0, disable;
-
-    if (sec_flags & SEC_IMAGE) return title_buffer_flush( handle, 1, 0 );
+    if (sec_flags & SEC_IMAGE)
+        return title_buffer_flush_reason( handle, 1, 0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
     resolved = !server_get_unix_name( handle, &path ) && path;
-    if (resolved)
-        scoped = wine_ps5_title_buffer_path(
-            path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) );
-
+    if (resolved) scoped = wine_ps5_title_buffer_path(
+        path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) );
     title_buffer_lock( &lock );
     disable = wine_ps5_title_buffer_disable_for_section( 0, resolved, scoped );
     if (disable) InterlockedExchange( &title_buffer_disabled, 1 );
     title_buffer_unlock( &lock );
-    if (disable)
-        title_buffer_log_state( &title_buffer_disabled_logged, "disabled",
-                                resolved ? "section-scoped" : "section-unresolved", 0 );
-
-    status = title_buffer_flush( handle, 1, 0 );
+    if (disable) title_buffer_log_state( &title_buffer_disabled_logged, "disabled",
+                                         resolved ? "section-scoped" : "section-unresolved", 0 );
+    status = title_buffer_flush_reason( handle, 1, 0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
     free( path );
     return status;
 }
@@ -8533,16 +9485,48 @@ NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags )
 NTSTATUS ps5_title_close_coalesced_write( HANDLE handle )
 {
     struct wine_ps5_title_lock lock;
-    NTSTATUS status = title_buffer_flush( handle, 1, 0 );
+    NTSTATUS status;
+    unsigned int i;
+    int owner = 0;
 
     title_buffer_lock( &lock );
-    title_buffer_wait_for_flush( &lock );
-    if (title_buffer.handle == handle)
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].handle == handle ||
+            title_buffer.runs[i].error_handle == handle)
+        {
+            owner = 1;
+            break;
+        }
+    title_buffer_unlock( &lock );
+    if (owner)
+        status = title_buffer_flush_handle_runs( handle, WINE_PS5_TITLE_BUFFER_BARRIER_CLOSE );
+    else
     {
-        title_buffer.handle = 0;
-        title_buffer.error_handle = 0;
-        title_buffer.pending_status = STATUS_SUCCESS; /* close already reported it */
+        title_buffer_note_reason( WINE_PS5_TITLE_BUFFER_EVENT_CLOSE_UNRELATED );
+        status = STATUS_SUCCESS;
     }
+#ifdef WINE_PS5_WRITE_BUFFER_TEST
+    title_buffer_test_close_hook( handle );
+#endif
+retry:
+    title_buffer_lock( &lock );
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if ((title_buffer.runs[i].handle == handle ||
+             title_buffer.runs[i].error_handle == handle) &&
+            title_buffer.runs[i].flushing)
+        {
+            title_buffer_unlock( &lock );
+            usleep( 1000 );
+            goto retry;
+        }
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].handle == handle ||
+            title_buffer.runs[i].error_handle == handle)
+        {
+            title_buffer.runs[i].handle = 0;
+            title_buffer.runs[i].error_handle = 0;
+            title_buffer.runs[i].pending_status = STATUS_SUCCESS;
+        }
     title_buffer_unlock( &lock );
     return status;
 }
@@ -8552,34 +9536,77 @@ void ps5_title_stop_coalesced_writes(void)
     InterlockedExchange( &title_buffer_shutdown, 1 );
 }
 
+static NTSTATUS title_buffer_flush_idle_due( uint64_t now, int native_worker )
+{
+    struct wine_ps5_title_lock lock;
+    NTSTATUS first_status = STATUS_SUCCESS, status;
+    uint64_t attempted_dev[WINE_PS5_TITLE_BUFFER_RUNS];
+    uint64_t attempted_ino[WINE_PS5_TITLE_BUFFER_RUNS];
+    unsigned int attempted_count = 0;
+
+    for (;;)
+    {
+        uint64_t earliest = UINT64_MAX, dev = 0, ino = 0;
+        int index = -1;
+        unsigned int i, j;
+
+        title_buffer_lock( &lock );
+        for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        {
+            struct title_buffer_run *run = &title_buffer.runs[i];
+            int attempted = 0;
+
+            if (!wine_ps5_title_buffer_idle( run->length, run->first_us, now )) continue;
+            for (j = 0; j < attempted_count; j++)
+                if (attempted_dev[j] == run->dev && attempted_ino[j] == run->ino)
+                {
+                    attempted = 1;
+                    break;
+                }
+            if (attempted) continue;
+            if (run->sequence < earliest)
+            {
+                earliest = run->sequence;
+                dev = run->dev;
+                ino = run->ino;
+                index = i;
+            }
+        }
+        if (index != -1) title_buffer_diag.idle++;
+        title_buffer_unlock( &lock );
+        if (index == -1) break;
+        attempted_dev[attempted_count] = dev;
+        attempted_ino[attempted_count++] = ino;
+        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, 0, dev, ino,
+                                              0, native_worker,
+                                              WINE_PS5_TITLE_BUFFER_BARRIERS );
+        if (status && !first_status) first_status = status;
+    }
+    return first_status;
+}
+
 void ps5_title_flush_all_coalesced_writes(void)
 {
     struct wine_ps5_title_lock lock;
     NTSTATUS status;
-    int retry = 0, current_flusher, current_worker;
-
+    int current_flusher = 0, current_worker;
+    unsigned int i;
     ps5_title_stop_coalesced_writes();
     title_buffer_lock( &lock );
-    current_flusher = title_buffer.flushing_thread_valid &&
-                      (uintptr_t)title_buffer.flushing_thread == (uintptr_t)pthread_self();
+    for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
+        if (title_buffer.runs[i].flushing_thread_valid &&
+            (uintptr_t)title_buffer.runs[i].flushing_thread == (uintptr_t)pthread_self())
+            current_flusher = 1;
     title_buffer_unlock( &lock );
     current_worker = InterlockedCompareExchange( &title_buffer_ready, 0, 0 ) &&
                      (uintptr_t)title_buffer_thread_id == (uintptr_t)pthread_self();
-    if (current_flusher || current_worker) return; /* cleanup drains after pthread_exit */
+    if (current_flusher || current_worker) return;
     if (InterlockedCompareExchange( &title_buffer_ready, 0, 0 ) &&
         !InterlockedExchange( &title_buffer_joined, 1 ))
         pthread_join( title_buffer_thread_id, NULL );
-
-    title_buffer_lock( &lock );
-    title_buffer_wait_for_flush( &lock );
-    if (title_buffer.pending_status)
-    {
-        title_buffer.pending_status = STATUS_SUCCESS;
-        retry = title_buffer.length != 0;
-    }
-    title_buffer_unlock( &lock );
-    status = title_buffer_flush( 0, 0, 2 );
-    if (status && !retry) status = title_buffer_flush( 0, 0, 2 );
+    status = title_buffer_flush_reason( 0, 0, 2, WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS );
+    if (status) status = title_buffer_flush_reason(
+        0, 0, 2, WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS );
     if (status)
         sceKernelDebugOutText( 0, "wine: title write buffer shutdown retry failed; bytes retained\n" );
 }
@@ -8587,30 +9614,35 @@ void ps5_title_flush_all_coalesced_writes(void)
 static void *title_buffer_thread( void *arg )
 {
     NTSTATUS status;
-
     (void)arg;
     for (;;)
     {
-        struct wine_ps5_title_lock lock;
-        int due, stopping;
-
+        int stopping;
         usleep( 10000 );
-        title_buffer_lock( &lock );
-        title_buffer_wait_for_flush( &lock );
         stopping = InterlockedCompareExchange( &title_buffer_shutdown, 0, 0 );
-        due = wine_ps5_title_buffer_idle(
-            title_buffer.length, title_buffer.first_us, title_io_now_us() );
-        title_buffer_unlock( &lock );
-        if (due) (void)title_buffer_flush( 0, 0, stopping ? 2 : 1 );
+        (void)title_buffer_flush_idle_due( title_io_now_us(), stopping ? 2 : 1 );
         if (stopping) break;
     }
-    status = title_buffer_flush( 0, 0, 2 );
-    if (status) status = title_buffer_flush( 0, 0, 2 );
+    status = title_buffer_flush_reason( 0, 0, 2, WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS );
+    if (status) status = title_buffer_flush_reason(
+        0, 0, 2, WINE_PS5_TITLE_BUFFER_BARRIER_PROCESS );
     if (status)
         sceKernelDebugOutText( 0, "wine: title write buffer native shutdown retry failed; bytes retained\n" );
     return NULL;
 }
-/* WINE_PS5_SINGLE_BUFFER_TEST_END */
+
+#ifdef WINE_PS5_WRITE_BUFFER_TEST
+static unsigned int title_buffer_test_pending_count(void)
+{
+    struct wine_ps5_title_lock lock;
+    unsigned int count;
+    title_buffer_lock( &lock );
+    count = title_buffer_pending_count_locked();
+    title_buffer_unlock( &lock );
+    return count;
+}
+#endif
+/* WINE_PS5_MULTI_BUFFER_TEST_END */
 #endif
 
 
@@ -8645,7 +9677,8 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
 
     if (!io) return STATUS_ACCESS_VIOLATION;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_READ ))) return status;
 #endif
 
 #ifdef __PROSPERO__
@@ -8939,7 +9972,8 @@ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
     if (!io) return STATUS_ACCESS_VIOLATION;
 #ifdef __PROSPERO__
     title_write_trace_op_begin( file, WINE_PS5_WRITE_TRACE_READ );
-    if ((status = ps5_title_flush_coalesced_write( file ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            file, WINE_PS5_TITLE_BUFFER_BARRIER_READ ))) return status;
 #endif
 
     status = server_get_unix_fd( file, FILE_READ_DATA, &unix_handle, &needs_close, &type, &options );
@@ -9033,11 +10067,6 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 
     if (!io) return STATUS_ACCESS_VIOLATION;
 
-#ifdef __PROSPERO__
-    if (!title_buffer_maybe_continuation( handle, length, offset ) &&
-        (status = ps5_title_flush_coalesced_write( handle )))
-        return status;
-#endif
     status = server_get_unix_fd( handle, FILE_WRITE_DATA, &unix_handle, &needs_close, &type, &options );
     if (status == STATUS_ACCESS_DENIED)
     {
@@ -9059,7 +10088,16 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
     }
 
     if (status == STATUS_BAD_DEVICE_TYPE)
+    {
+#ifdef __PROSPERO__
+        if ((status = ps5_title_flush_coalesced_write_reason(
+                handle, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE ))) return status;
+#endif
         return server_write_file( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    }
+#ifdef __PROSPERO__
+    if ((status = title_buffer_fence_nonfile( handle, type == FD_TYPE_FILE ))) goto done;
+#endif
 
     if (type == FD_TYPE_FILE)
     {
@@ -9084,7 +10122,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             {
                 struct stat st;
 #ifdef __PROSPERO__
-                if ((status = ps5_title_flush_coalesced_write( handle ))) goto done;
+                if ((status = ps5_title_flush_coalesced_write_reason(
+                        handle, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE ))) goto done;
 #endif
 
                 if (fstat( unix_handle, &st ) == -1)
@@ -9114,7 +10153,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
                 free( buffer_path );
                 buffer_path = NULL;
             }
-            else status = ps5_title_flush_coalesced_write( handle );
+            else status = ps5_title_flush_coalesced_write_reason(
+                handle, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE );
             if (status) goto done;
             if (coalesced) result = length;
             else while ((result = title_file_pwrite( handle, unix_handle, buffer, length, off )) == -1)
@@ -9175,7 +10215,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
         }
 #endif
 #ifdef __PROSPERO__
-        if ((status = ps5_title_flush_coalesced_write( handle ))) goto done;
+        if ((status = ps5_title_flush_coalesced_write_reason(
+                handle, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE ))) goto done;
 #endif
     }
     else if (type == FD_TYPE_SERIAL || type == FD_TYPE_DEVICE)
@@ -9342,7 +10383,8 @@ NTSTATUS WINAPI NtWriteFileGather( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
     if (length % page_size) return STATUS_INVALID_PARAMETER;
     if (!io) return STATUS_ACCESS_VIOLATION;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( file ))) return status;
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            file, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE ))) return status;
 #endif
 
     status = server_get_unix_fd( file, FILE_WRITE_DATA, &unix_handle, &needs_close, &type, &options );
@@ -9430,7 +10472,10 @@ NTSTATUS WINAPI NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUT
     if (HandleToLong( handle ) == ~0)
         return STATUS_INVALID_HANDLE;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle ))) return status;
+    if ((status = title_buffer_device_control_barrier(
+            handle, device == FILE_DEVICE_DISK || device == FILE_DEVICE_CD_ROM ||
+                    device == FILE_DEVICE_DVD || device == FILE_DEVICE_CONTROLLER ||
+                    device == FILE_DEVICE_MASS_STORAGE ))) return status;
 #endif
 
     switch (device)
@@ -9537,13 +10582,24 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
            in_buffer, in_size, out_buffer, out_size );
 
     if (!io) return STATUS_INVALID_PARAMETER;
-#ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle ))) return status;
-#endif
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options );
     if (status && status != STATUS_BAD_DEVICE_TYPE)
         return status;
+#ifdef __PROSPERO__
+    {
+        NTSTATUS flush_status = status
+            ? ps5_title_flush_coalesced_write_reason(
+                  handle, WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL )
+            : title_buffer_flush_fd_reason(
+                  handle, fd, WINE_PS5_TITLE_BUFFER_BARRIER_CONTROL );
+        if (flush_status)
+        {
+            if (!status && needs_close) close( fd );
+            return flush_status;
+        }
+    }
+#endif
     if (needs_close) close( fd );
 
     ignore_server_ioctl_struct_holes( code, in_buffer, in_size );
@@ -9657,7 +10713,8 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
     if (!io || !virtual_check_buffer_for_write( io, sizeof(*io) )) return STATUS_ACCESS_VIOLATION;
 #ifdef __PROSPERO__
     trace_started = title_write_trace_op_begin( handle, WINE_PS5_WRITE_TRACE_FLUSH );
-    if ((ret = ps5_title_flush_coalesced_write( handle )))
+    if ((ret = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH )))
     {
         title_write_trace_op_end( handle, WINE_PS5_WRITE_TRACE_FLUSH, trace_started, ret, flags );
         return io->Status = ret;
@@ -9766,7 +10823,8 @@ NTSTATUS WINAPI NtCancelIoFile( HANDLE handle, IO_STATUS_BLOCK *io_status )
     TRACE( "%p %p\n", handle, io_status );
 #ifdef __PROSPERO__
     {
-        NTSTATUS status = ps5_title_flush_coalesced_write( handle );
+        NTSTATUS status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL );
         if (status) return status;
     }
 #endif
@@ -9783,7 +10841,8 @@ NTSTATUS WINAPI NtCancelIoFileEx( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_
     TRACE( "%p %p %p\n", handle, io, io_status );
 #ifdef __PROSPERO__
     {
-        NTSTATUS status = ps5_title_flush_coalesced_write( handle );
+        NTSTATUS status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL );
         if (status) return status;
     }
 #endif
@@ -9804,7 +10863,8 @@ NTSTATUS WINAPI NtCancelSynchronousIoFile( HANDLE handle, IO_STATUS_BLOCK *io, I
 
     TRACE( "(%p %p %p)\n", handle, io, io_status );
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_CANCEL )))
         return io_status->Status = status;
 #endif
 
@@ -9833,7 +10893,8 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
     HANDLE handle;
     BOOLEAN async;
 #ifdef __PROSPERO__
-    if ((ret = ps5_title_flush_coalesced_write( file ))) return ret;
+    if ((ret = ps5_title_flush_coalesced_write_reason(
+            file, WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH ))) return ret;
 #endif
 
     if (apc || io_status || key)
@@ -9894,7 +10955,8 @@ NTSTATUS WINAPI NtUnlockFile( HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_I
     TRACE( "%p %p %s %s\n",
            handle, io_status, wine_dbgstr_longlong(offset->QuadPart), wine_dbgstr_longlong(count->QuadPart) );
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_LOCK_FLUSH )))
         return io_status->Status = status;
 #endif
 
@@ -10016,7 +11078,8 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
 
     if (!iosb) return STATUS_ACCESS_VIOLATION;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_DIRECTORY )))
         return iosb->Status = status;
 #endif
     if (filter == 0 || (filter & ~FILE_NOTIFY_ALL)) return STATUS_INVALID_PARAMETER;
@@ -10261,8 +11324,15 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
     int fd, needs_close;
     unsigned int status;
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
-        return io->Status = status;
+    if (info_class == FileFsSizeInformation ||
+        info_class == FileFsFullSizeInformation ||
+        info_class == FileFsFullSizeInformationEx)
+        status = ps5_title_flush_all_coalesced_writes_reason(
+            WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME );
+    else
+        status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME );
+    if (status) return io->Status = status;
 #endif
 
     status = server_get_unix_fd( handle, 0, &fd, &needs_close, &fd_type, NULL );
@@ -10520,7 +11590,8 @@ NTSTATUS WINAPI NtSetVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io, 
 {
 #ifdef __PROSPERO__
     NTSTATUS status;
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_VOLUME )))
         return io->Status = status;
 #endif
     FIXME( "(%p,%p,%p,0x%08x,0x%08x) stub\n", handle, io, info, length, class );
@@ -10541,7 +11612,8 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
     FIXME( "(%p,%p,%p,%d,%d,%p,%d,%p,%d) semi-stub\n",
            handle, io, buffer, length, single_entry, list, list_len, index, restart );
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_QUERY )))
         return io->Status = status;
 #endif
 
@@ -10566,7 +11638,8 @@ NTSTATUS WINAPI NtSetEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, U
 #endif
     FIXME( "(%p,%p,%p,%d) stub\n", handle, io, buffer, length );
 #ifdef __PROSPERO__
-    if ((status = ps5_title_flush_coalesced_write( handle )))
+    if ((status = ps5_title_flush_coalesced_write_reason(
+            handle, WINE_PS5_TITLE_BUFFER_BARRIER_QUERY )))
         return io->Status = status;
 #endif
     return STATUS_ACCESS_DENIED;
