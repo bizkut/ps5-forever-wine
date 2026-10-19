@@ -97,4 +97,37 @@ static inline void send_text( const struct ps5_desktop_text *text )
         NtUserSendHardwareInput( 0, SEND_HWMSG_NO_RAW, &input, 0 );
     }
 }
+
+static inline void post_voice_key( HWND target, unsigned int usage )
+{
+    LPARAM lparam = 1 | (hid_keys[usage].scan << 16);
+    NtUserPostMessage( target, WM_KEYDOWN, hid_keys[usage].vkey, lparam );
+    NtUserPostMessage( target, WM_KEYUP, hid_keys[usage].vkey, lparam | 0xc0000000u );
+}
+
+/* The caller validates the complete frame before reading it. Both input
+ * drains serialize dispatch, so the entire edit is posted before the next
+ * batch or hardware event. server/queue.c reads posted messages before
+ * hardware input. Never send these controls through send_key(), or text
+ * can overtake them even when the native producer kept perfect FIFO order.
+ *
+ * Preserve control key messages: WM_CHAR alone is not an Enter/Escape key
+ * press. Text is already committed, so do not send VK_PACKET too; WoW
+ * does not TranslateMessage those keys and would lose the characters. */
+static inline void send_voice_edit( const struct ps5_desktop_voice_edit *edit )
+{
+    HWND foreground = NtUserGetForegroundWindow(), target;
+    GUITHREADINFO info = {.cbSize = sizeof(info)};
+    DWORD thread = HandleToULong( NtUserQueryWindow( foreground, WindowThread ));
+    unsigned int i;
+
+    target = foreground && thread && NtUserGetGUIThreadInfo( thread, &info ) ? info.hwndFocus : 0;
+    if (!target) return;
+    if (edit->flags & PS5_DESKTOP_VOICE_ESCAPE_BEFORE) post_voice_key( target, 0x29 );
+    if (edit->flags & PS5_DESKTOP_VOICE_ENTER_BEFORE) post_voice_key( target, 0x28 );
+    for (i = 0; i < edit->erase; i++) post_voice_key( target, 0x2a );
+    for (i = 0; i < edit->length; i++) NtUserPostMessage( target, WM_CHAR, edit->text[i], 1 );
+    if (edit->flags & PS5_DESKTOP_VOICE_ENTER_AFTER) post_voice_key( target, 0x28 );
+    if (edit->flags & PS5_DESKTOP_VOICE_ESCAPE_AFTER) post_voice_key( target, 0x29 );
+}
 #endif

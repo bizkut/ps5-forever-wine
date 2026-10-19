@@ -109,6 +109,21 @@ To see compile configuration options, do `./configure --help`.
 
 For more information, see https://gitlab.winehq.org/wine/wine/-/wikis/Building-Wine
 
+The PS5 title's WoW voice input uses `PS5_DESKTOP_VOICE_EDIT` from
+`include/wine/ps5_desktop.h`. Each bounded edit posts control key taps and
+committed UTF-16 characters to one focused-window FIFO, instead of mixing
+hardware keys with posted text. This preserves the order of voice edits and
+later hardware input in the normal unfiltered message pump. It deliberately
+uses WoW's direct `WM_CHAR` path, not `VK_PACKET` translation; it is not a
+general-purpose IME or an input-state replacement. The standalone host
+regression tests the wire bounds, focus snapshot, control scan codes and
+posted-message ordering without logging speech:
+
+```
+cc -std=c11 -Wall -Wextra -Werror -Iinclude loader/tests/ps5_input.c -o /tmp/ps5_input_test
+/tmp/ps5_input_test
+```
+
 
 ## SETUP
 

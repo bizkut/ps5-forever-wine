@@ -76,6 +76,8 @@ enum ps5_desktop_type
     /* driver -> title */
     PS5_DESKTOP_TEXT_INPUT,     /* struct ps5_desktop_text_input: a text field took or lost the focus */
     PS5_DESKTOP_CURSOR_SHAPE,   /* struct ps5_desktop_cursor_shape: image or app-hidden cursor */
+    /* title -> hub -> input sink, or directly into the GPU parent's win32u */
+    PS5_DESKTOP_VOICE_EDIT,     /* struct ps5_desktop_voice_edit: one ordered WoW chat edit */
 };
 
 struct ps5_desktop_header
@@ -217,6 +219,45 @@ struct ps5_desktop_text
     uint32_t length;            /* UTF-16 units that follow */
     uint16_t text[];            /* header.size = sizeof(struct ps5_desktop_text) + 2 * length */
 };
+
+/* Voice chat uses WM_KEYDOWN/WM_KEYUP for controls and WM_CHAR for text.
+ * These must all enter the same posted-message FIFO: mixing hardware keys
+ * with posted text lets wineserver deliver text before the controls.
+ *
+ * One edit targets a snapshot of the foreground thread's focused window.
+ * Order: Escape-before, Enter-before, erase Backspace taps, UTF-16 text,
+ * Enter-after, Escape-after. Erase counts key taps, not UTF-16 units.
+ * This is the WoW message path, not a general SendInput/IME replacement:
+ * WoW consumes the characters directly without translating packet keys. */
+#define PS5_DESKTOP_VOICE_ESCAPE_BEFORE 0x01u
+#define PS5_DESKTOP_VOICE_ENTER_BEFORE  0x02u
+#define PS5_DESKTOP_VOICE_ENTER_AFTER   0x04u
+#define PS5_DESKTOP_VOICE_ESCAPE_AFTER  0x08u
+#define PS5_DESKTOP_VOICE_FLAGS        0x0fu
+#define PS5_DESKTOP_VOICE_MAX_ERASE    PS5_DESKTOP_MAX_TEXT
+
+struct ps5_desktop_voice_edit
+{
+    struct ps5_desktop_header header;
+    uint32_t flags;
+    uint32_t erase;
+    uint32_t length;            /* UTF-16 units that follow, at most PS5_DESKTOP_MAX_TEXT */
+    uint16_t text[];            /* header.size = sizeof(prefix) + 2 * length */
+};
+
+#define PS5_DESKTOP_VOICE_MAX_MESSAGE (sizeof(struct ps5_desktop_voice_edit) + \
+                                      PS5_DESKTOP_MAX_TEXT * sizeof(uint16_t))
+
+static inline int ps5_desktop_voice_edit_valid( const void *message, size_t size )
+{
+    struct ps5_desktop_voice_edit edit;
+    if (size < sizeof(edit)) return 0;
+    memcpy( &edit, message, sizeof(edit) );
+    return edit.header.type == PS5_DESKTOP_VOICE_EDIT && edit.header.size == size &&
+           !(edit.flags & ~PS5_DESKTOP_VOICE_FLAGS) &&
+           edit.erase <= PS5_DESKTOP_VOICE_MAX_ERASE && edit.length <= PS5_DESKTOP_MAX_TEXT &&
+           size == sizeof(edit) + edit.length * sizeof(uint16_t);
+}
 
 /* Sent when the title connects and whenever wineserver starts or exits. A
  * session's first process may end long before the session does (a launcher

@@ -76,7 +76,7 @@ static union
     struct ps5_desktop_key key;
     struct ps5_desktop_hello hello;
     uint64_t alignment;
-    unsigned char bytes[sizeof(struct ps5_desktop_text) + PS5_DESKTOP_MAX_TEXT * sizeof(uint16_t)];
+    unsigned char bytes[PS5_DESKTOP_VOICE_MAX_MESSAGE];
 } input_event;
 static unsigned int input_size;
 
@@ -483,6 +483,11 @@ static BOOL PS5_ProcessEvents( DWORD mask )
             if (input_event.header.size >= sizeof(*text) && text->length <= PS5_DESKTOP_MAX_TEXT &&
                 input_event.header.size == sizeof(*text) + text->length * sizeof(text->text[0]))
                 send_text( text );
+            else connection_lost();
+            break;
+        case PS5_DESKTOP_VOICE_EDIT:
+            if (ps5_desktop_voice_edit_valid( input_event.bytes, input_event.header.size ))
+                send_voice_edit( (const struct ps5_desktop_voice_edit *)input_event.bytes );
             else connection_lost();
             break;
         default:

@@ -11,7 +11,7 @@ union ps5_title_input
     struct ps5_desktop_header header;
     struct ps5_desktop_mouse mouse;
     struct ps5_desktop_key key;
-    unsigned char bytes[sizeof(struct ps5_desktop_text) + PS5_DESKTOP_MAX_TEXT * sizeof(uint16_t)];
+    unsigned char bytes[PS5_DESKTOP_VOICE_MAX_MESSAGE];
 };
 /* Returns one framed protocol event, 0 when empty. Cursor coordinates are
  * desktop pixels; the producer uses them to rebase the pad's absolute pointer.

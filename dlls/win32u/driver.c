@@ -928,6 +928,11 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
             ps5_post_text_chars( text );
             break;
         }
+        case PS5_DESKTOP_VOICE_EDIT:
+            if (event.header.size <= sizeof(event) &&
+                ps5_desktop_voice_edit_valid( &event, event.header.size ))
+                send_voice_edit( (const struct ps5_desktop_voice_edit *)&event );
+            break;
         case PS5_DESKTOP_MOUSE:
         {
             const struct ps5_desktop_mouse *mouse = &event.mouse;

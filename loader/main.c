@@ -1038,6 +1038,9 @@ static int ps5_hub_title_message( struct ps5_desktop_hub *hub, struct ps5_hub_pe
         if (header->size < sizeof(*text) || text->length > PS5_DESKTOP_MAX_TEXT ||
             header->size != sizeof(*text) + text->length * sizeof(text->text[0])) return 0;
         break;
+    case PS5_DESKTOP_VOICE_EDIT:
+        if (!ps5_desktop_voice_edit_valid( header, header->size )) return 0;
+        break;
     case PS5_DESKTOP_ART:
         if (header->size != sizeof(struct ps5_desktop_art)) return 0;
         ps5_hub_install_art( hub );
