@@ -433,7 +433,7 @@ static inline const char *wine_ps5_write_trace_class( const char *path )
     return "title-other";
 }
 
-/* Bounded process-wide extent slots, only for exact WoW CASC data.NNN archives. */
+/* Bounded process-wide extents for WoW CASC archives and Battle.net client files. */
 #define WINE_PS5_TITLE_BUFFER_MAX (1024u * 1024u)
 #define WINE_PS5_TITLE_BUFFER_RUNS 8u
 #define WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE 4u
@@ -499,12 +499,57 @@ static inline int wine_ps5_title_buffer_under_root( const char *path, const char
     if (!path || !root || !(length = strlen( root )) || strncmp( path, root, length )) return 0;
     return !path[length] || path[length] == '/';
 }
+static inline int wine_ps5_title_buffer_battlenet_path( const char *path, const char *c_root )
+{
+    static const char * const excluded_suffixes[] =
+    {
+        ".db", ".sqlite", ".sqlite3", ".log", "-journal", "-wal", "-shm"
+    };
+    const char *part, *end;
+    size_t length, suffix_length;
+    unsigned int i;
+
+    if (!wine_ps5_title_buffer_under_root( path, c_root )) return 0;
+    part = path + strlen( c_root );
+    while (*part == '/') part++;
+    for (end = part; *end && *end != '/'; end++);
+    if (!wine_ps5_title_buffer_component( part, end - part, "program files (x86)" ) &&
+        !wine_ps5_title_buffer_component( part, end - part, "programdata" )) return 0;
+    part = end;
+    while (*part == '/') part++;
+    for (end = part; *end && *end != '/'; end++);
+    if (!wine_ps5_title_buffer_component( part, end - part, "battle.net" )) return 0;
+    part = end;
+    while (*part == '/') part++;
+    if (!*part) return 0;
+    for (;;)
+    {
+        for (end = part; *end && *end != '/'; end++);
+        length = end - part;
+        if (wine_ps5_title_buffer_component( part, length, "." ) ||
+            wine_ps5_title_buffer_component( part, length, ".." ) ||
+            wine_ps5_title_buffer_component( part, length, "logs" )) return 0;
+        if (!*end) break;
+        part = end;
+        while (*part == '/') part++;
+        if (!*part) return 0;
+    }
+    for (i = 0; i < sizeof(excluded_suffixes) / sizeof(excluded_suffixes[0]); i++)
+    {
+        suffix_length = strlen( excluded_suffixes[i] );
+        if (length >= suffix_length && wine_ps5_title_buffer_component(
+                end - suffix_length, suffix_length, excluded_suffixes[i] )) return 0;
+    }
+    return 1;
+}
+
 
 static inline int wine_ps5_title_buffer_path( const char *path, const char *c_root,
                                               const char *w_root )
 {
     const char *part, *end, *next, *next_end, *leaf, *leaf_end, *name, *name_end;
 
+    if (wine_ps5_title_buffer_battlenet_path( path, c_root )) return 1;
     if (!wine_ps5_title_buffer_under_root( path, c_root ) &&
         !wine_ps5_title_buffer_under_root( path, w_root )) return 0;
     for (part = path; *part; part = *end ? end + 1 : end)
@@ -579,9 +624,9 @@ static inline int wine_ps5_title_buffer_rename_may_enter_scope(
     if (!wine_ps5_title_buffer_under_root( path, c_root ) &&
         !wine_ps5_title_buffer_under_root( path, w_root )) return 0;
     /*
-     * A renamed directory may contain an unseen World of Warcraft subtree;
-     * without an identity table, every directory rename on C:/W: is the
-     * conservative boundary. Files require the exact archive destination.
+     * A renamed directory may contain an unseen buffered subtree; without an
+     * identity table, every directory rename on C:/W: is the conservative
+     * boundary. Files require an eligible archive or Battle.net destination.
      */
     return directory || wine_ps5_title_buffer_path( path, c_root, w_root );
 }

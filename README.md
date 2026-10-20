@@ -124,6 +124,37 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude loader/tests/ps5_input.c -o /tmp/ps5
 /tmp/ps5_input_test
 ```
 
+The PS5 title write buffer admits synchronous regular-file writes to exact
+WoW `Data/data/data.NNN` archives on C:/W:, and files below C:'s
+`Program Files (x86)/Battle.net/` or `ProgramData/Battle.net/`. Battle.net
+components and excluded suffixes are ASCII case-insensitive; the configured
+Unix drive root must match exactly. `Logs` components, `.db`, `.sqlite`,
+`.sqlite3`, `.log`, `-journal`, `-wal` and `-shm` leaves, and dot/traversal
+components are excluded from the Battle.net rule. Other `title-other`
+paths are not made eligible, and trace class names are unchanged.
+
+Both scopes use the same process-local, inode-checked buffer: eight 1 MiB
+extents, at most four per handle, with a 40 ms residence limit checked by a
+10 ms worker. Explicit append/append-only and asynchronous writes bypass
+buffering after flushing; synchronous explicit offsets and direct-mode
+file-pointer writes may buffer. There is no executable-name or read-access
+filter. Reads and size queries through any same-process handle flush the
+matching inode, as do explicit flush, size/allocation changes and handle
+duplication. Close drains its owned extents; process handoff/exit and
+namespace barriers drain globally. Overlap, capacity and identity conflicts
+drain before falling back. Data mappings of an eligible or unresolved file,
+hard-link creation and renames into scope disable buffering. Short writes
+are retried; a failed flush retains unwritten bytes on a pinned fd, disables
+new admission and reports the pending error to the owning handle. This is not a cross-process
+cache-coherency protocol; pre-existing/cross-process aliases remain outside
+its guarantees, and database/log files deliberately stay on the direct path.
+
+Host policy tests live in `loader/tests/ps5_title.c`; the companion
+`ps5-wow/ps5/probes/psmkit-wine/build-write-buffer-test.py` extracts the
+production buffer from `dlls/ntdll/unix/file.c` for its host regression suite.
+They cover Battle.net path boundaries and same-/other-handle read/query,
+close/reopen, flush and duplicate visibility using 7 KiB writes.
+
 
 ## SETUP
 

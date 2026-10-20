@@ -1620,6 +1620,36 @@ static void test_write_coalescing(void)
     static const char c_root[] = "/data/forever/prefix/drive_c";
     static const char w_root[] = "/data/forever";
     struct wine_ps5_title_buffer_state state = {0};
+    static const struct
+    {
+        const char *path;
+        int eligible;
+    } battlenet[] =
+    {
+        { "Program Files (x86)/Battle.net/Battle.net.exe", 1 },
+        { "program files (X86)/BATTLE.NET/Battle.net.123/Lib.DLL", 1 },
+        { "ProgramData/Battle.net/Agent/Agent.123/Agent.exe", 1 },
+        { "PROGRAMDATA/battle.NET/Setup/data.tmp", 1 },
+        { "ProgramData/Battle.net/Agent/logs-old/data.bin", 1 },
+        { "Program Files (x86)/Battle.net", 0 },
+        { "Program Files (x86)/Battle.net/", 0 },
+        { "Program Files (x86)/Battle.net-old/client.exe", 0 },
+        { "Program Files/Battle.net/client.exe", 0 },
+        { "Other/ProgramData/Battle.net/Agent.exe", 0 },
+        { "ProgramData/Battle.net/../Other/client.exe", 0 },
+        { "ProgramData/Battle.net/Agent/./data.bin", 0 },
+        { "ProgramData/Battle.net/Agent/Logs/Agent.txt", 0 },
+        { "Program Files (x86)/Battle.net/logs/2026.txt", 0 },
+        { "ProgramData/Battle.net/Agent/client.DB", 0 },
+        { "ProgramData/Battle.net/Setup/client.SQLite", 0 },
+        { "ProgramData/Battle.net/Setup/client.sqlite3", 0 },
+        { "ProgramData/Battle.net/Agent/client.db-JOURNAL", 0 },
+        { "ProgramData/Battle.net/Agent/client.sqlite-WAL", 0 },
+        { "ProgramData/Battle.net/Agent/client.sqlite-SHM", 0 },
+        { "ProgramData/Battle.net/Agent/Agent.LOG", 0 }
+    };
+    char path[256];
+    unsigned int i;
     assert( WINE_PS5_TITLE_BUFFER_RUNS == 8 );
     assert( WINE_PS5_TITLE_BUFFER_TOTAL_MAX == 8u * 1024u * 1024u );
 
@@ -1643,6 +1673,20 @@ static void test_write_coalescing(void)
         "/data/forever/Games/World of Warcraft/Data/data/data.1234", c_root, w_root ) );
     assert( !wine_ps5_title_buffer_path(
         "/tmp/World of Warcraft/Data/data/data.000", c_root, w_root ) );
+    for (i = 0; i < sizeof(battlenet) / sizeof(battlenet[0]); i++)
+    {
+        snprintf( path, sizeof(path), "%s/%s", c_root, battlenet[i].path );
+        assert( wine_ps5_title_buffer_path( path, c_root, w_root ) == battlenet[i].eligible );
+    }
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/ProgramData/Battle.net/Agent.exe", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/prefix/drive_c2/ProgramData/Battle.net/Agent.exe", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path( NULL, c_root, w_root ) );
+    assert( !strcmp( wine_ps5_write_trace_class(
+        "/data/forever/prefix/drive_c/ProgramData/Battle.net/Agent/Agent.exe" ), "title-other" ) );
+    puts( "ps5 Battle.net buffers: exact C: roots, case-insensitive components, "
+          "database/journal/log and traversal exclusions, unchanged trace class PASS" );
 
     assert( wine_ps5_title_buffer_decide( &state, 0x100, 0, 4096, 1 ) ==
             WINE_PS5_TITLE_BUFFER_START );
