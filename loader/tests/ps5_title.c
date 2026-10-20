@@ -1647,6 +1647,24 @@ static void test_write_coalescing(void)
         { "ProgramData/Battle.net/Agent/client.sqlite-WAL", 0 },
         { "ProgramData/Battle.net/Agent/client.sqlite-SHM", 0 },
         { "ProgramData/Battle.net/Agent/Agent.LOG", 0 }
+    }, casc[] =
+    {
+        { "Games/StarCraft II/SC2Data/data/data.000", 1 },
+        { "Games/STARCRAFT II/sc2DATA/DATA/DATA.999", 1 },
+        { "Games/Other Blizzard Game/Data/data/data.123", 1 },
+        { "Games/Other Blizzard Game/_retail_/Data/data/data.042", 1 },
+        { "Games/Other Blizzard Game/Data/data/staging/SC2Data/data/data.007", 1 },
+        { "Games/Other Blizzard Game/xdata/data/data.001", 1 },
+        { "Games/StarCraft II/SC2Data/data/data.0001", 0 },
+        { "Games/StarCraft II/SC2Data/data/data.00a", 0 },
+        { "Games/StarCraft II/SC2Data/indices/00.idx", 0 },
+        { "Games/StarCraft II/xdata/data.000", 0 },
+        { "Games/StarCraft II/SC2Data/xdata/data.000", 0 },
+        { "Games/StarCraft II/Assets/data/data.000", 0 },
+        { "Games/StarCraft II/SC2Data/data/xata.000", 0 },
+        { "Games/StarCraft II/SC2Data/data/data.000/", 0 },
+        { "Games/StarCraft II/SC2Data/data/data.000/extra", 0 },
+        { "Games/StarCraft II/SC2Data/data", 0 }
     };
     char path[256];
     unsigned int i;
@@ -1673,6 +1691,19 @@ static void test_write_coalescing(void)
         "/data/forever/Games/World of Warcraft/Data/data/data.1234", c_root, w_root ) );
     assert( !wine_ps5_title_buffer_path(
         "/tmp/World of Warcraft/Data/data/data.000", c_root, w_root ) );
+    for (i = 0; i < sizeof(casc) / sizeof(casc[0]); i++)
+    {
+        snprintf( path, sizeof(path), "%s/%s", c_root, casc[i].path );
+        assert( wine_ps5_title_buffer_path( path, c_root, w_root ) == casc[i].eligible );
+        snprintf( path, sizeof(path), "%s/%s", w_root, casc[i].path );
+        assert( wine_ps5_title_buffer_path( path, c_root, w_root ) == casc[i].eligible );
+    }
+    assert( !wine_ps5_title_buffer_path(
+        "/data/foreverx/Games/StarCraft II/SC2Data/data/data.000", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/tmp/Games/StarCraft II/SC2Data/data/data.000", c_root, w_root ) );
+    assert( !wine_ps5_title_buffer_path(
+        "/data/forever/prefix/drive_c2/Games/StarCraft II/SC2Data/data/data.000", c_root, NULL ) );
     for (i = 0; i < sizeof(battlenet) / sizeof(battlenet[0]); i++)
     {
         snprintf( path, sizeof(path), "%s/%s", c_root, battlenet[i].path );
@@ -1723,7 +1754,7 @@ static void test_write_coalescing(void)
     assert( !wine_ps5_title_buffer_admit( 0, 1, 1 ) ); /* permanent disable */
     assert( wine_ps5_title_buffer_admit( 0, 0, 1 ) );
     assert( WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE == 4 );
-    puts( "ps5 CASC buffers: exact data.NNN scope, 8 MiB cap, four extents/handle, "
+    puts( "ps5 CASC buffers: suffix-Data/data/data.NNN scope, 8 MiB cap, four extents/handle, "
           "continuation/residence, identity, shutdown and fail-closed mapping/link policy PASS" );
 }
 

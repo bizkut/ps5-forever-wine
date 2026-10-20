@@ -433,7 +433,7 @@ static inline const char *wine_ps5_write_trace_class( const char *path )
     return "title-other";
 }
 
-/* Bounded process-wide extents for WoW CASC archives and Battle.net client files. */
+/* Bounded process-wide extents for Blizzard CASC layouts and Battle.net client files. */
 #define WINE_PS5_TITLE_BUFFER_MAX (1024u * 1024u)
 #define WINE_PS5_TITLE_BUFFER_RUNS 8u
 #define WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE 4u
@@ -547,40 +547,32 @@ static inline int wine_ps5_title_buffer_battlenet_path( const char *path, const 
 static inline int wine_ps5_title_buffer_path( const char *path, const char *c_root,
                                               const char *w_root )
 {
-    const char *part, *end, *next, *next_end, *leaf, *leaf_end, *name, *name_end;
+    const char *part, *end, *parent, *parent_end, *name, *name_end;
 
     if (wine_ps5_title_buffer_battlenet_path( path, c_root )) return 1;
-    if (!wine_ps5_title_buffer_under_root( path, c_root ) &&
-        !wine_ps5_title_buffer_under_root( path, w_root )) return 0;
-    for (part = path; *part; part = *end ? end + 1 : end)
+    if (wine_ps5_title_buffer_under_root( path, c_root )) part = path + strlen( c_root );
+    else if (wine_ps5_title_buffer_under_root( path, w_root )) part = path + strlen( w_root );
+    else return 0;
+    for (; *part; part = *end ? end + 1 : end)
     {
         while (*part == '/') part++;
         for (end = part; *end && *end != '/'; end++);
-        if (!wine_ps5_title_buffer_component( part, end - part, "world of warcraft" )) continue;
-        next = end;
-        while (*next == '/') next++;
-        for (next_end = next; *next_end && *next_end != '/'; next_end++);
-        if (next_end - next >= 3 && next[0] == '_' && next_end[-1] == '_')
-        {
-            next = next_end;
-            while (*next == '/') next++;
-            for (next_end = next; *next_end && *next_end != '/'; next_end++);
-        }
-        if (!wine_ps5_title_buffer_component( next, next_end - next, "data" )) continue;
-        leaf = next_end;
-        while (*leaf == '/') leaf++;
-        for (leaf_end = leaf; *leaf_end && *leaf_end != '/'; leaf_end++);
-        if (!wine_ps5_title_buffer_component( leaf, leaf_end - leaf, "data" )) continue;
-        name = leaf_end;
+        if (end - part < 4 ||
+            !wine_ps5_title_buffer_component( end - 4, 4, "data" )) continue;
+        parent = end;
+        while (*parent == '/') parent++;
+        for (parent_end = parent; *parent_end && *parent_end != '/'; parent_end++);
+        if (!wine_ps5_title_buffer_component( parent, parent_end - parent, "data" )) continue;
+        name = parent_end;
         while (*name == '/') name++;
         for (name_end = name; *name_end && *name_end != '/'; name_end++);
-        return !*name_end && name_end - name == 8 &&
-               wine_ps5_title_buffer_lower( name[0] ) == 'd' &&
-               wine_ps5_title_buffer_lower( name[1] ) == 'a' &&
-               wine_ps5_title_buffer_lower( name[2] ) == 't' &&
-               wine_ps5_title_buffer_lower( name[3] ) == 'a' &&
-               name[4] == '.' && name[5] >= '0' && name[5] <= '9' &&
-               name[6] >= '0' && name[6] <= '9' && name[7] >= '0' && name[7] <= '9';
+        if (!*name_end && name_end - name == 8 &&
+            wine_ps5_title_buffer_lower( name[0] ) == 'd' &&
+            wine_ps5_title_buffer_lower( name[1] ) == 'a' &&
+            wine_ps5_title_buffer_lower( name[2] ) == 't' &&
+            wine_ps5_title_buffer_lower( name[3] ) == 'a' &&
+            name[4] == '.' && name[5] >= '0' && name[5] <= '9' &&
+            name[6] >= '0' && name[6] <= '9' && name[7] >= '0' && name[7] <= '9') return 1;
     }
     return 0;
 }

@@ -124,14 +124,20 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude loader/tests/ps5_input.c -o /tmp/ps5
 /tmp/ps5_input_test
 ```
 
-The PS5 title write buffer admits regular-file writes to exact
-WoW `Data/data/data.NNN` archives on C:/W:, and files below C:'s
-`Program Files (x86)/Battle.net/` or `ProgramData/Battle.net/`. Battle.net
-components and excluded suffixes are ASCII case-insensitive; the configured
-Unix drive root must match exactly. `Logs` components, `.db`, `.sqlite`,
-`.sqlite3`, `.log`, `-journal`, `-wal` and `-shm` leaves, and dot/traversal
-components are excluded from the Battle.net rule. Other `title-other`
-paths are not made eligible, and trace class names are unchanged.
+The PS5 title write buffer admits regular-file writes to CASC archive layouts
+on C:/W: at any depth: the leaf is `data.NNN` with exactly three decimal
+digits, its parent is `data`, and its grandparent component ends with `data`
+(for example `Data/data/data.000` or `SC2Data/data/data.000`). Components are
+ASCII case-insensitive; no game-name or channel-name list is required, so
+WoW's `_retail_` layout and StarCraft II both match.
+
+The separate Battle.net client rule admits files below C:'s
+`Program Files (x86)/Battle.net/` or `ProgramData/Battle.net/`. Its components
+and excluded suffixes are ASCII case-insensitive; the configured Unix drive
+roots must match exactly. `Logs` components, `.db`, `.sqlite`, `.sqlite3`,
+`.log`, `-journal`, `-wal` and `-shm` leaves, and dot/traversal components
+remain excluded from the Battle.net rule. Other paths are not made eligible,
+and trace class names are unchanged.
 
 Both scopes use the same process-local, inode-checked buffer: eight 1 MiB
 extents, at most four per handle, with a 40 ms residence limit checked by a
@@ -162,9 +168,9 @@ database/log files deliberately stay on the direct path.
 Host policy tests live in `loader/tests/ps5_title.c`; the companion
 `ps5-wow/ps5/probes/psmkit-wine/build-write-buffer-test.py` extracts the
 production buffer, regular-file write dispatch and completion tail from
-`dlls/ntdll/unix/file.c` for its host regression suite. They cover Battle.net
-path boundaries and same-/other-handle read/query, close/reopen, flush and
-duplicate visibility using 7 KiB writes. Overlapped regressions also cover
+`dlls/ntdll/unix/file.c` for its host regression suite. They cover CASC layout
+and Battle.net path boundaries, same-/other-handle read/query, close/reopen,
+flush and duplicate visibility using 7 KiB writes. Overlapped regressions also cover
 IOSB byte counts, event/APC/completion-port calls, unchanged file position,
 copied caller bytes, append handling and the write-through exclusion.
 
