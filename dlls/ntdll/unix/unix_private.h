@@ -438,7 +438,7 @@ extern NTSTATUS ps5_title_flush_coalesced_write( HANDLE handle );
 extern NTSTATUS ps5_title_flush_coalesced_write_reason( HANDLE handle, unsigned int reason );
 extern NTSTATUS ps5_title_flush_all_coalesced_writes_reason( unsigned int reason );
 extern NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags );
-extern NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory );
+extern NTSTATUS ps5_title_note_buffered_rename( HANDLE handle, const char *path, int directory );
 extern NTSTATUS ps5_title_close_coalesced_write( HANDLE handle );
 extern void ps5_title_flush_all_coalesced_writes(void);
 extern void ps5_title_stop_coalesced_writes(void);

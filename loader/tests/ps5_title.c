@@ -1704,10 +1704,6 @@ static void test_write_coalescing(void)
     assert( !wine_ps5_title_buffer_idle( 4096, 100, 100 + WINE_PS5_TITLE_BUFFER_RESIDENCE_US - 1 ) );
     assert( wine_ps5_title_buffer_idle( 4096, 100, 100 + WINE_PS5_TITLE_BUFFER_RESIDENCE_US ) );
 
-    assert( !wine_ps5_title_buffer_disable_for_section( 1, 0, 0 ) ); /* SEC_IMAGE */
-    assert( !wine_ps5_title_buffer_disable_for_section( 0, 1, 0 ) ); /* unrelated data */
-    assert( wine_ps5_title_buffer_disable_for_section( 0, 1, 1 ) );  /* direct match */
-    assert( wine_ps5_title_buffer_disable_for_section( 0, 0, 0 ) );  /* unresolved */
     assert( wine_ps5_title_buffer_single_link( 1 ) );
     assert( wine_ps5_title_buffer_single_link( 0 ) ); /* Prospero unknown-count sentinel */
     assert( !wine_ps5_title_buffer_single_link( 2 ) );

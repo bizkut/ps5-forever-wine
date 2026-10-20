@@ -6602,7 +6602,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                     if (!fstat( rename_fd, &rename_st )) directory = S_ISDIR( rename_st.st_mode );
                     if (rename_close) close( rename_fd );
                 }
-                if ((status = ps5_title_note_buffered_rename( unix_name, directory )))
+                if ((status = ps5_title_note_buffered_rename( handle, unix_name, directory )))
                 {
                     free( unix_name );
                     free( nt_name.Buffer );
@@ -8035,6 +8035,7 @@ static ssize_t title_file_pwrite_native( HANDLE handle, int fd, const void *buff
 #define TITLE_BUFFER_DIAG_DISTINCT 32
 #define TITLE_BUFFER_DIAG_SAMPLE_HANDLES WINE_PS5_TITLE_BUFFER_RUNS
 #define TITLE_BUFFER_DIAG_SAMPLES 64
+#define TITLE_BUFFER_EXCLUDED_IDENTITIES 1024
 
 struct title_buffer_run
 {
@@ -8054,6 +8055,8 @@ struct title_buffer_table
 {
     pthread_mutex_t mutex;
     struct title_buffer_run runs[WINE_PS5_TITLE_BUFFER_RUNS];
+    struct { uint64_t dev, ino; } excluded[TITLE_BUFFER_EXCLUDED_IDENTITIES];
+    unsigned int excluded_count;
     uint64_t next_sequence;
     int barrier_count, barrier_active;
 };
@@ -8902,6 +8905,54 @@ static int title_buffer_resolve_handle_identity( HANDLE handle, uint64_t *dev, u
     *ino = st.st_ino;
     return 1;
 }
+static int title_buffer_identity_excluded_locked( uint64_t dev, uint64_t ino )
+{
+    unsigned int i;
+
+    for (i = 0; i < title_buffer.excluded_count; i++)
+        if (title_buffer.excluded[i].dev == dev && title_buffer.excluded[i].ino == ino)
+            return 1;
+    return 0;
+}
+
+static NTSTATUS title_buffer_exclude_handle_identity( HANDLE handle, unsigned int reason )
+{
+    struct wine_ps5_title_lock lock;
+    uint64_t dev = 0, ino = 0;
+    NTSTATUS pending_status, flush_status;
+    sigset_t previous;
+    int resolved, fallback = 0;
+
+    resolved = title_buffer_resolve_handle_identity( handle, &dev, &ino ) && dev && ino;
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+    title_buffer_begin_barrier( reason, 1 );
+    title_buffer_lock( &lock );
+    if (!resolved)
+        fallback = 1;
+    else if (!title_buffer_identity_excluded_locked( dev, ino ))
+    {
+        if (title_buffer.excluded_count == TITLE_BUFFER_EXCLUDED_IDENTITIES)
+            fallback = 1;
+        else
+        {
+            title_buffer.excluded[title_buffer.excluded_count].dev = dev;
+            title_buffer.excluded[title_buffer.excluded_count++].ino = ino;
+        }
+    }
+    if (fallback) InterlockedExchange( &title_buffer_disabled, 1 );
+    title_buffer_unlock( &lock );
+    if (fallback)
+        title_buffer_log_state( &title_buffer_disabled_logged, "disabled",
+                                resolved ? "exclusion-capacity" : "exclusion-unresolved", 0 );
+    pending_status = title_buffer_take_error( handle, 1 );
+    flush_status = title_buffer_flush_matching(
+        fallback ? TITLE_BUFFER_MATCH_ALL : TITLE_BUFFER_MATCH_IDENTITY,
+        handle, dev, ino, 1, 0, reason );
+    title_buffer_end_barrier();
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return pending_status ? pending_status : flush_status;
+}
+
 
 static NTSTATUS title_buffer_flush_scoped_identity( HANDLE caller, uint64_t dev, uint64_t ino,
                                                     unsigned int reason )
@@ -9241,6 +9292,12 @@ retry:
         dev = title_buffer.runs[first_handle].dev;
         ino = title_buffer.runs[first_handle].ino;
     }
+    if (title_buffer_identity_excluded_locked( dev, ino ))
+    {
+        title_buffer_unlock( &lock );
+        return title_buffer_flush_scoped_identity(
+            handle, dev, ino, WINE_PS5_TITLE_BUFFER_BARRIER_NONDATA_WRITE );
+    }
     if (first_handle != -1 && !admission_path)
     {
         strcpy( retained_path, title_buffer.runs[first_handle].path );
@@ -9394,17 +9451,14 @@ static NTSTATUS title_buffer_disable_for_link(void)
     return title_buffer_flush_reason( 0, 0, 0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
 }
 
-NTSTATUS ps5_title_note_buffered_rename( const char *path, int directory )
+NTSTATUS ps5_title_note_buffered_rename( HANDLE handle, const char *path, int directory )
 {
-    struct wine_ps5_title_lock lock;
     if (!wine_ps5_title_buffer_rename_may_enter_scope(
             path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ), directory ))
         return STATUS_SUCCESS;
-    title_buffer_lock( &lock );
-    InterlockedExchange( &title_buffer_disabled, 1 );
-    title_buffer_unlock( &lock );
-    title_buffer_log_state( &title_buffer_disabled_logged, "disabled", "rename-scope", 0 );
-    return title_buffer_flush_reason( 0, 0, 0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
+    if (directory)
+        return title_buffer_flush_reason( handle, 1, 0, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
+    return title_buffer_exclude_handle_identity( handle, WINE_PS5_TITLE_BUFFER_BARRIER_NAMESPACE );
 }
 
 static NTSTATUS title_buffer_fence_nonfile( HANDLE handle, int regular_file )
@@ -9462,24 +9516,11 @@ NTSTATUS ps5_title_flush_all_coalesced_writes_reason( unsigned int reason )
 
 NTSTATUS ps5_title_prepare_buffered_section( HANDLE handle, ULONG sec_flags )
 {
-    struct wine_ps5_title_lock lock;
-    NTSTATUS status;
-    char *path = NULL;
-    int resolved, scoped = 0, disable;
     if (sec_flags & SEC_IMAGE)
         return title_buffer_flush_reason( handle, 1, 0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
-    resolved = !server_get_unix_name( handle, &path ) && path;
-    if (resolved) scoped = wine_ps5_title_buffer_path(
-        path, ps5_title_drive( 'c' ), ps5_title_drive( 'w' ) );
-    title_buffer_lock( &lock );
-    disable = wine_ps5_title_buffer_disable_for_section( 0, resolved, scoped );
-    if (disable) InterlockedExchange( &title_buffer_disabled, 1 );
-    title_buffer_unlock( &lock );
-    if (disable) title_buffer_log_state( &title_buffer_disabled_logged, "disabled",
-                                         resolved ? "section-scoped" : "section-unresolved", 0 );
-    status = title_buffer_flush_reason( handle, 1, 0, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
-    free( path );
-    return status;
+    /* Remember out-of-scope data mappings too: a directory rename can move
+     * their files into scope without exposing each descendant handle. */
+    return title_buffer_exclude_handle_identity( handle, WINE_PS5_TITLE_BUFFER_BARRIER_SECTION );
 }
 
 NTSTATUS ps5_title_close_coalesced_write( HANDLE handle )

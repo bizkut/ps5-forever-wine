@@ -146,12 +146,18 @@ filter. Reads and size queries through any same-process handle flush the
 matching inode, as do explicit flush, size/allocation changes and handle
 duplication. Close drains its owned extents; process handoff/exit and
 namespace barriers drain globally. Overlap, capacity and identity conflicts
-drain before falling back. Data mappings of an eligible or unresolved file,
-hard-link creation and renames into scope disable buffering. Short writes
-are retried; a failed flush retains unwritten bytes on a pinned fd, disables
-new admission and reports the pending error to the owning handle. This is not a cross-process
-cache-coherency protocol; pre-existing/cross-process aliases remain outside
-its guarantees, and database/log files deliberately stay on the direct path.
+drain before falling back. Non-image file mappings drain and permanently
+exclude only that device/inode, leaving unrelated files eligible. Resolved
+data mappings outside the path rule are remembered too, so an ancestor
+directory rename cannot admit a previously mapped descendant. File renames
+into scope likewise exclude their source identity. The bounded 1,024-entry
+identity table falls back to process-wide disable on exhaustion or unresolved
+identity; hard-link creation also retains the global fail-closed boundary.
+Short writes are retried; a failed flush retains unwritten bytes on a pinned
+fd, disables new admission and reports the pending error to the owning
+handle. This is not a cross-process cache-coherency protocol;
+pre-existing/cross-process aliases remain outside its guarantees, and
+database/log files deliberately stay on the direct path.
 
 Host policy tests live in `loader/tests/ps5_title.c`; the companion
 `ps5-wow/ps5/probes/psmkit-wine/build-write-buffer-test.py` extracts the

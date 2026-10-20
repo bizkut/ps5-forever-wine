@@ -604,11 +604,6 @@ static inline int wine_ps5_title_buffer_idle( size_t length, uint64_t first_us, 
            now_us - first_us >= WINE_PS5_TITLE_BUFFER_RESIDENCE_US;
 }
 
-static inline int wine_ps5_title_buffer_disable_for_section( int image, int resolved, int scoped )
-{
-    return !image && (!resolved || scoped);
-}
-
 static inline int wine_ps5_title_buffer_single_link( uint64_t links )
 {
     /* Prospero may report zero for an ordinary title-storage file. Links
