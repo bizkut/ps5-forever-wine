@@ -174,6 +174,16 @@ flush and duplicate visibility using 7 KiB writes. Overlapped regressions also c
 IOSB byte counts, event/APC/completion-port calls, unchanged file position,
 copied caller bytes, append handling and the write-through exclusion.
 
+Title exit keeps asynchronous exit signals blocked through native pthread
+teardown; a pending `SIGQUIT` must not re-enter `pthread_exit` when the TLS
+destructor unregisters the Wine thread. The companion
+`ps5-wow/ps5/probes/psmkit-wine/build-title-exit-test.py` extracts the actual
+exit request and unregister destructor into `loader/tests/ps5_title_exit.c`.
+Its host regression uses real pthread exits, pending signals and native TLS
+destructors, covering callback return, a signal queued during teardown,
+the already-closed callback gate and thread-registry retirement.
+
+
 
 ## SETUP
 

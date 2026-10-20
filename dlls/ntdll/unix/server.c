@@ -725,18 +725,18 @@ void ps5_title_unregister_thread(void)
 
 void ps5_title_request_exit( int status )
 {
-    sigset_t previous;
     ps5_title_stop_coalesced_writes();
 
     /* SIGQUIT must not abandon an active callback count before its return
-     * into ntdll. After closure, late exits never enter loader text again. */
-    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, &previous );
+     * into ntdll, or re-enter pthread_exit from a native TLS destructor.
+     * This thread never resumes, so keep asynchronous signals blocked
+     * through native pthread teardown. */
+    pthread_sigmask( SIG_BLOCK, &ps5_title_block_set, NULL );
     if (wine_ps5_title_enter_callback( &title_callbacks ))
     {
         title_runtime.exit( status );
         wine_ps5_title_leave_callback( &title_callbacks );
     }
-    pthread_sigmask( SIG_SETMASK, &previous, NULL );
     pthread_exit( UIntToPtr(status) );
 }
 
