@@ -10142,7 +10142,7 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             /* async I/O doesn't make sense on regular files */
 #ifdef __PROSPERO__
             coalesced = 0;
-            if (!async_write && offset->QuadPart != FILE_WRITE_TO_END_OF_FILE)
+            if (!(options & FILE_WRITE_THROUGH) && offset->QuadPart != FILE_WRITE_TO_END_OF_FILE)
             {
                 need_path = title_buffer_needs_path( handle, &buffer_generation );
                 eligible = title_buffer_resolve_start( handle, unix_handle, need_path,
@@ -10182,8 +10182,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             goto done;
         }
 #ifdef __PROSPERO__
-        if (!async_write && (!offset || offset->QuadPart == FILE_USE_FILE_POINTER_POSITION) &&
-            ps5_direct_enabled())
+        if (!async_write && !(options & FILE_WRITE_THROUGH) &&
+            (!offset || offset->QuadPart == FILE_USE_FILE_POINTER_POSITION) && ps5_direct_enabled())
         {
             off_t pos = lseek( unix_handle, 0, SEEK_CUR );
 

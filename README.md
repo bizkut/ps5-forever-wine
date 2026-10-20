@@ -124,7 +124,7 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude loader/tests/ps5_input.c -o /tmp/ps5
 /tmp/ps5_input_test
 ```
 
-The PS5 title write buffer admits synchronous regular-file writes to exact
+The PS5 title write buffer admits regular-file writes to exact
 WoW `Data/data/data.NNN` archives on C:/W:, and files below C:'s
 `Program Files (x86)/Battle.net/` or `ProgramData/Battle.net/`. Battle.net
 components and excluded suffixes are ASCII case-insensitive; the configured
@@ -135,9 +135,13 @@ paths are not made eligible, and trace class names are unchanged.
 
 Both scopes use the same process-local, inode-checked buffer: eight 1 MiB
 extents, at most four per handle, with a 40 ms residence limit checked by a
-10 ms worker. Explicit append/append-only and asynchronous writes bypass
-buffering after flushing; synchronous explicit offsets and direct-mode
-file-pointer writes may buffer. There is no executable-name or read-access
+10 ms worker. Explicit append/append-only and write-through writes bypass
+buffering after flushing. Explicit nonnegative offsets, including overlapped
+and `NO_BUFFERING` writes, and synchronous direct-mode file-pointer writes
+may buffer. Overlapped writes retain Wine's regular-file completion path:
+the copied byte count reaches the IOSB, event, APC queue or completion port,
+and the call returns `STATUS_PENDING` without moving the file pointer.
+There is no executable-name or read-access
 filter. Reads and size queries through any same-process handle flush the
 matching inode, as do explicit flush, size/allocation changes and handle
 duplication. Close drains its owned extents; process handoff/exit and
@@ -151,9 +155,12 @@ its guarantees, and database/log files deliberately stay on the direct path.
 
 Host policy tests live in `loader/tests/ps5_title.c`; the companion
 `ps5-wow/ps5/probes/psmkit-wine/build-write-buffer-test.py` extracts the
-production buffer from `dlls/ntdll/unix/file.c` for its host regression suite.
-They cover Battle.net path boundaries and same-/other-handle read/query,
-close/reopen, flush and duplicate visibility using 7 KiB writes.
+production buffer, regular-file write dispatch and completion tail from
+`dlls/ntdll/unix/file.c` for its host regression suite. They cover Battle.net
+path boundaries and same-/other-handle read/query, close/reopen, flush and
+duplicate visibility using 7 KiB writes. Overlapped regressions also cover
+IOSB byte counts, event/APC/completion-port calls, unchanged file position,
+copied caller bytes, append handling and the write-through exclusion.
 
 
 ## SETUP
