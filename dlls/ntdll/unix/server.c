@@ -4660,11 +4660,13 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     int fd;
 #ifdef __PROSPERO__
     NTSTATUS coalesce_status;
+    LONG64 fsop_started;
 #endif
 
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 #ifdef __PROSPERO__
+    fsop_started = ps5_title_fsop_begin();
     coalesce_status = ps5_title_close_coalesced_write( handle );
 #endif
 
@@ -4688,6 +4690,7 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
 
     if (fd != -1) close( fd );
 #ifdef __PROSPERO__
+    ps5_title_fsop_close( fsop_started );
     if (!ret && coalesce_status) ret = coalesce_status;
 #endif
 

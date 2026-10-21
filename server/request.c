@@ -386,6 +386,14 @@ static unsigned int census_count[REQ_NB_REQUESTS];
 static unsigned long long census_us[REQ_NB_REQUESTS];
 static unsigned int census_blocked;
 static unsigned int census_direct, census_queued;
+static unsigned long long census_max_us[REQ_NB_REQUESTS];
+static unsigned int census_phase_count[CENSUS_PHASES];
+static unsigned long long census_phase_us[CENSUS_PHASES], census_phase_max[CENSUS_PHASES];
+static const char * const census_phase_name[CENSUS_PHASES] =
+{
+    "open", "open_create", "mkdir", "inode", "realpath", "sharing", "file_object", "park", "close", "unlink",
+    "truncate"
+};
 static unsigned long long census_since;
 struct request_queue_stat
 {
@@ -432,6 +440,29 @@ static unsigned long long census_now_us(void)
     return now.tv_sec * 1000000ull + now.tv_nsec / 1000;
 }
 
+unsigned long long census_phase_start(void)
+{
+    return census_now_us();
+}
+
+void census_phase_note( enum census_phase phase, unsigned long long started, const char *name )
+{
+    static unsigned int slow_logged;
+    int saved_errno = errno;
+    unsigned long long took = census_now_us() - started;
+
+    census_phase_count[phase]++;
+    census_phase_us[phase] += took;
+    if (took > census_phase_max[phase]) census_phase_max[phase] = took;
+    if (took >= 20000 && slow_logged < 300)
+    {
+        slow_logged++;
+        inprocess_trace( "server slow op=%s ms=%llu name=%s\n", census_phase_name[phase], took / 1000,
+                         name ? name : "-" );
+    }
+    errno = saved_errno;
+}
+
 static void census_note( enum request req, unsigned long long started, unsigned int error, int direct )
 {
     unsigned long long now = census_now_us(), total_us = 0;
@@ -444,6 +475,7 @@ static void census_note( enum request req, unsigned long long started, unsigned 
     if (direct) census_direct++;
     else census_queued++;
     census_us[req] += now - started;
+    if (now - started > census_max_us[req]) census_max_us[req] = now - started;
     if (req == REQ_select && error == STATUS_PENDING) census_blocked++;
     if (!census_since) census_since = now;
     if (now - census_since < 10000000) return;
@@ -464,6 +496,33 @@ static void census_note( enum request req, unsigned long long started, unsigned 
         len += snprintf( line + len, sizeof(line) - len, " %s=%u/%llums", get_request_name( top[j] ),
                          census_count[top[j]], census_us[top[j]] / 1000 );
     inprocess_trace( "%s\n", line );
+    {
+        unsigned int by_time[5] = { 0 }, times = 0;
+
+        for (i = 0; i < REQ_NB_REQUESTS; i++)
+        {
+            if (!census_us[i]) continue;
+            for (j = times; j > 0 && census_us[by_time[j - 1]] < census_us[i]; j--)
+                if (j < ARRAY_SIZE(by_time)) by_time[j] = by_time[j - 1];
+            if (j < ARRAY_SIZE(by_time)) by_time[j] = i;
+            if (times < ARRAY_SIZE(by_time)) times++;
+        }
+        len = snprintf( line, sizeof(line), "server time window_ms=%llu handler_ms=%llu top_ms",
+                        (now - census_since) / 1000, total_us / 1000 );
+        for (j = 0; j < times; j++)
+            len += snprintf( line + len, sizeof(line) - len, " %s=%u/%llums/max%llums",
+                             get_request_name( by_time[j] ), census_count[by_time[j]],
+                             census_us[by_time[j]] / 1000, census_max_us[by_time[j]] / 1000 );
+        inprocess_trace( "%s\n", line );
+        len = snprintf( line, sizeof(line), "server ops window_ms=%llu", (now - census_since) / 1000 );
+        for (j = 0; j < CENSUS_PHASES; j++)
+        {
+            if (!census_phase_count[j]) continue;
+            len += snprintf( line + len, sizeof(line) - len, " %s=%u/%llums/max%llums", census_phase_name[j],
+                             census_phase_count[j], census_phase_us[j] / 1000, census_phase_max[j] / 1000 );
+        }
+        inprocess_trace( "%s\n", line );
+    }
     directory_entries_census_flush();
     for (i = 0; i < REQ_NB_REQUESTS; i++)
     {
@@ -478,6 +537,10 @@ static void census_note( enum request req, unsigned long long started, unsigned 
     memset( request_queue_stats, 0, sizeof(request_queue_stats) );
     memset( census_count, 0, sizeof(census_count) );
     memset( census_us, 0, sizeof(census_us) );
+    memset( census_max_us, 0, sizeof(census_max_us) );
+    memset( census_phase_count, 0, sizeof(census_phase_count) );
+    memset( census_phase_us, 0, sizeof(census_phase_us) );
+    memset( census_phase_max, 0, sizeof(census_phase_max) );
     census_blocked = 0;
     census_direct = census_queued = 0;
     census_since = now;

@@ -388,6 +388,15 @@ static pthread_mutex_t title_dir_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
 static LONG64 title_io_now_us(void);
+
+/* What a title's file creation costs (reported with "title io"): NtCreateFile
+ * as a whole, its name lookup, the directory scans lookup falls back to, the
+ * case-sensitivity probe, and the server's create_file; NtClose is added by
+ * server.c. */
+enum title_fsop_kind { FSOP_CREATE, FSOP_LOOKUP, FSOP_FIND, FSOP_CASE, FSOP_OPEN, FSOP_CLOSE, FSOP_KINDS };
+static LONG64 title_fsop_calls[FSOP_KINDS], title_fsop_us[FSOP_KINDS], title_fsop_max[FSOP_KINDS];
+static LONG64 title_fsop_scans, title_fsop_entries;
+static void title_fsop_add( unsigned int kind, LONG64 us );
 static int broker_query_fs( HANDLE handle, struct wb_statfs_reply *reply );
 
 static struct wine_ps5_sticky_writes title_write_sticky_handles;
@@ -3737,8 +3746,8 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
  * The file found is appended to unix_name at pos.
  * There must be at least MAX_DIR_ENTRY_LEN+2 chars available at pos.
  */
-static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
-                                  BOOLEAN check_case )
+static NTSTATUS find_file_in_dir_untimed( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
+                                          BOOLEAN check_case )
 {
     WCHAR buffer[MAX_DIR_ENTRY_LEN];
     BOOLEAN is_name_8_dot_3;
@@ -3768,7 +3777,19 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     is_name_8_dot_3 = is_name_8_dot_3 && length >= 8 && name[4] == '~';
 #endif
 
-    if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+    if (!is_name_8_dot_3)
+    {
+        BOOLEAN case_sensitive;
+#ifdef __PROSPERO__
+        LONG64 case_started = title_io_now_us();
+#endif
+        case_sensitive = get_dir_case_sensitivity( root_fd, unix_name );
+#ifdef __PROSPERO__
+        title_fsop_add( FSOP_CASE, title_io_now_us() - case_started );
+        if (case_sensitive) InterlockedIncrement64( &title_fsop_scans );
+#endif
+        if (!case_sensitive) goto not_found;
+    }
 
     /* now look for it through the directory */
 
@@ -3830,6 +3851,9 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     unix_name[pos - 1] = '/';
     while ((de = readdir( dir )))
     {
+#ifdef __PROSPERO__
+        InterlockedIncrement64( &title_fsop_entries );
+#endif
         ret = ntdll_umbstowcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
         if (ret == length && !wcsnicmp( buffer, name, ret ))
         {
@@ -3857,6 +3881,20 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 not_found:
     unix_name[pos - 1] = 0;
     return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const WCHAR *name, int length,
+                                  BOOLEAN check_case )
+{
+#ifdef __PROSPERO__
+    LONG64 started = title_io_now_us();
+    NTSTATUS status = find_file_in_dir_untimed( root_fd, unix_name, pos, name, length, check_case );
+
+    title_fsop_add( FSOP_FIND, title_io_now_us() - started );
+    return status;
+#else
+    return find_file_in_dir_untimed( root_fd, unix_name, pos, name, length, check_case );
+#endif
 }
 
 /* CW-Bug-Id: #23185 Emulate Steam Input native hooks for native SDL */
@@ -5693,6 +5731,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
+#ifdef __PROSPERO__
+    LONG64 fsop_started = title_io_now_us(), fsop_lookup = 0, fsop_open = 0, fsop_mark;
+#endif
 
     TRACE( "handle=%p access=%08x name=%s objattr=%08x root=%p sec=%p io=%p alloc_size=%p "
            "attr=%08x sharing=%08x disp=%d options=%08x ea=%p.0x%08x\n",
@@ -5714,6 +5755,10 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     }
     else status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, disposition,
                                          options & FILE_OPEN_REPARSE_POINT );
+#ifdef __PROSPERO__
+    fsop_lookup = title_io_now_us() - fsop_started;
+    title_fsop_add( FSOP_LOOKUP, fsop_lookup );
+#endif
 
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
@@ -5753,8 +5798,15 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     if (status == STATUS_SUCCESS)
     {
         name_hidden = is_hidden_file( unix_name );
+#ifdef __PROSPERO__
+        fsop_mark = title_io_now_us();
+#endif
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
                                  sharing, disposition, options, ea_buffer, ea_length );
+#ifdef __PROSPERO__
+        fsop_open = title_io_now_us() - fsop_mark;
+        title_fsop_add( FSOP_OPEN, fsop_open );
+#endif
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
 
@@ -5823,6 +5875,27 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     }
 
  done:
+#ifdef __PROSPERO__
+    {
+        static LONG slow_logged;
+        LONG64 took = title_io_now_us() - fsop_started;
+
+        title_fsop_add( FSOP_CREATE, took );
+        if (took > 50000 && ps5_direct_enabled() && InterlockedIncrement( &slow_logged ) <= 200)
+        {
+            char line[512];
+            size_t len = unix_name ? strlen( unix_name ) : 0;
+
+            snprintf( line, sizeof(line), "wine: title slow create pid=%d ms=%lld lookup=%lld open=%lld disp=%u "
+                      "status=%#x scans=%lld entries=%lld path=%s\n", (int)getpid(), (long long)took / 1000,
+                      (long long)fsop_lookup / 1000, (long long)fsop_open / 1000, (unsigned int)disposition,
+                      status, (long long)__atomic_load_n( &title_fsop_scans, __ATOMIC_RELAXED ),
+                      (long long)__atomic_load_n( &title_fsop_entries, __ATOMIC_RELAXED ),
+                      unix_name ? unix_name + (len > 200 ? len - 200 : 0) : "-" );
+            sceKernelDebugOutText( 0, line );
+        }
+    }
+#endif
     free( unix_name );
     free( nt_name.Buffer );
     return io->Status = status;
@@ -7527,6 +7600,50 @@ static LONG64 title_io_now_us(void)
     return (LONG64)now.tv_sec * 1000000 + now.tv_nsec / 1000;
 }
 
+LONG64 ps5_title_fsop_begin(void)
+{
+    return title_io_now_us();
+}
+
+static void title_fsop_add( unsigned int kind, LONG64 us )
+{
+    LONG64 seen;
+
+    InterlockedIncrement64( &title_fsop_calls[kind] );
+    InterlockedExchangeAdd64( &title_fsop_us[kind], us );
+    while ((seen = __atomic_load_n( &title_fsop_max[kind], __ATOMIC_RELAXED )) < us &&
+           InterlockedCompareExchange64( &title_fsop_max[kind], us, seen ) != seen) {}
+}
+
+void ps5_title_fsop_close( LONG64 started )
+{
+    title_fsop_add( FSOP_CLOSE, title_io_now_us() - started );
+}
+
+static void title_fsop_report(void)
+{
+    static const char * const names[FSOP_KINDS] = { "create", "lookup", "find", "case", "open", "close" };
+    char line[384];
+    int len = snprintf( line, sizeof(line), "wine: title fsops pid=%d", (int)getpid() ), any = 0;
+    unsigned int i;
+
+    for (i = 0; i < FSOP_KINDS; i++)
+    {
+        LONG64 calls = __atomic_exchange_n( &title_fsop_calls[i], 0, __ATOMIC_SEQ_CST );
+        LONG64 us = __atomic_exchange_n( &title_fsop_us[i], 0, __ATOMIC_SEQ_CST );
+        LONG64 max = __atomic_exchange_n( &title_fsop_max[i], 0, __ATOMIC_SEQ_CST );
+
+        if (!calls) continue;
+        any = 1;
+        len += snprintf( line + len, sizeof(line) - len, " %s=%lld/%lldms/max%lldms", names[i],
+                         (long long)calls, (long long)us / 1000, (long long)max / 1000 );
+    }
+    len += snprintf( line + len, sizeof(line) - len, " scans=%lld entries=%lld\n",
+                     (long long)__atomic_exchange_n( &title_fsop_scans, 0, __ATOMIC_SEQ_CST ),
+                     (long long)__atomic_exchange_n( &title_fsop_entries, 0, __ATOMIC_SEQ_CST ) );
+    if (any) sceKernelDebugOutText( 0, line );
+}
+
 static void title_io_note( enum title_io_kind kind, LONG64 bytes, LONG64 started )
 {
     LONG64 now = title_io_now_us(), last = title_io_logged_at;
@@ -7552,6 +7669,7 @@ static void title_io_note( enum title_io_kind kind, LONG64 bytes, LONG64 started
               (long long)calls[1], (long long)sizes[1] >> 10, (long long)times[1] / 1000,
               (long long)coalesced, (long long)calls[2], (long long)times[2] / 1000 );
     sceKernelDebugOutText( 0, line );
+    title_fsop_report();
 }
 
 /* pread for a regular file; -1 and errno like pread */

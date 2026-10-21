@@ -1206,6 +1206,7 @@ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
     /* make sure it is still the same file */
     struct stat st;
 #ifdef __PROSPERO__
+    unsigned long long started = census_phase_start();
     unpark_inode( inode );
 #endif
     if (!stat( fd->unix_name, &st ) && st.st_dev == inode->device->dev && st.st_ino == inode->ino)
@@ -1213,6 +1214,9 @@ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
         if (S_ISDIR(st.st_mode)) rmdir( fd->unix_name );
         else unlink( fd->unix_name );
     }
+#ifdef __PROSPERO__
+    census_phase_note( CENSUS_UNLINK, started, fd->unix_name );
+#endif
 }
 
 /* close all pending file descriptors in the closed list */
@@ -1920,9 +1924,12 @@ static void park_timeout( void *unused )
  * exited (run 20261009-b1-census-1). Re-check while over the high water. */
 static void park_balance(void)
 {
+    unsigned long long started = census_phase_start();
+
     if (park_live > PARK_HIGH_WATER) park_idle( park_live - PARK_LOW_WATER );
     if (park_live > PARK_HIGH_WATER && !park_timer)
         park_timer = add_timeout_user( -(timeout_t)PARK_MIN_IDLE * 10000 / 4, park_timeout, NULL );
+    census_phase_note( CENSUS_PARK, started, NULL );
 }
 
 /* why open files could not be parked: the first failing rule of each, the
@@ -2193,6 +2200,13 @@ void allow_fd_parking( struct fd *fd )
 static void fd_destroy( struct object *obj )
 {
     struct fd *fd = (struct fd *)obj;
+#ifdef __PROSPERO__
+    unsigned long long started = census_phase_start();
+    char name_tail[200];
+    size_t name_len = fd->unix_name ? strlen( fd->unix_name ) : 0;
+
+    snprintf( name_tail, sizeof(name_tail), "%s", fd->unix_name ? fd->unix_name + (name_len > 199 ? name_len - 199 : 0) : "-" );
+#endif
 
     free_async_queue( &fd->read_q );
     free_async_queue( &fd->write_q );
@@ -2218,6 +2232,9 @@ static void fd_destroy( struct object *obj )
         free( fd->unix_name );
     }
     if (fd->sync) release_object( fd->sync );
+#ifdef __PROSPERO__
+    census_phase_note( CENSUS_CLOSE, started, name_tail );
+#endif
 }
 
 /* check if the desired access is possible without violating */
@@ -2691,6 +2708,30 @@ static void ps5_dump_open_files(void)
 }
 #endif
 
+#ifdef __PROSPERO__
+/* the Unix calls of a file open, timed for the server's census (request.c) */
+static int census_open( const char *name, int flags, mode_t mode )
+{
+    unsigned long long started = census_phase_start();
+    int ret = open( name, flags, mode );
+
+    census_phase_note( (flags & O_CREAT) ? CENSUS_OPEN_CREATE : CENSUS_OPEN, started, name );
+    return ret;
+}
+
+static int census_mkdir( const char *name, mode_t mode )
+{
+    unsigned long long started = census_phase_start();
+    int ret = mkdir( name, mode );
+
+    census_phase_note( CENSUS_MKDIR, started, name );
+    return ret;
+}
+#else
+#define census_open open
+#define census_mkdir mkdir
+#endif
+
 /* open() wrapper that returns a struct fd with no fd user set */
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
                     int flags, mode_t *mode, unsigned int access,
@@ -2704,6 +2745,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     char *path;
 #ifdef __PROSPERO__
     char *title_name = NULL;
+    unsigned long long phase_started = 0;
 #endif
 
     if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
@@ -2746,7 +2788,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     /* create the directory if needed */
     if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
     {
-        if (mkdir( name, *mode ) == -1)
+        if (census_mkdir( name, *mode ) == -1)
         {
             if (errno != EEXIST || (flags & O_EXCL))
             {
@@ -2764,11 +2806,11 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode );
+    fd->unix_fd = census_open( name, rw_mode | (flags & ~O_TRUNC), *mode );
 #ifdef __PROSPERO__
     if (fd->unix_fd == -1 && errno == EMFILE && inprocess_server)
     {
-        if (park_make_room()) fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode );
+        if (park_make_room()) fd->unix_fd = census_open( name, rw_mode | (flags & ~O_TRUNC), *mode );
         else errno = EMFILE;
     }
     fd->reopen_flags = rw_mode | (flags & ~(O_TRUNC | O_CREAT | O_EXCL));
@@ -2780,7 +2822,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         if (errno == EISDIR)
         {
             if ((access & FILE_UNIX_WRITE_ACCESS) || (flags & O_CREAT))
-                fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
+                fd->unix_fd = census_open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
         }
 
         if (fd->unix_fd == -1)
@@ -2806,6 +2848,9 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 
     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
     fd->unix_name = NULL;
+#ifdef __PROSPERO__
+    phase_started = census_phase_start();
+#endif
     fstat( fd->unix_fd, &st );
     *mode = st.st_mode;
 
@@ -2814,6 +2859,10 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     {
         unsigned int err;
         struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
+
+#ifdef __PROSPERO__
+        census_phase_note( CENSUS_INODE, phase_started, name );
+#endif
 
         if (!inode)
         {
@@ -2824,6 +2873,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         }
 
 #ifdef __PROSPERO__
+        phase_started = census_phase_start();
         if ((path = dup_fd_name( inprocess_server ? NULL : root, name )))
         {
             fd->unix_name = inprocess_server ? ps5_realpath( path, NULL ) : realpath( path, NULL );
@@ -2834,6 +2884,9 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 #endif
             free( path );
         }
+#ifdef __PROSPERO__
+        census_phase_note( CENSUS_REALPATH, phase_started, name );
+#endif
 
         closed_fd->unix_fd = fd->unix_fd;
         closed_fd->unix_name = fd->unix_name;
@@ -2855,7 +2908,14 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             set_error( STATUS_FILE_IS_A_DIRECTORY );
             goto error;
         }
-        if ((err = check_sharing( fd, access, sharing, flags, options )))
+#ifdef __PROSPERO__
+        phase_started = census_phase_start();
+#endif
+        err = check_sharing( fd, access, sharing, flags, options );
+#ifdef __PROSPERO__
+        census_phase_note( CENSUS_SHARING, phase_started, name );
+#endif
+        if (err)
         {
             set_error( err );
             goto error;
@@ -2878,7 +2938,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
                 set_error( STATUS_OBJECT_NAME_COLLISION );
                 goto error;
             }
+#ifdef __PROSPERO__
+            phase_started = census_phase_start();
+#endif
             ftruncate( fd->unix_fd, 0 );
+#ifdef __PROSPERO__
+            census_phase_note( CENSUS_TRUNCATE, phase_started, name );
+#endif
         }
     }
     else  /* special file */

@@ -384,9 +384,14 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
         obj = create_serial( fd );
     else
     {
-        obj = create_file_obj( fd, access, mode, sd );
 #ifdef __PROSPERO__
+        unsigned long long started = census_phase_start();
+
+        obj = create_file_obj( fd, access, mode, sd );
+        census_phase_note( CENSUS_FILE_OBJECT, started, name );
         if (obj && S_ISREG(mode)) allow_fd_parking( fd );
+#else
+        obj = create_file_obj( fd, access, mode, sd );
 #endif
     }
 

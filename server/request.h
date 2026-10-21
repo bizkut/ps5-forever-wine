@@ -88,6 +88,27 @@ struct process;
 extern int inprocess_is_host_process( const struct process *process );
 extern void inprocess_exit( int status ) __attribute__((noreturn));
 extern void inprocess_trace( const char *format, ... ) __attribute__((format(printf,1,2)));
+
+/* Where the in-process server's handler time goes inside file requests: the
+ * Unix calls and bookkeeping steps a handler makes, summed per 10 s census
+ * window with the slowest single call, and any call over 20 ms named. */
+enum census_phase
+{
+    CENSUS_OPEN,
+    CENSUS_OPEN_CREATE,
+    CENSUS_MKDIR,
+    CENSUS_INODE,
+    CENSUS_REALPATH,
+    CENSUS_SHARING,
+    CENSUS_FILE_OBJECT,
+    CENSUS_PARK,
+    CENSUS_CLOSE,
+    CENSUS_UNLINK,
+    CENSUS_TRUNCATE,
+    CENSUS_PHASES
+};
+extern unsigned long long census_phase_start(void);
+extern void census_phase_note( enum census_phase phase, unsigned long long started, const char *name );
 #endif
 
 extern void trace_request(void);
