@@ -989,6 +989,7 @@ SOURCES = \
 	wine/ps5_cursor.h \
 	wine/ps5_desktop.h \
 	wine/ps5_input.h \
+	wine/ps5_prefix_init.h \
 	wine/ps5_spawn.h \
 	wine/ps5_suspend.h \
 	wine/ps5_request_profile.h \

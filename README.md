@@ -124,6 +124,34 @@ cc -std=c11 -Wall -Wextra -Werror -Iinclude loader/tests/ps5_input.c -o /tmp/ps5
 /tmp/ps5_input_test
 ```
 
+The title's explicit prefix initialization (`wineboot -i` with
+`WINEPS5_PREFIX_INIT=1`) forces the normal native and WOW64 install passes even
+when `.update-timestamp` is current. It publishes `.wineboot-init-done` only
+after each install child exits successfully and both registry views contain
+the normal Generic Verify V2 trust callbacks and PE SIP callbacks, with their
+expected DLL/function values and resolvable provider exports. Optional DLL
+registration HRESULTs keep SetupAPI's existing handling; an interrupted or
+failed installation process cannot certify completion.
+Before emitting proof, Wineboot checks `RegFlushKey` on real opened
+`HKLM\\Software` handles in both views. The in-process title server saves its
+registered hives itself and returns save failures through the request status,
+without sending absolute title filenames to the client's relative-path writer.
+Stream errors, data flush/sync errors, close errors and failed renames retain
+dirty state; ordinary hive replacement occurs only after a successful save.
+Native checkpoint publication synchronizes the prefix directory after Wine
+quiesces, completing rename-metadata durability before readiness is committed.
+
+The transient file contains exactly `WINE_PS5_PREFIX_INIT_PROOF` from
+`include/wine/ps5_prefix_init.h`. The native title must wait for Wine to quiesce
+and save its hives before persisting that proof under
+`WINE_PS5_PREFIX_TRUST_READY_NAME` and admitting applications. The proof is a
+prefix-initialization checkpoint, not a successful verification of any file.
+Normal signature, digest, signer and certificate-policy checks still run.
+An unregistered trust action with no verification steps now fails with
+`TRUST_E_PROVIDER_UNKNOWN`, rather than reporting success without verification.
+There is no file/hash allowlist or signature-failure override.
+
+
 The PS5 title write buffer admits regular-file writes to CASC archive layouts
 on C:/W: at any depth: the leaf is `data.NNN` with exactly three decimal
 digits, its parent is `data`, and its grandparent component ends with `data`

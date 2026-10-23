@@ -312,7 +312,7 @@ extern unsigned int supported_machines_count;
 extern unsigned short supported_machines[8];
 extern unsigned short native_machine;
 extern void init_registry(void);
-extern void flush_registry(void);
+extern int flush_registry(void);
 
 static inline int is_machine_32bit( unsigned short machine )
 {

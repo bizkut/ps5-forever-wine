@@ -167,7 +167,9 @@ struct wintrust_step
 static DWORD WINTRUST_ExecuteSteps(const struct wintrust_step *steps,
  DWORD numSteps, CRYPT_PROVIDER_DATA *provData)
 {
-    DWORD i, err = ERROR_SUCCESS;
+    /* An unregistered action supplies no verification steps.  Loading the
+     * common allocation helpers alone does not establish trust. */
+    DWORD i, err = numSteps ? ERROR_SUCCESS : TRUST_E_PROVIDER_UNKNOWN;
 
     for (i = 0; !err && i < numSteps; i++)
     {

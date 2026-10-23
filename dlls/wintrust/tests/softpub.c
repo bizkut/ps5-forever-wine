@@ -824,6 +824,37 @@ static void test_sip_create_indirect_data(void)
     DeleteFileW(temp_file);
 }
 
+static void test_wintrust_unknown_provider(void)
+{
+    static GUID action = {0x1518fc1e, 0x7d67, 0x4a34, {0x81,0x64,0x83,0xf2,0xec,0xc9,0x7a,0x46}};
+    WINTRUST_FILE_INFO file = {sizeof(file)};
+    WINTRUST_DATA data = {sizeof(data)};
+    WCHAR path[MAX_PATH];
+    LONG status;
+
+    getNotepadPath(path, ARRAY_SIZE(path));
+    file.pcwszFilePath = path;
+    data.dwUIChoice = WTD_UI_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+
+    SetLastError(0xdeadbeef);
+    status = WinVerifyTrust(NULL, &action, &data);
+    ok(status == TRUST_E_PROVIDER_UNKNOWN, "Got %#lx.\n", status);
+    ok(GetLastError() == TRUST_E_PROVIDER_UNKNOWN, "Got %#lx.\n", GetLastError());
+    ok(!data.hWVTStateData, "State was not closed.\n");
+
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    SetLastError(0xdeadbeef);
+    status = WinVerifyTrustEx(NULL, &action, &data);
+    ok(status == TRUST_E_PROVIDER_UNKNOWN, "Got %#lx.\n", status);
+    ok(GetLastError() == TRUST_E_PROVIDER_UNKNOWN, "Got %#lx.\n", GetLastError());
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    status = WinVerifyTrust(NULL, &action, &data);
+    ok(status == S_OK, "Got %#lx.\n", status);
+    ok(!data.hWVTStateData, "State was not closed.\n");
+}
+
 static void test_wintrust(void)
 {
     static GUID generic_action_v2 = WINTRUST_ACTION_GENERIC_VERIFY_V2;
@@ -1951,6 +1982,7 @@ START_TEST(softpub)
     InitFunctionPtrs();
     test_provider_funcs();
     test_sip_create_indirect_data();
+    test_wintrust_unknown_provider();
     test_wintrust();
     test_wintrust_digest();
     test_get_known_usages();

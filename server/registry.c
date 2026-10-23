@@ -2220,7 +2220,7 @@ static int save_branch( struct key *key, const char *filename )
 #else
     char tmp[32];
 #endif
-    int fd, count = 0, ret = 0;
+    int fd, count = 0, ret = 0, error = 0;
     FILE *f;
 
     if (!(key->flags & KEY_DIRTY))
@@ -2238,7 +2238,12 @@ static int save_branch( struct key *key, const char *filename )
          * via symbolic links, write directly into it; otherwise use a temp file */
         if (!lstat( filename, &st ) && (!S_ISREG(st.st_mode) || st.st_nlink > 1))
         {
-            ftruncate( fd, 0 );
+            if (ftruncate( fd, 0 ))
+            {
+                error = errno;
+                close( fd );
+                goto done;
+            }
             goto save;
         }
         close( fd );
@@ -2264,6 +2269,7 @@ static int save_branch( struct key *key, const char *filename )
  save:
     if (!(f = fdopen( fd, "w" )))
     {
+        error = errno;
         if (tmp[0]) unlink( tmp );
         close( fd );
         goto done;
@@ -2281,28 +2287,39 @@ static int save_branch( struct key *key, const char *filename )
      * three registry files were left empty: the rename reached the disk, the
      * data did not. Flush the data first, so a crash leaves the old file or
      * the new one. */
-    ret = !fflush( f ) && !fsync( fileno( f ) );
-    ret = !fclose( f ) && ret;
+    if (ferror( f )) error = errno ? errno : EIO;
+    if (!error && fflush( f )) error = errno ? errno : EIO;
+    if (!error && fsync( fileno( f ) )) error = errno ? errno : EIO;
+    if (fclose( f ) && !error) error = errno ? errno : EIO;
+    ret = !error;
 #else
-    ret = !fclose(f);
+    if (ferror( f )) error = errno ? errno : EIO;
+    if (fclose( f ) && !error) error = errno ? errno : EIO;
+    ret = !error;
 #endif
 
     if (tmp[0])
     {
         /* if successfully written, rename to final name */
-        if (ret) ret = !rename( tmp, filename );
+        if (ret && rename( tmp, filename ))
+        {
+            error = errno;
+            ret = 0;
+        }
         if (!ret) unlink( tmp );
     }
 
 done:
+    if (!ret && !error) error = errno ? errno : EIO;
     if (ret) make_clean( key, key->timestamp_counter );
+    else errno = error;
     return ret;
 }
 
 /* save the modified registry branches to disk */
-void flush_registry(void)
+int flush_registry(void)
 {
-    int i;
+    int i, error = 0;
 
 #ifdef __PROSPERO__
     if (inprocess_server)
@@ -2310,23 +2327,30 @@ void flush_registry(void)
         /* absolute names; no chdir in a process shared with Wine's threads */
         for (i = 0; i < save_branch_count; i++)
             if (!save_branch( save_branch_info[i].key, save_branch_info[i].filename ))
+            {
+                if (!error) error = errno ? errno : EIO;
                 inprocess_trace( "could not save registry branch to %s: %s\n",
                                  save_branch_info[i].filename, strerror( errno ) );
-        return;
+            }
+        if (error) errno = error;
+        return !error;
     }
 #endif
 
-    if (fchdir( config_dir_fd ) == -1) return;
+    if (fchdir( config_dir_fd ) == -1) return 0;
     for (i = 0; i < save_branch_count; i++)
     {
         if (!save_branch( save_branch_info[i].key, save_branch_info[i].filename ))
         {
+            if (!error) error = errno ? errno : EIO;
             fprintf( stderr, "wineserver: could not save registry branch to %s",
                      save_branch_info[i].filename );
             perror( " " );
         }
     }
     if (fchdir( server_dir_fd ) == -1) fatal_error( "chdir to server dir: %s\n", strerror( errno ));
+    if (error) errno = error;
+    return !error;
 }
 
 /* find all the branches inside the specified key or the branch containing the key */
@@ -2438,6 +2462,18 @@ DECL_HANDLER(flush_key)
 
     reply->total = 0;
     reply->branch_count = 0;
+#ifdef __PROSPERO__
+    if (inprocess_server)
+    {
+        reply->timestamp_counter = change_timestamp_counter;
+        /* Title branch names are absolute and the server owns persistence.
+         * Do not hand this snapshot to the client's relative-path writer.
+         * Report save failures before the caller can certify prefix setup. */
+        release_object( key );
+        if (!flush_registry()) file_set_error();
+        return;
+    }
+#endif
     if ((key->flags & KEY_DIRTY) && !(key->flags & KEY_VOLATILE))
         find_branches_for_key( key, branches, &branch_count );
     release_object( key );

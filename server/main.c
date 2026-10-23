@@ -432,6 +432,7 @@ static const struct fd_ops inprocess_stop_ops =
 static void inprocess_cleanup( void *arg )
 {
     char line[160];
+    int registry_saved;
 
     /* Initialization, main-loop callbacks and cleanup share the same lock;
      * direct callers can never see half-initialized or destroyed objects. */
@@ -452,12 +453,12 @@ static void inprocess_cleanup( void *arg )
     }
     /* Save before the server's objects go away; a title killed by the system
      * never gets here, the periodic save in registry.c covers that. */
-    flush_registry();
+    registry_saved = flush_registry();
     close( config_dir_fd );
     close( server_dir_fd );
     config_dir_fd = server_dir_fd = -1;
-    snprintf( line, sizeof(line), "wine: in-process wineserver stopped; registry saved; desktop_requests=%u\n",
-              inprocess_desktop_requests );
+    snprintf( line, sizeof(line), "wine: in-process wineserver stopped; registry %s; desktop_requests=%u\n",
+              registry_saved ? "saved" : "save failed", inprocess_desktop_requests );
     sceKernelDebugOutText( 0, line );
     if (inprocess_direct_enabled) pthread_mutex_unlock( &inprocess_request_mutex );
 }

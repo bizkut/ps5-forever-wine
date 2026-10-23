@@ -83,6 +83,8 @@
 #include <newdev.h>
 #include <wincrypt.h>
 #include "resource.h"
+#include "wine/ps5_prefix_init.h"
+#include "ps5-crypto.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wineboot);
 
@@ -1656,25 +1658,32 @@ static void update_root_certs(void)
 }
 
 /* execute rundll32 on the wine.inf file if necessary */
-static void update_wineprefix( BOOL force )
+static BOOL update_wineprefix( BOOL force, BOOL require_complete )
 {
     const WCHAR *config_dir = _wgetenv( L"WINECONFIGDIR" );
     WCHAR *inf_path = get_wine_inf_path();
     int fd;
     struct stat st;
+    BOOL success = TRUE;
 
     if (!inf_path)
     {
         WINE_MESSAGE( "wine: failed to update %s, wine.inf not found\n", debugstr_w( config_dir ));
-        return;
+        return FALSE;
     }
     if ((fd = _wopen( inf_path, O_RDONLY )) == -1)
     {
         WINE_MESSAGE( "wine: failed to update %s with %s: %s\n",
                       debugstr_w(config_dir), debugstr_w(inf_path), strerror(errno) );
+        success = FALSE;
         goto done;
     }
-    fstat( fd, &st );
+    if (fstat( fd, &st ))
+    {
+        close( fd );
+        success = FALSE;
+        goto done;
+    }
     close( fd );
 
     if (update_timestamp( config_dir, st.st_mtime ) || force)
@@ -1682,22 +1691,37 @@ static void update_wineprefix( BOOL force )
         HANDLE process;
         DWORD count = 0;
 
-        if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
+        process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST );
+        if (process)
         {
             for (;;)
             {
                 if (process)
                 {
                     MSG msg;
-                    DWORD res = MsgWaitForMultipleObjects( 1, &process, FALSE, INFINITE, QS_ALLINPUT );
+                    DWORD exit_code, res = MsgWaitForMultipleObjects( 1, &process, FALSE, INFINITE, QS_ALLINPUT );
+
+                    if (require_complete && res == WAIT_FAILED)
+                    {
+                        WINE_ERR( "waiting for prefix installation failed (%lu).\n", GetLastError() );
+                        CloseHandle( process );
+                        success = FALSE;
+                        break;
+                    }
                     if (res != WAIT_OBJECT_0)
                     {
                         while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
                         continue;
                     }
+                    if (require_complete && (!GetExitCodeProcess( process, &exit_code ) || exit_code))
+                    {
+                        WINE_ERR( "prefix installation process failed.\n" );
+                        success = FALSE;
+                    }
                     CloseHandle( process );
                 }
-                if (!machines[count].Machine) break;
+                else if (require_complete) success = FALSE;
+                if (!success || !machines[count].Machine) break;
                 if (machines[count].Native)
                     process = start_rundll32( inf_path, L"DefaultInstall", IMAGE_FILE_MACHINE_TARGET_HOST );
                 else
@@ -1705,6 +1729,8 @@ static void update_wineprefix( BOOL force )
                 count++;
             }
         }
+        else if (require_complete) success = FALSE;
+        if (!success) goto done;
         install_root_pnp_devices();
         update_user_profile();
         update_win_version();
@@ -1715,6 +1741,7 @@ static void update_wineprefix( BOOL force )
 
 done:
     free( inf_path );
+    return success;
 }
 
 /* Process items in the StartUp group of the user's Programs under the Start Menu. Some installers put
@@ -1861,6 +1888,8 @@ int __cdecl main( int argc, char *argv[] )
     /* First, set the current directory to SystemRoot */
     int i, j;
     BOOL end_session, force, init, kill, restart, shutdown, update;
+    BOOL prefix_updated = TRUE, title_init;
+    const WCHAR *prefix_init;
     HANDLE event;
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING nameW = RTL_CONSTANT_STRING( L"\\KernelObjects\\__wineboot_event" );
@@ -1967,7 +1996,11 @@ int __cdecl main( int argc, char *argv[] )
         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
         start_services_process();
     }
-    if (init || update) update_wineprefix( update );
+    prefix_init = _wgetenv( L"WINEPS5_PREFIX_INIT" );
+    title_init = init && prefix_init && !wcscmp( prefix_init, L"1" );
+    /* A title is performing an explicit initialization/repair transaction, not
+     * a timestamp-only update.  A fresh stamp cannot prove registrations. */
+    if (init || update) prefix_updated = update_wineprefix( update || title_init, title_init );
 
     create_digitalproductid();
     create_volatile_environment_registry_key();
@@ -1985,23 +2018,18 @@ int __cdecl main( int argc, char *argv[] )
 
     WINE_TRACE("Operation done\n");
 
-    if (init)
+    if (title_init)
     {
-        /* A PS5 title creating its prefix waits for this: .update-timestamp
-         * is written before the install passes above run. */
-        const WCHAR *prefix_init = _wgetenv( L"WINEPS5_PREFIX_INIT" );
         const WCHAR *config_dir = _wgetenv( L"WINECONFIGDIR" );
-        if (prefix_init && !wcscmp( prefix_init, L"1" ) && config_dir)
+
+        /* Persist the checked registry data before emitting transient proof.
+         * The native title publishes its directory-synchronized persistent
+         * checkpoint only after all Wine processes have quiesced. */
+        if (!wineboot_finish_title_prefix(config_dir, prefix_updated))
         {
-            WCHAR *file = malloc( wcslen(config_dir) * sizeof(WCHAR) + sizeof(L"\\.wineboot-init-done") );
-            int fd;
-            if (file)
-            {
-                lstrcpyW( file, config_dir );
-                lstrcatW( file, L"\\.wineboot-init-done" );
-                if ((fd = _wopen( file, O_WRONLY | O_CREAT | O_TRUNC, 0666 )) != -1) close( fd );
-                free( file );
-            }
+            WINE_ERR( "could not certify title prefix initialization (%lu).\n", GetLastError() );
+            SetEvent( event );
+            return 1;
         }
     }
 
