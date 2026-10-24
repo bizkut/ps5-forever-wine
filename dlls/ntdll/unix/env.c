@@ -2004,7 +2004,13 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
      * Native Wine configuration remains the trusted game-role profile. */
     if (ps5_direct_enabled() && ps5_title_get_runtime()->parent_environment)
     {
+        static const WCHAR audioW[] = {'W','I','N','E','P','S','5','_','T','I','T','L','E','_','A','U','D','I','O',0};
+        static const WCHAR inputW[] = {'W','I','N','E','P','S','5','_','T','I','T','L','E','_','X','I','N','P','U','T',0};
+        static const WCHAR galliumW[] = {'G','A','L','L','I','U','M','_','D','R','I','V','E','R',0};
+        static const WCHAR zinkW[] = {'z','i','n','k',0};
+        const char *driver = getenv( "GALLIUM_DRIVER" );
         const struct wine_ps5_title_runtime *runtime = ps5_title_get_runtime();
+
         free( env );
         env_pos = runtime->parent_environment_bytes / sizeof(WCHAR);
         env_size = env_pos;
@@ -2014,14 +2020,9 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         /* The launcher cannot grant/revoke trusted title-role capabilities.
          * Refresh Wine's PE audio/input and the trusted graphics-role driver
          * selector; Jagex/session and all other launcher entries are unchanged. */
-        static const WCHAR audioW[] = {'W','I','N','E','P','S','5','_','T','I','T','L','E','_','A','U','D','I','O',0};
-        static const WCHAR inputW[] = {'W','I','N','E','P','S','5','_','T','I','T','L','E','_','X','I','N','P','U','T',0};
         env_pos = env[0] ? env_pos - 1 : 0; /* exclude final NUL (empty block has no entries) */
         set_env_var( &env, &env_pos, &env_size, audioW, ARRAY_SIZE(audioW) - 1, valueW );
         set_env_var( &env, &env_pos, &env_size, inputW, ARRAY_SIZE(inputW) - 1, valueW );
-        static const WCHAR galliumW[] = {'G','A','L','L','I','U','M','_','D','R','I','V','E','R',0};
-        static const WCHAR zinkW[] = {'z','i','n','k',0};
-        const char *driver = getenv( "GALLIUM_DRIVER" );
         if (driver && !strcmp( driver, "zink" ))
             set_env_var( &env, &env_pos, &env_size, galliumW, ARRAY_SIZE(galliumW) - 1, zinkW );
         env[env_pos++] = 0;
