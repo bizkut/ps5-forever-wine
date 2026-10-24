@@ -361,6 +361,44 @@ void *ps5_direct_reserve( void *base, size_t size )
 }
 /* WINE_PS5_CHUNKED_RESERVE_TEST_END */
 
+/* WINE_PS5_PLACEHOLDER_TEST_BEGIN */
+BOOL ps5_direct_reserve_placeholders(void)
+{
+    return direct_memory_enabled && direct_chunked_reserve;
+}
+
+void *ps5_direct_placeholder_reserve( void *base, size_t size, BOOL replace )
+{
+    void *placed = base;
+    int32_t result;
+    size_t flexible = 0;
+
+    /* Placeholders have no physical ownership or per-64-KiB metadata. Unlike
+     * direct-backed views, their legal split boundaries are host pages. FIXED
+     * is only used to reset an already-owned placeholder/replaced view. */
+    result = sceKernelReserveVirtualRange( &placed, size, replace ? PS5_KERNEL_MAP_FIXED : 0,
+                                          PS5_KERNEL_PAGE_SIZE );
+    if (result)
+    {
+        if (replace) ps5_direct_fail_fast(); /* never publish a partially reset view */
+        errno = result == (int32_t)0x8002000c ? ENOMEM : EEXIST;
+        return MAP_FAILED;
+    }
+    if (placed != base)
+    {
+        if (sceKernelMunmap( placed, size )) ps5_direct_fail_fast();
+        if (replace) ps5_direct_fail_fast();
+        errno = EEXIST;
+        return MAP_FAILED;
+    }
+    result = sceKernelAvailableFlexibleMemorySize( &flexible );
+    direct_log( "wine: ps5-placeholder pid=%d base=%p size=%zu replace=%d "
+                "flexible_free_bytes=%zu flexible_query_result=%#x\n",
+                (int)getpid(), base, size, replace, flexible, (unsigned int)result );
+    return base;
+}
+/* WINE_PS5_PLACEHOLDER_TEST_END */
+
 struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size )
 {
     struct ps5_direct_view *view, **prev;

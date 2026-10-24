@@ -289,6 +289,7 @@ static BOOL title_direct_cache_evict_range( void *base, size_t size );
 #define VPROT_NATIVE           0x1000
 #ifdef __PROSPERO__
 #define VPROT_PS5_DIRECT       0x2000  /* trusted-title direct-backed view */
+#define VPROT_PS5_PLACEHOLDER  0x4000  /* native reserve-only placeholder, no direct metadata */
 #endif
 
 /* Conversion from VPROT_* to Win32 flags */
@@ -2631,6 +2632,7 @@ struct alloc_area
     size_t native_mapped_size;
 #ifdef __PROSPERO__
     BOOL direct;
+    BOOL placeholder;
 #endif
 };
 
@@ -2648,8 +2650,9 @@ static void *map_alloc_area( const struct alloc_area *area, void *base )
         errno = ENOMEM;
         return MAP_FAILED;
     }
-    ret = area->direct ? ps5_direct_reserve( base, area->size ) :
-                        anon_mmap_tryfixed( base, area->size, area->unix_prot, 0 );
+    ret = area->placeholder ? ps5_direct_placeholder_reserve( base, area->size, FALSE ) :
+          area->direct ? ps5_direct_reserve( base, area->size ) :
+                         anon_mmap_tryfixed( base, area->size, area->unix_prot, 0 );
     if (ret != MAP_FAILED) ps5_title_note_reservation( ret, area->size );
     return ret;
 #else
@@ -2676,7 +2679,12 @@ static void* try_map_free_area( struct alloc_area *area, void *base, void *end, 
         TRACE( "Found free area is already mapped, start %p.\n", start );
         if (errno != EEXIST)
         {
-            ERR( "mmap() error %s, range %p-%p, unix_prot %#x.\n",
+            ERR( "%s() error %s, range %p-%p, unix_prot %#x.\n",
+#ifdef __PROSPERO__
+                 area->placeholder ? "reserve-placeholder" : area->direct ? "reserve-direct" : "mmap",
+#else
+                 "mmap",
+#endif
                  strerror(errno), start, (char *)start + size, unix_prot );
             return NULL;
         }
@@ -3976,7 +3984,10 @@ static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BO
     area.align_mask = align_mask;
 #ifdef __PROSPERO__
     area.direct = !!(vprot & VPROT_PS5_DIRECT);
+    area.placeholder = !!(vprot & VPROT_PS5_PLACEHOLDER);
     limit_low = ps5_direct_reserve_floor( limit_low, size, area.direct );
+    if (area.placeholder && size >= (size_t)0x20000000)
+        limit_low = max( limit_low, (char *)(UINT_PTR)0x1000000000 );
 #endif
 
     reserve_start = preload_reserve_start;
@@ -4091,6 +4102,11 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot, unsigned
      * there since. */
     if (!title_direct_cache_evict_range( base, ROUND_SIZE( 0, size, granularity_mask ) ))
         return STATUS_NO_MEMORY;
+    if (vprot & VPROT_PS5_PLACEHOLDER)
+    {
+        if (ps5_direct_placeholder_reserve( start, end - start, FALSE ) == MAP_FAILED) goto failed;
+        return STATUS_SUCCESS;
+    }
     if (vprot & VPROT_PS5_DIRECT)
     {
         if ((UINT_PTR)base & granularity_mask) return STATUS_CONFLICTING_ADDRESSES;
@@ -4221,6 +4237,14 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (!(view->protect & VPROT_FREE_PLACEHOLDER)) return STATUS_INVALID_PARAMETER;
 
         TRACE( "found view %p, size %p, protect %#x.\n", view->base, (void *)view->size, view->protect );
+#ifdef __PROSPERO__
+        /* Materialize only the replaced subset, with the original mmap
+         * lifecycle. Host-page splits must not acquire direct-memory units
+         * that also belong to neighbouring placeholders. */
+        if (view->protect & VPROT_PS5_PLACEHOLDER)
+            if (anon_mmap_fixed( base, host_size, unix_prot, 0 ) == MAP_FAILED)
+                return STATUS_NO_MEMORY;
+#endif
 
         view->protect = vprot | VPROT_PLACEHOLDER;
         set_vprot( view, base, size, vprot );
@@ -4269,6 +4293,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+#ifdef __PROSPERO__
+        /* Impossible reservations must not trim caches, clear native views
+         * or create metadata before V8 tries its smaller fallback. */
+        if (start >= end || host_size > (size_t)((char *)end - (char *)start))
+            return STATUS_NO_MEMORY;
+#endif
 #ifdef __PROSPERO__
         status = title_direct_cache_take( view_ret, NULL, size, vprot, (UINT_PTR)start,
                                           (UINT_PTR)end, align_mask, top_down );
@@ -4673,6 +4703,11 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
 static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *base, size_t size )
 {
     NTSTATUS status;
+#ifdef __PROSPERO__
+    unsigned int native = ps5_direct_reserve_placeholders() ? VPROT_PS5_PLACEHOLDER : 0;
+#else
+    unsigned int native = 0;
+#endif
 
     if (!size) return STATUS_INVALID_PARAMETER_3;
     if (!(view->protect & VPROT_PLACEHOLDER)) return STATUS_CONFLICTING_ADDRESSES;
@@ -4690,13 +4725,18 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
         status = remove_pages_from_view( view, base, size );
         if (status) return status;
 
-        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER );
+        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | native );
         if (status) return status;
     }
 
-    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
+#ifdef __PROSPERO__
+    if (native)
+        ps5_direct_placeholder_reserve( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), TRUE );
+    else
+#endif
+        anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), PROT_NONE, 0 );
+    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | native;
     set_page_vprot( view->base, view->size, 0 );
-    anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), PROT_NONE, 0 );
 #ifdef __PROSPERO__
     if (title_profile_is_enabled()) title_map_unmapped( view );
 #endif
@@ -8127,6 +8167,10 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (type & MEM_COMMIT) vprot |= VPROT_COMMITTED;
             if (type & MEM_WRITE_WATCH) vprot |= VPROT_WRITEWATCH;
             if (type & MEM_RESERVE_PLACEHOLDER) vprot |= VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
+#ifdef __PROSPERO__
+            if ((type & MEM_RESERVE_PLACEHOLDER) && ps5_direct_reserve_placeholders())
+                vprot |= VPROT_PS5_PLACEHOLDER;
+#endif
             if (protect & PAGE_NOCACHE) vprot |= SEC_NOCACHE;
 #ifdef __PROSPERO__
             if (ps5_direct_enabled() && !is_dos_memory &&
