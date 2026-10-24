@@ -1871,12 +1871,14 @@ int main( int argc, char *argv[] )
     {
         void (*init_func)(int, char **) = dlsym( handle, "__wine_main" );
 #ifdef __PROSPERO__
-        /* as for wineserver.so: this line places ntdll.so for llvm-symbolizer,
-         * and names the process, which the console's process lists and memory
-         * reports do not; one line per process, so always. The first argument
-         * tells Chromium's processes apart (--type=gpu-process, renderer) */
-        fprintf( stderr, "wine: pid %d ntdll.so __wine_main=%p %s %.60s\n", (int)getpid(), init_func,
-                 argc > 1 ? argv[1] : "", argc > 2 ? argv[2] : "" );
+        /* Keep the module placement for symbolization, but never print
+         * title argv: launcher-provided arguments may contain credentials. */
+        if (in_title)
+            fprintf( stderr, "wine: pid %d ntdll.so __wine_main=%p argc=%d argv=REDACTED\n",
+                     (int)getpid(), init_func, argc );
+        else
+            fprintf( stderr, "wine: pid %d ntdll.so __wine_main=%p %s %.60s\n", (int)getpid(), init_func,
+                     argc > 1 ? argv[1] : "", argc > 2 ? argv[2] : "" );
         if (in_title) ps5_run_title( handle, init_func, argc, argv, native_runtime );
 #endif
         if (init_func) init_func( argc, argv );
