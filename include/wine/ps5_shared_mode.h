@@ -12,6 +12,35 @@
 #ifndef WINE_PS5_SHARED_ROOT
 #define WINE_PS5_SHARED_ROOT "/data/runescape"
 #endif
+#define WINE_PS5_PRIVATE_HANDOFF_DIRECTORY WINE_PS5_SHARED_ROOT "/handoff"
+
+/* The only private exception inside the shared root. Normalize harmless slash
+ * and dot spellings, but never authorize a parent traversal. */
+static inline int wine_ps5_private_handoff_path( const char *path )
+{
+#ifdef WINE_PS5_RUNESCAPE
+    static const char root[] = WINE_PS5_SHARED_ROOT;
+    const char *first, *scan;
+    if (!path || strncmp( path, root, sizeof(root) - 1 ) ||
+        (path[sizeof(root) - 1] && path[sizeof(root) - 1] != '/')) return 0;
+    first = scan = path + sizeof(root) - 1;
+    while (*scan)
+    {
+        if (*scan++ != '/') continue;
+        if (scan[0] == '.' && scan[1] == '.' && (!scan[2] || scan[2] == '/')) return 0;
+    }
+    for (;;)
+    {
+        while (*first == '/') ++first;
+        if (first[0] == '.' && (!first[1] || first[1] == '/')) { ++first;continue; }
+        break;
+    }
+    return !strncmp( first, "handoff", 7 ) && (!first[7] || first[7] == '/');
+#else
+    (void)path;
+    return 0;
+#endif
+}
 
 static inline int wine_ps5_shared_path( const char *path )
 {
@@ -20,6 +49,7 @@ static inline int wine_ps5_shared_path( const char *path )
     const char *component;
     if (!path || strncmp( path, root, sizeof(root) - 1 ) ||
         (path[sizeof(root) - 1] && path[sizeof(root) - 1] != '/')) return 0;
+    if (wine_ps5_private_handoff_path( path )) return 0;
     component = path + sizeof(root) - 1;
     while (*component)
     {
@@ -98,7 +128,7 @@ static inline int wine_ps5_shared_resolve( const char *path, char resolved[4096]
                 {
                     resolved[length++] = '/';
                     strcpy(resolved + length, leaf);
-                    selected = 1;
+                    selected = wine_ps5_shared_path(resolved);
                 }
             }
         }
