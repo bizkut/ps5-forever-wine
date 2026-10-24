@@ -151,6 +151,13 @@ An unregistered trust action with no verification steps now fails with
 `TRUST_E_PROVIDER_UNKNOWN`, rather than reporting success without verification.
 There is no file/hash allowlist or signature-failure override.
 
+Products sharing the PS5 runtime may define `WB_USER_ROOT` (including its
+trailing slash) and `WB_TITLE_ID` consistently for both Wine and the native
+write broker. `include/wine/ps5_writebroker.h` retains `/data/forever/` and
+`PPSA99030` when no overrides are supplied. The root scopes broker admission,
+the token and icon paths; the title ID scopes home-screen icon replacement.
+Never mix differently configured Wine and broker binaries.
+
 
 The PS5 title write buffer admits regular-file writes to CASC archive layouts
 on C:/W: at any depth: the leaf is `data.NNN` with exactly three decimal
