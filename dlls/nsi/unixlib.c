@@ -13,6 +13,9 @@
 #include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __PROSPERO__
+#include <ps5platform/klog.h>
+#endif
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
@@ -62,18 +65,21 @@ static NTSTATUS unix_enumerate_tcp( void *args )
     if (InterlockedIncrement( &queries ) <= 32)
     {
         UINT_PTR i, shown = 0;
-        fprintf( stderr, "wine: nsi tcp query pid=%04x filter=%u status=%08x rows=%u owners=%u\n",
+        char line[256];
+        snprintf( line, sizeof(line), "wine: nsi tcp query pid=%04x filter=%u status=%08x rows=%u owners=%u\n",
                  (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess, filter,
                  (unsigned int)status, (unsigned int)params->count, !!params->static_size );
+        sceKernelDebugOutText( 0, line );
         if (!status && params->key_size && params->static_size)
             for (i = 0; i < params->count && shown < 16; i++)
             {
                 const struct nsi_tcp_conn_key *key = (const struct nsi_tcp_conn_key *)params->key_data + i;
                 const struct nsi_tcp_conn_static *stat = (const struct nsi_tcp_conn_static *)params->static_data + i;
                 if (key->local.si_family != WS_AF_INET || key->local.Ipv4.sin_addr.WS_s_addr != 0x0100007f) continue;
-                fprintf( stderr, "wine: nsi tcp loopback owner=%04x local_port=%u remote_port=%u\n",
+                snprintf( line, sizeof(line), "wine: nsi tcp loopback owner=%04x local_port=%u remote_port=%u\n",
                          stat->pid, RtlUshortByteSwap( key->local.Ipv4.sin_port ),
                          RtlUshortByteSwap( key->remote.Ipv4.sin_port ) );
+                sceKernelDebugOutText( 0, line );
                 shown++;
             }
     }
