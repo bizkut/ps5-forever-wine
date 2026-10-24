@@ -10,6 +10,16 @@ be used for porting Windows code into native Unix executables.
 Wine is free software, released under the GNU LGPL; see the file
 LICENSE for the details.
 
+The title-only PS5 direct allocator supports an opt-in
+`WINEPS5_CHUNKED_RESERVE=1` experiment. If a native reservation larger than
+4 GiB returns ENOMEM, it tries adjacent exact-hinted 1-GiB native reservations
+at the candidate selected by Wine's existing usable-address-range search.
+Displaced placements are rejected without replacing existing mappings. Any
+failed transaction releases every acquired chunk; rollback failure is fatal.
+The resulting single Wine view retains per-64-KiB ownership, including split
+release, decommit, protection and free/re-reserve alignment trimming. The flag
+defaults off; physical-memory capacity and address-space limits are unchanged.
+
 
 ## QUICK START
 

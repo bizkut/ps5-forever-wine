@@ -88,6 +88,7 @@ struct ps5_direct_pools
 static int direct_memory_enabled;
 static int direct_memory_initialized;
 static int direct_test_enabled;
+static int direct_chunked_reserve;
 static int64_t direct_memory_size;
 static char *metadata_next, *metadata_end;
 static struct ps5_direct_view *free_metadata;
@@ -277,6 +278,51 @@ static int32_t title_startup_direct_unmap( void *addr, size_t size )
 #define sceKernelMunmap(a,s) (__atomic_load_n( &ps5_title_startup_active, __ATOMIC_RELAXED ) ? \
                              title_startup_direct_unmap(a,s) : sceKernelMunmap(a,s))
 
+/* WINE_PS5_CHUNKED_RESERVE_TEST_BEGIN */
+/* Never use MAP_FIXED here: a kernel-only mapping can occupy a Wine-free
+ * candidate. Hints plus exact-placement checks preserve it. Reservations are
+ * owned by the existing per-64-KiB view bitmap, independently of their native
+ * chunk boundaries, so split/release/decommit keep the same ownership model. */
+static int direct_reserve_chunks( void *base, size_t size )
+{
+    const size_t chunk_size = (size_t)1 << 30;
+    size_t offset = 0, count;
+    void *placed;
+    int32_t result;
+
+    while (offset < size)
+    {
+        count = min( size - offset, chunk_size );
+        placed = (char *)base + offset;
+        result = sceKernelReserveVirtualRange( &placed, count, 0, DIRECT_UNIT_SIZE );
+        if (result) break;
+        if (placed != (char *)base + offset)
+        {
+            if (sceKernelMunmap( placed, count )) ps5_direct_fail_fast();
+            break;
+        }
+        offset += count;
+    }
+    if (offset == size)
+    {
+        direct_log( "wine: ps5-direct chunk-reserve base=%p size=%zu chunk=%zu result=0\n",
+                    base, size, chunk_size );
+        return 0;
+    }
+    /* Even ENOMEM may be placement-dependent. Let virtual.c's bounded,
+     * alignment/limit-aware free-area search try its next candidate. */
+    direct_log( "wine: ps5-direct chunk-reserve base=%p size=%zu owned=%zu "
+                "result=0x%08x actual=%p rollback=1\n", base, size, offset,
+                (unsigned int)result, placed );
+    while (offset)
+    {
+        count = min( offset, chunk_size );
+        offset -= count;
+        if (sceKernelMunmap( (char *)base + offset, count )) ps5_direct_fail_fast();
+    }
+    return EEXIST;
+}
+
 void *ps5_direct_reserve( void *base, size_t size )
 {
     void *placed = base;
@@ -287,6 +333,11 @@ void *ps5_direct_reserve( void *base, size_t size )
     result = sceKernelReserveVirtualRange( &placed, size, 0, DIRECT_UNIT_SIZE );
     if (result)
     {
+        if (direct_chunked_reserve && result == (int32_t)0x8002000c && size > ((size_t)4 << 30))
+        {
+            if (!(errno = direct_reserve_chunks( base, size ))) return base;
+            return MAP_FAILED;
+        }
         direct_error( "view-reserve", "reserve", result );
         errno = result == (int32_t)0x8002000c ? ENOMEM : EEXIST;
         return MAP_FAILED;
@@ -296,10 +347,14 @@ void *ps5_direct_reserve( void *base, size_t size )
      * the EEXIST miss anon_mmap_tryfixed() reports silently on the ordinary
      * path; try_map_free_area() probes the next candidate. Not a failure. */
     if ((result = sceKernelMunmap( placed, size )))
+    {
         direct_error( "view-reserve", "unmap-unexpected-reservation", result );
+        if (direct_chunked_reserve) ps5_direct_fail_fast();
+    }
     errno = EEXIST;
     return MAP_FAILED;
 }
+/* WINE_PS5_CHUNKED_RESERVE_TEST_END */
 
 struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size )
 {
@@ -1004,6 +1059,7 @@ void ps5_direct_init(void)
 {
     const char *memory_mode = getenv( "WINEPS5_DIRECT_MEMORY" );
     const char *test_mode = getenv( "WINEPS5_DIRECT_TEST" );
+    const char *chunk_mode = getenv( "WINEPS5_CHUNKED_RESERVE" );
     int enabled = memory_mode && !strcmp( memory_mode, "1" );
     int test = test_mode && !strcmp( test_mode, "1" );
     int error = 0;
@@ -1020,6 +1076,7 @@ void ps5_direct_init(void)
     direct_memory_initialized = 1;
     direct_memory_enabled = enabled;
     direct_test_enabled = enabled && test;
+    direct_chunked_reserve = enabled && chunk_mode && !strcmp( chunk_mode, "1" );
     if (enabled)
     {
         direct_memory_size = sceKernelGetDirectMemorySize();
