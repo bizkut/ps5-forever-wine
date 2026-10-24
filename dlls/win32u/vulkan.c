@@ -4584,6 +4584,11 @@ static VkResult nulldrv_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
         NtUserGetClientRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) );
         if (!(*client = nulldrv_client_surface_create( hwnd ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
         res = create( instance->host.instance, rect.right - rect.left, rect.bottom - rect.top, surface );
+#ifdef WINE_PS5_RUNESCAPE
+        MESSAGE( "wine: title Vulkan surface instance=%p hwnd=%p surface=%llx result=%d\n",
+                 instance->host.instance, hwnd,
+                 res ? 0ull : (unsigned long long)(UINT_PTR)*surface, res );
+#endif
         if (res) { client_surface_release( *client ); *client = NULL; }
         return res;
     }
