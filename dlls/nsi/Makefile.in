@@ -1,5 +1,7 @@
 MODULE    = nsi.dll
 IMPORTLIB = nsi
+UNIXLIB   = nsi.so
 
 SOURCES = \
-	nsi.c
+	nsi.c \
+	unixlib.c

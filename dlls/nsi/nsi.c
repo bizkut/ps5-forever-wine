@@ -17,15 +17,19 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winsock2.h"
 #include "winternl.h"
 #include "ws2ipdef.h"
 #include "iphlpapi.h"
 #include "netioapi.h"
 #include "iptypes.h"
+#define __WINE_INIT_NPI_MODULEID
 #include "netiodef.h"
 #include "wine/nsi.h"
 #include "wine/debug.h"
+#include "wine/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 
@@ -38,6 +42,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
     {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls( hinst );
+            __wine_init_unix_call();
             break;
         case DLL_PROCESS_DETACH:
             if (nsi_device != INVALID_HANDLE_VALUE) CloseHandle( nsi_device );
@@ -164,10 +169,20 @@ DWORD WINAPI NsiEnumerateObjectsAllParameters( DWORD unk, DWORD unk2, const NPI_
 DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *params )
 {
     DWORD out_size, received, err = ERROR_SUCCESS;
-    HANDLE device = get_nsi_device( FALSE );
+    HANDLE device;
     struct nsiproxy_enumerate_all in;
     BYTE *out, *ptr;
 
+    /* TCP ownership lives in wineserver, not a privileged host TCP table.
+     * Sandboxed title processes cannot start the NSI driver service. */
+    if (__wine_unixlib_handle && NmrIsEqualNpiModuleId( params->module, &NPI_MS_TCP_MODULEID ) &&
+        (params->table == NSI_TCP_ALL_TABLE || params->table == NSI_TCP_ESTAB_TABLE ||
+         params->table == NSI_TCP_LISTEN_TABLE))
+    {
+        NTSTATUS status = WINE_UNIX_CALL( 0, params );
+        if (status != STATUS_NOT_SUPPORTED) return RtlNtStatusToDosError( status );
+    }
+    device = get_nsi_device( FALSE );
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
     out_size = sizeof(DWORD) +

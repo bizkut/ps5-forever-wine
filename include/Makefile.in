@@ -983,6 +983,7 @@ SOURCES = \
 	wine/mscvpdb.h \
 	wine/mssign.h \
 	wine/nsi.h \
+	wine/nsi_tcp.h \
 	wine/opengl_driver.h \
 	wine/orpc.idl \
 	wine/plugplay.idl \

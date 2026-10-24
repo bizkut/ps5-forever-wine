@@ -36,6 +36,18 @@ adds counts and
 ASCII digit/Latin-letter/other classes only; it is enabled by RuneScape's build
 identity, not by Forever's default configuration.
 
+PS5 title TCP-owner queries no longer require the unavailable NSI driver
+service: `nsi.dll` uses `nsi.so` for the TCP all/established/listener tables,
+with the same `wine/nsi_tcp.h` conversion used by `nsiproxy.sys`. The shared
+wineserver supplies each socket's Windows owner PID and recorded endpoint
+tuple across native child processes; no host PID is substituted. IPv6 scope
+IDs are taken from the socket's recorded addresses. Non-title runtimes and
+other NSI modules/tables retain the device path; query failures and invalid or
+short buffers remain failures. Both matching PE architectures and `nsi.so`
+must be staged together. Bounded `wine: nsi tcp query`/`loopback` diagnostics
+contain statuses, counts, Windows PIDs and loopback ports only, never external
+addresses, paths, URLs or endpoint tokens.
+
 
 ## QUICK START
 
