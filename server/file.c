@@ -749,8 +749,10 @@ int set_file_sd( struct object *obj, struct fd *fd, mode_t *mode, uid_t *uid,
             /* keep the bits that we don't map to access rights in the ACL */
             new_mode = st.st_mode & (S_ISUID|S_ISGID|S_ISVTX);
             new_mode |= sd_to_mode( new_sd, owner );
+            if (S_ISDIR(st.st_mode) || st.st_nlink == 1)
+                new_mode = get_shared_fd_mode( fd, st.st_mode, new_mode );
 
-            if (((st.st_mode ^ new_mode) & (S_IRWXU|S_IRWXG|S_IRWXO)) && fchmod( unix_fd, new_mode ) == -1)
+            if (((st.st_mode ^ new_mode) & 07777) && fchmod( unix_fd, new_mode ) == -1)
             {
                 free( new_sd );
                 file_set_error();

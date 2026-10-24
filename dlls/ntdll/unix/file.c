@@ -105,6 +105,7 @@
 #endif
 #include <time.h>
 #include <unistd.h>
+#include "wine/ps5_shared_mode.h"
 #ifdef __PROSPERO__
 # include <ps5platform/klog.h>
 # include <sys/mman.h>
@@ -2236,14 +2237,16 @@ static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
 
 /* return TRUE if this is a file owned by Wine which applications should not try to mess with. */
-static BOOL is_wine_file( HANDLE handle )
+static BOOL is_wine_file( HANDLE handle, BOOL *shared )
 {
     char *unix_name;
     BOOL ret;
+    *shared = FALSE;
 
     if (server_get_unix_name( handle, &unix_name ))
         return FALSE;
     ret = strstr(unix_name, "/lib/wine/" ) || strstr( unix_name, "/lib64/wine/" ) ||strstr( unix_name, "/share/wine/" );
+    *shared = wine_ps5_shared_existing_path( unix_name );
     free(unix_name);
     return ret;
 }
@@ -2253,9 +2256,21 @@ static BOOL is_wine_file( HANDLE handle )
 static NTSTATUS fd_set_file_info( int fd, HANDLE handle, UINT attr, BOOL force_set_xattr )
 {
     struct stat st;
+    BOOL shared = FALSE, wine_file;
+    mode_t original_mode;
 
     if (fstat( fd, &st ) == -1) return errno_to_status( errno );
-    if (attr & FILE_ATTRIBUTE_READONLY)
+    original_mode = st.st_mode;
+#ifdef WINE_PS5_RUNESCAPE
+    wine_file = is_wine_file( handle, &shared );
+#else
+    wine_file = !(attr & FILE_ATTRIBUTE_READONLY) && is_wine_file( handle, &shared );
+#endif
+    if ((!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) ||
+        (S_ISREG(st.st_mode) && st.st_nlink > 1)) shared = FALSE;
+    if (shared)
+        st.st_mode = wine_ps5_shared_permissions( st.st_mode );
+    else if (attr & FILE_ATTRIBUTE_READONLY)
     {
         if (S_ISDIR( st.st_mode))
             WARN("FILE_ATTRIBUTE_READONLY ignored for directory.\n");
@@ -2264,7 +2279,7 @@ static NTSTATUS fd_set_file_info( int fd, HANDLE handle, UINT attr, BOOL force_s
     }
     else
     {
-        if (is_wine_file( handle ))
+        if (wine_file)
         {
             TRACE("HACK: Not giving write permission to wine file!\n");
             return STATUS_ACCESS_DENIED;
@@ -2275,7 +2290,8 @@ static NTSTATUS fd_set_file_info( int fd, HANDLE handle, UINT attr, BOOL force_s
             st.st_mode |= (0600 | ((st.st_mode & 044) >> 1)) & (~start_umask);
         }
     }
-    if (fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
+    if ((!shared || ((original_mode ^ st.st_mode) & 07777)) &&
+        fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
 
     /* if the file has multiple names, we can't be sure that it is safe to not
        set the extended attribute, since any of the names could start with a dot */

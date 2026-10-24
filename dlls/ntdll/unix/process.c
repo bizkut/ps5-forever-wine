@@ -869,6 +869,13 @@ static char *ps5_winebrowser_url( const UNICODE_STRING *command )
 #endif
 
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static NTSTATUS ps5_create_game_acknowledgement( HANDLE *, HANDLE *, ACCESS_MASK, ACCESS_MASK,
+                                                OBJECT_ATTRIBUTES *, OBJECT_ATTRIBUTES *, ULONG, ULONG,
+                                                RTL_USER_PROCESS_PARAMETERS *, PS_CREATE_INFO *,
+                                                PS_ATTRIBUTE_LIST *, const struct wine_ps5_title_game_launch * );
+#endif
+
 /* The internal entry lets B2 create a stand-in without routing it again. */
 static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr,
                                     ACCESS_MASK process_access, ACCESS_MASK thread_access,
@@ -1110,21 +1117,41 @@ static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_
                 while (*end) end += wcslen(end) + 1;
                 launch.environment_bytes = (end + 1 - params->Environment) * sizeof(WCHAR);
             }
+#ifdef WINE_PS5_RUNESCAPE
+            status = STATUS_NO_MEMORY;
+#endif
             if (!launch.argv || (params->CurrentDirectory.DosPath.Length && !windows_cwd))
                 ret = ENOMEM;
             else
+            {
+#ifdef WINE_PS5_RUNESCAPE
+                status = ps5_create_game_acknowledgement( process_handle_ptr, thread_handle_ptr,
+                    process_access, thread_access, process_attr, thread_attr, process_flags, thread_flags,
+                    params, info, ps_attr, &launch );
+                ret = status ? EIO : 0;
+#else
                 ret = ps5_title_get_runtime()->game_launch( &launch );
+#endif
+            }
             free( launch.argv );
             free( windows_cwd );
             free( dos_image );
             {
                 char line[160];
+#ifdef WINE_PS5_RUNESCAPE
+                snprintf( line, sizeof(line),
+                          "wine: title game launch caught image=%s result=%d create_status=%08x argv=REDACTED cwd=REDACTED\n",
+                          basename, ret, status );
+#else
                 snprintf( line, sizeof(line),
                           "wine: title game launch caught image=%s result=%d argv=REDACTED cwd=REDACTED\n",
                           basename, ret );
+#endif
                 sceKernelDebugOutText( 0, line );
             }
+#ifndef WINE_PS5_RUNESCAPE
             status = ret ? STATUS_UNSUCCESSFUL : STATUS_CANCELLED;
+#endif
             goto done;
         }
         free( dos_image );
@@ -1336,6 +1363,80 @@ done:
     free( nt_name.Buffer );
     return status;
 }
+
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+/* Return a real successful CreateProcess transaction to the resident launcher.
+ * The private bootstrap event starts its orderly shutdown only after the
+ * original game command/environment has been copied by the native supervisor. */
+static NTSTATUS ps5_create_game_acknowledgement( HANDLE *process, HANDLE *thread,
+    ACCESS_MASK process_access, ACCESS_MASK thread_access, OBJECT_ATTRIBUTES *process_attr,
+    OBJECT_ATTRIBUTES *thread_attr, ULONG process_flags, ULONG thread_flags,
+    RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info, PS_ATTRIBUTE_LIST *attributes,
+    const struct wine_ps5_title_game_launch *launch )
+{
+    static const WCHAR imageW[] = {'C',':','\\','w','i','n','d','o','w','s','\\',
+                                  's','y','s','t','e','m','3','2','\\','c','m','d','.','e','x','e',0};
+    static const WCHAR nt_imageW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                                     's','y','s','t','e','m','3','2','\\','c','m','d','.','e','x','e',0};
+    static const WCHAR commandW[] = {'c','m','d','.','e','x','e',' ','/','c',' ','e','x','i','t',' ','0',0};
+    RTL_USER_PROCESS_PARAMETERS ack_params = *params;
+    PS_ATTRIBUTE_LIST *ack_attributes;
+    OBJECT_ATTRIBUTES event_attr;
+    UNICODE_STRING event_name;
+    WCHAR nameW[128];
+    char name[128];
+    HANDLE event;
+    SIZE_T count = (attributes->TotalLength - sizeof(attributes->TotalLength)) / sizeof(PS_ATTRIBUTE);
+    SIZE_T used = 0;
+    NTSTATUS status;
+
+    snprintf( name, sizeof(name), "\\Sessions\\%u\\BaseNamedObjects\\RuneScapeOsrsHandoff",
+              NtCurrentTeb()->Peb->SessionId );
+    ascii_to_unicode( nameW, name, strlen(name) + 1 );
+    init_unicode_string( &event_name, nameW );
+    InitializeObjectAttributes( &event_attr, &event_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    if ((status = NtOpenEvent( &event, EVENT_MODIFY_STATE, &event_attr ))) return status;
+    ack_attributes = malloc( sizeof(attributes->TotalLength) + (count + 1) * sizeof(PS_ATTRIBUTE) );
+    if (!ack_attributes)
+    {
+        NtClose( event );
+        return STATUS_NO_MEMORY;
+    }
+    for (SIZE_T i = 0; i < count; ++i)
+        if (attributes->Attributes[i].Attribute != PS_ATTRIBUTE_IMAGE_NAME)
+            ack_attributes->Attributes[used++] = attributes->Attributes[i];
+    ack_attributes->Attributes[used++] = (PS_ATTRIBUTE)
+    {
+        .Attribute = PS_ATTRIBUTE_IMAGE_NAME,
+        .Size = sizeof(nt_imageW) - sizeof(WCHAR),
+        .ValuePtr = (WCHAR *)nt_imageW
+    };
+    ack_attributes->TotalLength = sizeof(ack_attributes->TotalLength) + used * sizeof(PS_ATTRIBUTE);
+    init_unicode_string( &ack_params.ImagePathName, imageW );
+    init_unicode_string( &ack_params.CommandLine, commandW );
+    /* Detached acknowledgement: never allocate a conhost/extra title child. */
+    ack_params.ConsoleHandle = 0;
+    ack_params.ConsoleFlags = 0;
+    status = create_user_process( process, thread, process_access, thread_access, process_attr, thread_attr,
+                                  process_flags, thread_flags, &ack_params, info, ack_attributes, FALSE );
+    free( ack_attributes );
+    if (!status)
+    {
+        int error = ps5_title_get_runtime()->game_launch( launch );
+        status = error ? STATUS_UNSUCCESSFUL : NtSetEvent( event, NULL );
+        if (status)
+        {
+            NtTerminateProcess( *process, status );
+            NtClose( *thread );
+            NtClose( *process );
+            *process = *thread = 0;
+        }
+    }
+    NtClose( event );
+    return status;
+}
+#endif
+
 
 #ifdef __PROSPERO__
 static BOOL wcs_has_ascii( const WCHAR *str, size_t len, const char *needle, size_t needle_len )

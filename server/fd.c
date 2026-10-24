@@ -78,6 +78,7 @@ extern char *ps5_realpath( const char *, char * );
 #undef LIST_ENTRY
 #endif
 #include <sys/stat.h>
+#include "wine/ps5_shared_mode.h"
 #include <sys/time.h>
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -2598,6 +2599,12 @@ char *dup_fd_name( struct fd *root, const char *name )
     return ret;
 }
 
+mode_t get_shared_fd_mode( struct fd *fd, mode_t current, mode_t requested )
+{
+    if (!S_ISREG(current) && !S_ISDIR(current)) return requested;
+    return wine_ps5_shared_existing_path( fd->unix_name ) ? wine_ps5_shared_permissions( current ) : requested;
+}
+
 static WCHAR *dup_nt_name( struct fd *root, struct unicode_str name, data_size_t *len )
 {
     WCHAR *ptr, *ret;
@@ -2742,6 +2749,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     struct fd *fd;
     int root_fd = -1;
     int rw_mode;
+    int shared_create = flags & O_CREAT;
     char *path;
 #ifdef __PROSPERO__
     char *title_name = NULL;
@@ -2784,6 +2792,20 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             }
         }
     }
+
+#ifdef WINE_PS5_RUNESCAPE
+    {
+        char shared_path[4096];
+#ifdef __PROSPERO__
+        int shared = wine_ps5_shared_resolve( name, shared_path, ps5_realpath );
+#else
+        int shared = wine_ps5_shared_resolve( name, shared_path, realpath );
+#endif
+        if (shared)
+            *mode = wine_ps5_shared_permissions( (options & FILE_DIRECTORY_FILE) ? S_IFDIR :
+                     S_IFREG | (is_file_executable( name ) ? 0111 : 0) ) & ~S_IFMT;
+    }
+#endif
 
     /* create the directory if needed */
     if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
@@ -2919,6 +2941,22 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         {
             set_error( err );
             goto error;
+        }
+
+        /* Apply after sharing validation and through the held descriptor:
+         * creation umasks cannot make the shared data private again. */
+        if (shared_create && (S_ISDIR(st.st_mode) || st.st_nlink == 1))
+        {
+            mode_t wanted = get_shared_fd_mode( fd, st.st_mode, st.st_mode );
+            if ((wanted & 07777) != (st.st_mode & 07777))
+            {
+                if (fchmod( fd->unix_fd, wanted ) == -1)
+                {
+                    file_set_error();
+                    goto error;
+                }
+                st.st_mode = *mode = wanted;
+            }
         }
 
         /* can't unlink files if we don't have permission to access */
@@ -3884,11 +3922,23 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
 
     if (is_file_executable( fd->unix_name ) != is_file_executable( name ) && !fstat( fd->unix_fd, &st ))
     {
+#ifdef WINE_PS5_RUNESCAPE
+        mode_t execute = st.st_mode & 0111;
+        char shared_path[4096];
+#endif
         if (is_file_executable( name ))
             /* set executable bit where read bit is set */
             st.st_mode |= (st.st_mode & 0444) >> 2;
         else
             st.st_mode &= ~0111;
+#ifdef WINE_PS5_RUNESCAPE
+#ifdef __PROSPERO__
+        if (st.st_nlink == 1 && wine_ps5_shared_resolve( name, shared_path, ps5_realpath ))
+#else
+        if (st.st_nlink == 1 && wine_ps5_shared_resolve( name, shared_path, realpath ))
+#endif
+            st.st_mode = wine_ps5_shared_permissions( st.st_mode | execute );
+#endif
         fchmod( fd->unix_fd, st.st_mode );
     }
 

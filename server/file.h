@@ -113,6 +113,7 @@ extern void allow_fd_parking( struct fd *fd );
 #endif
 extern void set_fd_signaled( struct fd *fd, int signaled );
 extern char *dup_fd_name( struct fd *root, const char *name ) __WINE_DEALLOC(free) __WINE_MALLOC;
+extern mode_t get_shared_fd_mode( struct fd *fd, mode_t current, mode_t requested );
 extern void get_nt_name( struct fd *fd, struct unicode_str *name );
 
 extern struct object *default_fd_get_sync( struct object *obj );
