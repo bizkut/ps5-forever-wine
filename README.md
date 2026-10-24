@@ -22,6 +22,20 @@ The resulting single Wine view retains per-64-KiB ownership, including split
 release, decommit, protection and free/re-reserve alignment trimming. The flag
 defaults off; physical-memory capacity and address-space limits are unchanged.
 
+Unicode keyboard packets carry their UTF-16 unit in private hardware-message
+metadata, not the application's `VK_PACKET` scan-code bits. Key messages expose
+scan code zero, while low-level hooks retain the original unit and
+`TranslateMessage` posts the corresponding `WM_CHAR`. This prevents a character
+such as U+0039 from masquerading as the physical Space key (scan 0x39).
+The change is generic, not product-gated; PS5 GPU-parent text already posted
+`WM_CHAR` directly and keeps that delivery path. Packet translation uses the
+receiving thread's most recently retrieved packet: deferring translation until
+after retrieving a later packet does not retain the earlier unit. The protocol
+version advances to require matching client/server builds. `WINEPS5_TEXT_DIAG`
+adds counts and
+ASCII digit/Latin-letter/other classes only; it is enabled by RuneScape's build
+identity, not by Forever's default configuration.
+
 
 ## QUICK START
 

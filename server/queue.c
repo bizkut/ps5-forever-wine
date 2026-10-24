@@ -2442,6 +2442,7 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     unsigned char vkey = input->kbd.vkey, hook_vkey = vkey;
     unsigned int message_code, time;
     lparam_t lparam = input->kbd.scan << 16;
+    lparam_t hook_lparam;
     unsigned int flags = 0;
     BOOL unicode = input->kbd.flags & KEYEVENTF_UNICODE;
     int wait;
@@ -2580,21 +2581,30 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     msg->msg       = message_code;
     if (origin == IMO_INJECTED) msg_data->flags = LLKHF_INJECTED;
 
+    if (input->kbd.flags & KEYEVENTF_KEYUP) flags |= KF_REPEAT | KF_UP;
+    else if (desktop_shm->keystate[vkey] & 0x80) flags |= KF_REPEAT;
     if (!unicode || input->kbd.vkey)
     {
         if (input->kbd.flags & KEYEVENTF_EXTENDEDKEY) flags |= KF_EXTENDED;
         /* FIXME: set KF_DLGMODE and KF_MENUMODE when needed */
-        if (input->kbd.flags & KEYEVENTF_KEYUP) flags |= KF_REPEAT | KF_UP;
-        else if (desktop_shm->keystate[vkey] & 0x80) flags |= KF_REPEAT;
-
         lparam &= 0xff0000; /* mask off scan code high bits for non-unicode input */
-        msg_data->flags |= (flags & (KF_EXTENDED | KF_ALTDOWN | KF_UP)) >> 8;
+    }
+    msg_data->flags |= (flags & (KF_EXTENDED | KF_ALTDOWN | KF_UP)) >> 8;
+    hook_lparam = lparam;
+    if (unicode && vkey == VK_PACKET)
+    {
+        /* Windows exposes no physical scan code for Unicode packets. Keep
+         * the UTF-16 unit in private message data for TranslateMessage, not
+         * in the application-visible key's scan bits (e.g. '9' == Space).
+         * The low-level keyboard hook still receives the Unicode unit. */
+        msg_data->unicode_char = (lparam >> 16) + 1;
+        lparam = 0;
     }
 
     msg->wparam = vkey;
     msg->lparam = (flags << 16) | lparam | 1u /* repeat count */;
 
-    if (!(wait = send_hook_ll_message( desktop, msg, WH_KEYBOARD_LL, lparam | hook_vkey, sender )))
+    if (!(wait = send_hook_ll_message( desktop, msg, WH_KEYBOARD_LL, hook_lparam | hook_vkey, sender )))
         queue_hardware_message( desktop, msg, 1 );
 
     return wait;

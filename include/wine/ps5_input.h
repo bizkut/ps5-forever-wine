@@ -2,6 +2,10 @@
 #ifndef __WINE_PS5_INPUT_H
 #define __WINE_PS5_INPUT_H
 #include "wine/ps5_desktop.h"
+#ifdef WINEPS5_TEXT_DIAG
+#include <stdio.h>
+extern int sceKernelDebugOutText( int channel, const char *text );
+#endif
 
 struct hid_key
 {
@@ -87,15 +91,39 @@ static inline void send_text( const struct ps5_desktop_text *text )
 {
     INPUT input = { .type = INPUT_KEYBOARD };
     unsigned int i;
+#ifdef WINEPS5_TEXT_DIAG
+    unsigned int failed = 0, digit = 0, letter = 0, other = 0;
+    char line[160];
+#endif
 
     for (i = 0; i < text->length; i++)
     {
         input.ki.wScan = text->text[i];
         input.ki.dwFlags = KEYEVENTF_UNICODE;
+#ifdef WINEPS5_TEXT_DIAG
+        /* NtUserSendHardwareInput forwards NTSTATUS, despite its BOOL type.
+         * Zero means queued, not consumed by the application. */
+        failed += !!NtUserSendHardwareInput( 0, SEND_HWMSG_NO_RAW, &input, 0 );
+        if (text->text[i] >= '0' && text->text[i] <= '9') digit++;
+        else if ((text->text[i] >= 'A' && text->text[i] <= 'Z') ||
+                 (text->text[i] >= 'a' && text->text[i] <= 'z')) letter++;
+        else other++;
+#else
         NtUserSendHardwareInput( 0, SEND_HWMSG_NO_RAW, &input, 0 );
+#endif
         input.ki.dwFlags |= KEYEVENTF_KEYUP;
+#ifdef WINEPS5_TEXT_DIAG
+        failed += !!NtUserSendHardwareInput( 0, SEND_HWMSG_NO_RAW, &input, 0 );
+#else
         NtUserSendHardwareInput( 0, SEND_HWMSG_NO_RAW, &input, 0 );
+#endif
     }
+#ifdef WINEPS5_TEXT_DIAG
+    snprintf( line, sizeof(line),
+              "wine: desktop text length=%u digit=%u letter=%u other=%u packets=%u failed=%u via=unicode\n",
+              text->length, digit, letter, other, text->length * 2, failed );
+    sceKernelDebugOutText( 0, line );
+#endif
 }
 
 static inline void post_voice_key( HWND target, unsigned int usage )

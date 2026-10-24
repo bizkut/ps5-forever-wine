@@ -1195,9 +1195,9 @@ static void test_SendInput_keyboard_messages( WORD vkey, WORD scan, WCHAR wch, W
     struct send_input_keyboard_test unicode[] =
     {
         {.scan = 0x3c0, .flags = KEYEVENTF_UNICODE, .expect_state = {[VK_PACKET] = 0x80},
-         .expect = {KEY_HOOK(WM_KEYDOWN, 0x3c0, VK_PACKET), KEY_MSG(WM_KEYDOWN, 0, VK_PACKET, .todo_value = TRUE), WIN_MSG(WM_CHAR, 0x3c0, 1), {0}}},
+         .expect = {KEY_HOOK(WM_KEYDOWN, 0x3c0, VK_PACKET), KEY_MSG(WM_KEYDOWN, 0, VK_PACKET), WIN_MSG(WM_CHAR, 0x3c0, 1), {0}}},
         {.scan = 0x3c0, .flags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-         .expect = {KEY_HOOK(WM_KEYUP, 0x3c0, VK_PACKET, .todo_value = TRUE), KEY_MSG(WM_KEYUP, 0, VK_PACKET, .todo_value = TRUE), {0}}},
+         .expect = {KEY_HOOK(WM_KEYUP, 0x3c0, VK_PACKET), KEY_MSG(WM_KEYUP, 0, VK_PACKET), {0}}},
         {0},
     };
 
@@ -1264,9 +1264,9 @@ static void test_SendInput_keyboard_messages( WORD vkey, WORD scan, WCHAR wch, W
     struct send_input_keyboard_test unicode_vkey_packet[] =
     {
         {.scan = 0x3c0, .vkey = VK_PACKET, .flags = KEYEVENTF_UNICODE, .expect_state = {[VK_PACKET] = 0x80},
-         .expect = {KEY_HOOK(WM_KEYDOWN, 0xc0, VK_PACKET), KEY_MSG(WM_KEYDOWN, 0, VK_PACKET, .todo_value = TRUE), WIN_MSG(WM_CHAR, 0xc0, 1), {0}}},
+         .expect = {KEY_HOOK(WM_KEYDOWN, 0xc0, VK_PACKET), KEY_MSG(WM_KEYDOWN, 0, VK_PACKET), WIN_MSG(WM_CHAR, 0xc0, 1), {0}}},
         {.scan = 0x3c0, .vkey = VK_PACKET, .flags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-         .expect = {KEY_HOOK(WM_KEYUP, 0xc0, VK_PACKET), KEY_MSG(WM_KEYUP, 0, VK_PACKET, .todo_value = TRUE), {0}}},
+         .expect = {KEY_HOOK(WM_KEYUP, 0xc0, VK_PACKET), KEY_MSG(WM_KEYUP, 0, VK_PACKET), {0}}},
         {0},
     };
 
@@ -1505,9 +1505,9 @@ static void test_SendInput_raw_key_messages( WORD vkey, WORD wch, HKL hkl )
     struct send_input_keyboard_test raw_unicode_legacy[] =
     {
         {.scan = 0x3c0, .flags = KEYEVENTF_UNICODE, .expect_state = {[VK_PACKET] = 0x80},
-         .expect = {KEY_MSG(WM_KEYDOWN, 0, VK_PACKET, .todo_value = TRUE), WIN_MSG(WM_CHAR, 0x3c0, 1), {0}}},
+         .expect = {KEY_MSG(WM_KEYDOWN, 0, VK_PACKET), WIN_MSG(WM_CHAR, 0x3c0, 1), {0}}},
         {.scan = 0x3c0, .flags = KEYEVENTF_KEYUP | KEYEVENTF_UNICODE,
-         .expect = {KEY_MSG(WM_KEYUP, 0, VK_PACKET, .todo_value = TRUE), {0}}},
+         .expect = {KEY_MSG(WM_KEYUP, 0, VK_PACKET), {0}}},
         {0},
     };
     struct send_input_keyboard_test raw_unicode_nolegacy[] =

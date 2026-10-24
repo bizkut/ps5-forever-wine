@@ -291,7 +291,7 @@ struct hardware_msg_data
 {
     lparam_t             info;
     data_size_t          size;
-    int                  __pad;
+    unsigned int         unicode_char;
     unsigned int         hw_id;
     unsigned int         flags;
     struct hw_msg_source source;
@@ -7094,6 +7094,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 930
+#define SERVER_PROTOCOL_VERSION 931
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

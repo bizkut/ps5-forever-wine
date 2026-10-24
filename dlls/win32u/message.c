@@ -40,6 +40,10 @@
 #ifdef __PROSPERO__
 #include "wine/ps5_title.h"
 #endif
+#ifdef WINEPS5_TEXT_DIAG
+#include <stdio.h>
+extern int sceKernelDebugOutText( int channel, const char *text );
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
@@ -2511,7 +2515,7 @@ static BOOL process_pointer_message( MSG *msg, UINT hw_id, const struct hardware
  *
  * returns TRUE if the contents of 'msg' should be passed to the application
  */
-static BOOL process_keyboard_message( MSG *msg, UINT hw_id, HWND hwnd_filter,
+static BOOL process_keyboard_message( MSG *msg, UINT hw_id, const struct hardware_msg_data *msg_data, HWND hwnd_filter,
                                       UINT first, UINT last, BOOL remove )
 {
     EVENTMSG event;
@@ -2586,6 +2590,14 @@ static BOOL process_keyboard_message( MSG *msg, UINT hw_id, HWND hwnd_filter,
     if (remove && (msg->message == WM_KEYDOWN || msg->message == WM_KEYUP))
         if (ImmProcessKey( msg->hwnd, NtUserGetKeyboardLayout(0), msg->wParam, msg->lParam, 0 ))
             msg->wParam = VK_PROCESSKEY;
+
+    /* Like keyboard state, Unicode packet translation belongs to the
+     * receiving thread, not a physical scan code in the returned MSG.
+     * Preserve it across key-up and unrelated peeks. TranslateMessage uses
+     * the most recently retrieved packet; deferred translation after
+     * retrieving a later packet does not retain the earlier character. */
+    if (msg->wParam == VK_PACKET && (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN))
+        get_user_thread_info()->packet_char = msg_data->unicode_char;
 
     return TRUE;
 }
@@ -2907,7 +2919,7 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
     if (msg->message == WM_INPUT || msg->message == WM_INPUT_DEVICE_CHANGE)
         ret = process_rawinput_message( msg, hw_id, msg_data );
     else if (is_keyboard_message( msg->message ))
-        ret = process_keyboard_message( msg, hw_id, hwnd_filter, first, last, remove );
+        ret = process_keyboard_message( msg, hw_id, msg_data, hwnd_filter, first, last, remove );
     else if (is_mouse_message( msg->message ))
         ret = process_mouse_message( msg, hw_id, msg_data->info, hwnd_filter, first, last, remove );
     else if (msg->message >= WM_POINTERUPDATE && msg->message <= WM_POINTERLEAVE)
@@ -4927,12 +4939,32 @@ BOOL WINAPI NtUserTranslateMessage( const MSG *msg, UINT flags )
     switch (msg->wParam)
     {
     case VK_PACKET:
+    {
+        unsigned int packet = get_user_thread_info()->packet_char;
+        WCHAR unit = packet - 1;
+#ifdef WINEPS5_TEXT_DIAG
+        BOOL queued;
+        unsigned int scan_zero = !(HIWORD(msg->lParam) & 0xff);
+        unsigned int digit = unit >= '0' && unit <= '9';
+        unsigned int letter = (unit >= 'A' && unit <= 'Z') || (unit >= 'a' && unit <= 'z');
+        char line[128];
+#endif
+        if (!packet) return TRUE;
         message = (msg->message == WM_KEYDOWN) ? WM_CHAR : WM_SYSCHAR;
         TRACE_(key)( "PostMessageW(%p,%s,%04x,%08x)\n", msg->hwnd,
                      debugstr_msg_name( message, msg->hwnd ),
-                     HIWORD(msg->lParam), LOWORD(msg->lParam) );
-        NtUserPostMessage( msg->hwnd, message, HIWORD(msg->lParam), LOWORD(msg->lParam) );
+                     unit, LOWORD(msg->lParam) );
+#ifdef WINEPS5_TEXT_DIAG
+        queued = NtUserPostMessage( msg->hwnd, message, unit, LOWORD(msg->lParam) );
+        snprintf( line, sizeof(line),
+                  "wine: desktop text translate queued=%u digit=%u letter=%u other=%u scan_zero=%u via=wm_char\n",
+                  !!queued, digit, letter, !(digit || letter), scan_zero );
+        sceKernelDebugOutText( 0, line );
+#else
+        NtUserPostMessage( msg->hwnd, message, unit, LOWORD(msg->lParam) );
+#endif
         return TRUE;
+    }
 
     case VK_PROCESSKEY:
         return ImmTranslateMessage( msg->hwnd, msg->message, msg->wParam, msg->lParam );

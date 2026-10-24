@@ -130,6 +130,7 @@ struct user_thread_info
     struct imm_thread_data       *imm_thread_data;        /* IMM thread data */
     HKL                           kbd_layout;             /* Current keyboard layout */
     UINT                          kbd_layout_id;          /* Current keyboard layout ID */
+    unsigned int                  packet_char;            /* last retrieved Unicode packet unit + 1 */
     struct hardware_msg_data     *rawinput;               /* Current rawinput message data */
     struct touchinput_thread_data *touchinput;            /* touch input thread local buffer */
     UINT                          spy_indent;             /* Current spy indent */
