@@ -2441,7 +2441,7 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
     struct thread *foreground;
     unsigned char vkey = input->kbd.vkey, hook_vkey = vkey;
     unsigned int message_code, time;
-    lparam_t lparam = input->kbd.scan << 16;
+    lparam_t lparam = (lparam_t)input->kbd.scan << 16;
     lparam_t hook_lparam;
     unsigned int flags = 0;
     BOOL unicode = input->kbd.flags & KEYEVENTF_UNICODE;
