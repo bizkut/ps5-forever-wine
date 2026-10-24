@@ -1206,6 +1206,21 @@ static int game_loader_exists( const char *path )
 
 static void test_game_image_rule(void)
 {
+#ifdef WINE_PS5_RUNESCAPE
+    assert( wine_ps5_title_game_image( "C:\\Game\\osclient.exe", "/prefix/drive_c/Game/osclient.exe",
+                                      game_loader_exists ) );
+    assert( wine_ps5_title_game_image( "c:/Game/OSCLIENT.EXE", "/prefix/drive_c/Game/OSCLIENT.EXE",
+                                      game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "C:\\Game\\Wow.exe", "/prefix/drive_c/Game/Wow.exe",
+                                       game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "Z:\\Game\\osclient.exe", "/prefix/drive_c/Game/osclient.exe",
+                                       game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "C:\\Game\\osclient.exe.dll", "/prefix/drive_c/Game/osclient.exe.dll",
+                                       game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "osclient.exe", "/prefix/drive_c/Game/osclient.exe",
+                                       game_loader_exists ) );
+    puts( "ps5 game image: official OSRS leaf, C drive, case-insensitive, no WoW loader heuristic PASS" );
+#else
     assert( wine_ps5_title_game_image( "C:\\WoW\\WowB.exe",
                                       "/prefix/drive_c/WoW/WowB.exe", game_loader_exists ) );
     assert( wine_ps5_title_game_image( "w:\\WoW\\wOwTest.ExE",
@@ -1219,6 +1234,7 @@ static void test_game_image_rule(void)
     assert( !wine_ps5_title_game_image( "C:\\WoW\\Other.exe",
                                        "/prefix/drive_c/WoW/Other.exe", game_loader_exists ) );
     puts( "ps5 game image: Wow*.exe plus sibling loader, C/W drives, case-insensitive rule PASS" );
+#endif
 }
 
 static const char *match_refused_program( const char *image, const char *programs, size_t *match_length )

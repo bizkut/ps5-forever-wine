@@ -19,7 +19,7 @@ static inline const char *wine_ps5_gpu_name(void)
 #include <stdint.h>
 #include <string.h>
 
-#define WINE_PS5_TITLE_RUNTIME_VERSION 12
+#define WINE_PS5_TITLE_RUNTIME_VERSION 13
 
 /* Match Wine's generic SMBIOS fallback where the native host has no Linux
  * DMI data; never substitute a particular PC or console model. */
@@ -244,6 +244,8 @@ struct wine_ps5_title_game_launch
     char **argv;                /* decoded Windows command: executable first */
     const char *windows_cwd;    /* UTF-8 DOS cwd, may be NULL */
     const char *unix_cwd;       /* translated cwd, may be NULL */
+    const uint16_t *environment; /* original Windows UTF-16 block, including double NUL */
+    unsigned int environment_bytes;
 };
 
 
@@ -296,6 +298,10 @@ struct wine_ps5_title_runtime
      * command synchronously and requests clean title shutdown for relaunch.
      * Returns 0 when accepted, otherwise errno. Argument values are private. */
     int (*game_launch)( const struct wine_ps5_title_game_launch *launch );
+    /* GPU-parent launch state, never imported into the native host environment. */
+    const uint16_t *parent_environment;
+    unsigned int parent_environment_bytes;
+    const char *parent_windows_cwd;
     /* Parent-only title audio. A PsmKit child leaves these NULL and the
      * Wine driver provides a clocked silent endpoint. output consumes one
      * 48-kHz signed-16 stereo grain and is allowed to block for that grain. */

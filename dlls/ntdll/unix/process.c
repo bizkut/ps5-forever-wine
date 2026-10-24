@@ -1104,6 +1104,12 @@ static NTSTATUS create_user_process( HANDLE *process_handle_ptr, HANDLE *thread_
                 windows_cwd = ps5_payload_utf8( &params->CurrentDirectory.DosPath );
             launch.windows_cwd = windows_cwd;
             launch.unix_cwd = unix_cwd;
+            launch.environment = params->Environment;
+            {
+                const WCHAR *end = params->Environment;
+                while (*end) end += wcslen(end) + 1;
+                launch.environment_bytes = (end + 1 - params->Environment) * sizeof(WCHAR);
+            }
             if (!launch.argv || (params->CurrentDirectory.DosPath.Length && !windows_cwd))
                 ret = ENOMEM;
             else
