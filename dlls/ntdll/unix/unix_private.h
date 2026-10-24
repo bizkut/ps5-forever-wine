@@ -445,6 +445,7 @@ extern void ps5_title_fsop_close( LONG64 started );
 extern void ps5_title_flush_all_coalesced_writes(void);
 extern void ps5_title_stop_coalesced_writes(void);
 extern void *ps5_direct_reserve( void *base, size_t size );
+extern BOOL ps5_direct_chunked_reserve_enabled( size_t size );
 extern struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size );
 extern void ps5_direct_retain_view( struct ps5_direct_view *view );
 extern void ps5_direct_free_view( struct ps5_direct_view *view );

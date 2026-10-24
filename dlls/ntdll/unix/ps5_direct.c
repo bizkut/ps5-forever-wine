@@ -279,6 +279,11 @@ static int32_t title_startup_direct_unmap( void *addr, size_t size )
                              title_startup_direct_unmap(a,s) : sceKernelMunmap(a,s))
 
 /* WINE_PS5_CHUNKED_RESERVE_TEST_BEGIN */
+BOOL ps5_direct_chunked_reserve_enabled( size_t size )
+{
+    return direct_chunked_reserve && size > ((size_t)8 << 30);
+}
+
 /* Never use MAP_FIXED here: a kernel-only mapping can occupy a Wine-free
  * candidate. Hints plus exact-placement checks preserve it. Reservations are
  * owned by the existing per-64-KiB view bitmap, independently of their native
@@ -333,7 +338,7 @@ void *ps5_direct_reserve( void *base, size_t size )
     result = sceKernelReserveVirtualRange( &placed, size, 0, DIRECT_UNIT_SIZE );
     if (result)
     {
-        if (direct_chunked_reserve && result == (int32_t)0x8002000c && size > ((size_t)4 << 30))
+        if (ps5_direct_chunked_reserve_enabled( size ) && result == (int32_t)0x8002000c)
         {
             if (!(errno = direct_reserve_chunks( base, size ))) return base;
             return MAP_FAILED;

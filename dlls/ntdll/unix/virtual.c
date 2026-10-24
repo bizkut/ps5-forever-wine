@@ -3803,9 +3803,10 @@ static void *try_map_free_area_range( struct alloc_area *area, char *start, char
 {
     char *alloc_start;
 
+    if (start >= end || (size_t)(end - start) < area->size) return NULL;
+
     if (area->top_down)
     {
-        if (end - start < area->size) return NULL;
         alloc_start = ROUND_ADDR( end - area->size, area->align_mask );
         return try_map_free_area( area, start, alloc_start + area->size, alloc_start );
     }
@@ -3926,6 +3927,21 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
     return try_map_free_area_range( area, base, end );
 }
 
+#ifdef __PROSPERO__
+/* WINE_PS5_CHUNKED_RANGE_TEST_BEGIN */
+static char *ps5_direct_reserve_floor( char *start, size_t size, BOOL direct )
+{
+    /* Native title mappings occupy the low Wine-free window and ignore
+     * occupied hints. Console reserves established adjacent chunks at 64 GiB.
+     * Only constrain unhinted large allocations: fixed-address requests must
+     * retain their exact base, including free/re-reserve alignment trimming. */
+    if (direct && ps5_direct_chunked_reserve_enabled( size ))
+        return max( start, (char *)(UINT_PTR)0x1000000000 );
+    return start;
+}
+/* WINE_PS5_CHUNKED_RANGE_TEST_END */
+#endif
+
 static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BOOL top_down,
                              int unix_prot, UINT_PTR align_mask, unsigned int vprot )
 {
@@ -3960,6 +3976,7 @@ static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BO
     area.align_mask = align_mask;
 #ifdef __PROSPERO__
     area.direct = !!(vprot & VPROT_PS5_DIRECT);
+    limit_low = ps5_direct_reserve_floor( limit_low, size, area.direct );
 #endif
 
     reserve_start = preload_reserve_start;
