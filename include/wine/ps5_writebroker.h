@@ -23,8 +23,10 @@
  * creates, truncates or removes one.
  * The Wine client lazily opens at most 16 pooled connections per process,
  * each locked across a synchronous request and reply; no client worker is
- * added. The broker uses one worker and a 1 MiB buffer per live connection
- * (at most 16 workers / 16 MiB for a fully used Wine process's pool).
+ * added. The broker uses one worker and a 1 MiB network buffer per connection;
+ * RuneScape adds 64 KiB comparison scratch, retained only by that worker.
+ * A fully used process pool has at most 16 workers / 16 MiB by default or
+ * 17 MiB for RuneScape; no file-content/dirty cache survives a request.
  * Wine thread-ID routing drops the two fixed alignment bits before taking
  * the pool index, allowing consecutive Wine threads to use all 16 slots.
  * In place of a write, WB_ICON_MAGIC (path_length and length 0) asks the
@@ -38,6 +40,10 @@
  * Protocol version 6 identifies brokers that perform bounded, no-follow
  * permission repair over their fixed launcher-data roots before creating
  * the authentication token or accepting connections.
+ * RuneScape selects version 7 for synchronous extent-checked diff writes.
+ * Replies still report the full logical length only after all required native
+ * writes (including EOF extension and identical-write metadata touch) finish.
+ * It retains no dirty content and needs no deferred flush/read protocol.
  * Malformed requests close the connection.
  */
 
@@ -53,8 +59,11 @@
 #endif
 #define WB_MAGIC       0x31524257u   /* "WBR1" */
 /* 2: WB_USER_ROOT, versioned hello. 3: user data only, token in WB_USER_ROOT.
- * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC. 6: startup permission repair. */
+ * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC. 6: startup permission repair.
+ * Product version 7: synchronous extent-checked diff writes, same wire layout. */
+#ifndef WB_VERSION
 #define WB_VERSION     6
+#endif
 #define WB_TOKEN_BYTES 16
 #define WB_MAX_PATH    1024
 #define WB_MAX_WRITE   (16u << 20)
