@@ -468,9 +468,12 @@ WND *get_win_ptr( HWND hwnd )
 {
     WND *win;
 
-    if ((win = get_user_handle_ptr( hwnd, NTUSER_OBJ_WINDOW )) == WND_OTHER_PROCESS)
+    if ((win = get_user_handle_ptr( hwnd, NTUSER_OBJ_WINDOW )) == WND_OTHER_PROCESS || !win)
     {
-        if (is_desktop_window( hwnd )) win = WND_DESKTOP;
+        /* A forced server-created desktop/message window can carry our PID
+         * without a client WND. Do not confuse that with an invalid handle. */
+        if (is_desktop_window( hwnd ) && (win || is_valid_entry( hwnd, NTUSER_OBJ_WINDOW )))
+            win = WND_DESKTOP;
     }
     return win;
 }

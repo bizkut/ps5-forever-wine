@@ -2720,6 +2720,30 @@ static void ps5_log_mouse_message( enum ps5_mouse_trace_stage stage, const char 
     sceKernelDebugOutText( 0, line );
     RtlSetLastWin32Error( error );
 }
+
+static void ps5_log_mouse_activation( const char *phase, const MSG *msg, HWND root, HWND active,
+                                      UINT reply, BOOL attempted, BOOL result, DWORD foreground_error )
+{
+    static LONG logged;
+    HWND foreground;
+    DWORD error;
+    char line[384];
+
+    if (!ps5_is_mouse_button_message( msg->message ) ||
+        !InterlockedCompareExchange( &ps5_mouse_input_seen, 0, 0 ) ||
+        InterlockedCompareExchange( &logged, 0, 0 ) >= 64 ||
+        InterlockedIncrement( &logged ) > 64) return;
+    error = RtlGetLastWin32Error();
+    foreground = NtUserGetForegroundWindow();
+    snprintf( line, sizeof(line),
+              "wine: title mouse activation phase=%s wm=%#x hwnd=%lx root=%lx active_snapshot=%lx foreground=%lx "
+              "ma=%u fg_attempted=%u fg_result=%u fg_last_error=%#lx tid=%04lx\n",
+              phase, msg->message, (unsigned long)HandleToULong( msg->hwnd ), (unsigned long)HandleToULong( root ),
+              (unsigned long)HandleToULong( active ), (unsigned long)HandleToULong( foreground ), reply, attempted, result,
+              (unsigned long)foreground_error, (unsigned long)GetCurrentThreadId() );
+    sceKernelDebugOutText( 0, line );
+    RtlSetLastWin32Error( error );
+}
 static void ps5_note_message_pump( BOOL get, const MSG *msg, HWND filter, UINT first, UINT last, UINT flags )
 {
     struct ps5_mouse_diagnostics *diag;
@@ -2755,9 +2779,12 @@ static void ps5_note_message_pump( BOOL get, const MSG *msg, HWND filter, UINT f
 #define PS5_CLICK_LOG(stage,reason,space) \
     ps5_log_mouse_message( stage, reason, msg, hw_id, hittest, info.hwndCapture, space )
 #define PS5_MOUSE_PUMP(get,msg,filter,first,last,flags) ps5_note_message_pump( get, msg, filter, first, last, flags )
+#define PS5_MOUSE_ACTIVATION_LOG(phase,root,reply,attempted,result,error) \
+    ps5_log_mouse_activation( phase, msg, root, info.hwndActive, reply, attempted, result, error )
 #else
 #define PS5_CLICK_LOG(stage,reason,space) ((void)0)
 #define PS5_MOUSE_PUMP(get,msg,filter,first,last,flags) ((void)0)
+#define PS5_MOUSE_ACTIVATION_LOG(phase,root,reply,attempted,result,error) ((void)0)
 #endif
 
 /***********************************************************************
@@ -3010,6 +3037,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
             {
                 UINT ret = send_message( msg->hwnd, WM_MOUSEACTIVATE, (WPARAM)hwndTop,
                                          MAKELONG( hittest, msg->message ) );
+                PS5_MOUSE_ACTIVATION_LOG( "reply", hwndTop, ret, FALSE, FALSE, 0 );
                 switch(ret)
                 {
                 case MA_NOACTIVATEANDEAT:
@@ -3022,8 +3050,12 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                     /* fall through */
                 case MA_ACTIVATE:
                 case 0:
-                    if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                {
+                    BOOL activated = set_foreground_window( hwndTop, TRUE, FALSE );
+                    PS5_MOUSE_ACTIVATION_LOG( "foreground", hwndTop, ret, TRUE, activated, RtlGetLastWin32Error() );
+                    if (!activated) eat_msg = TRUE;
                     break;
+                }
                 default:
                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );
                     break;
