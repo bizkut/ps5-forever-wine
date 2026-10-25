@@ -1449,14 +1449,9 @@ static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
     /* The window compositor presents a desktop: a NULL cursor (e.g. a window
      * class without one) keeps the last visible pointer instead of hiding the
      * hardware cursor for good. The direct game path keeps NULL = hidden. */
-    static int compositor = -1;
+    const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
     static LONG substituted;
-    if (compositor < 0)
-    {
-        const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
-        compositor = present && !strcmp( present, "compositor" );
-    }
-    if (compositor)
+    if (present && !strcmp( present, "compositor" ))
     {
         if (cursor) ps5_title_last_visible_cursor = cursor;
         else if (ps5_title_last_visible_cursor)
