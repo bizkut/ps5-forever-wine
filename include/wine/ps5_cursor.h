@@ -22,6 +22,7 @@ struct wine_ps5_cursor_entry
 {
     struct wine_ps5_cursor_entry *next;
     HCURSOR cursor;
+    uint32_t width, height, visible_pixels, reserved; /* keeps bytes[] 8-byte aligned */
     unsigned char bytes[];
 };
 struct wine_ps5_cursor_cache
@@ -130,8 +131,9 @@ static inline void wine_ps5_cursor_destroy( struct wine_ps5_cursor_cache *cache,
     pthread_mutex_unlock( &cache->mutex );
 }
 
-static inline BOOL wine_ps5_cursor_publish( struct wine_ps5_cursor_cache *cache, uint64_t id,
-                                           HCURSOR cursor, wine_ps5_cursor_send send )
+/* Cache lookup/convert with the mutex held. visible_pixels counts non-transparent pixels. */
+static inline struct wine_ps5_cursor_entry *wine_ps5_cursor_lookup( struct wine_ps5_cursor_cache *cache,
+                                                                     HCURSOR cursor )
 {
     union
     {
@@ -139,22 +141,54 @@ static inline BOOL wine_ps5_cursor_publish( struct wine_ps5_cursor_cache *cache,
         unsigned char bytes[PS5_DESKTOP_MAX_MESSAGE];
     } message;
     struct wine_ps5_cursor_entry *entry;
+    unsigned int i, visible = 0;
+
+    for (entry = cache->entries; entry; entry = entry->next)
+        if (entry->cursor == cursor) return entry;
+    if (!wine_ps5_cursor_build_shape( cursor, &message.shape )) return NULL;
+    if (!(entry = malloc( sizeof(*entry) + message.shape.header.size ))) return NULL;
+    for (i = 0; i < message.shape.width * message.shape.height; i++)
+        if (message.shape.pixels[i] >> 24) visible++;
+    entry->cursor = cursor;
+    entry->width = message.shape.width;
+    entry->height = message.shape.height;
+    entry->visible_pixels = visible;
+    entry->reserved = 0;
+    memcpy( entry->bytes, &message, message.shape.header.size );
+    entry->next = cache->entries;
+    cache->entries = entry;
+    return entry;
+}
+
+/* The converted size and number of non-transparent pixels of a cursor. */
+static inline BOOL wine_ps5_cursor_info( struct wine_ps5_cursor_cache *cache, HCURSOR cursor,
+                                        uint32_t *width, uint32_t *height, uint32_t *visible_pixels )
+{
+    struct wine_ps5_cursor_entry *entry;
+    BOOL result = FALSE;
+
+    pthread_mutex_lock( &cache->mutex );
+    if ((entry = wine_ps5_cursor_lookup( cache, cursor )))
+    {
+        *width = entry->width;
+        *height = entry->height;
+        *visible_pixels = entry->visible_pixels;
+        result = TRUE;
+    }
+    pthread_mutex_unlock( &cache->mutex );
+    return result;
+}
+
+static inline BOOL wine_ps5_cursor_publish( struct wine_ps5_cursor_cache *cache, uint64_t id,
+                                           HCURSOR cursor, wine_ps5_cursor_send send )
+{
+    struct wine_ps5_cursor_entry *entry;
     struct ps5_desktop_cursor_shape *shape;
     BOOL result = FALSE;
 
     if (!send) return FALSE;
     pthread_mutex_lock( &cache->mutex );
-    for (entry = cache->entries; entry; entry = entry->next)
-        if (entry->cursor == cursor) break;
-    if (!entry)
-    {
-        if (!wine_ps5_cursor_build_shape( cursor, &message.shape )) goto done;
-        if (!(entry = malloc( sizeof(*entry) + message.shape.header.size ))) goto done;
-        entry->cursor = cursor;
-        memcpy( entry->bytes, &message, message.shape.header.size );
-        entry->next = cache->entries;
-        cache->entries = entry;
-    }
+    if (!(entry = wine_ps5_cursor_lookup( cache, cursor ))) goto done;
     shape = (struct ps5_desktop_cursor_shape *)entry->bytes;
     shape->id = id;
     /* Cache conversion only: every SetCursor republishes, since another

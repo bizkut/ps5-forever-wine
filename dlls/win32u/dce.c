@@ -104,7 +104,7 @@ static BOOL offscreen_window_surface_flush( struct window_surface *surface, cons
 {
 #if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
     /* The title window compositor shows GDI-painted windows (no-op otherwise). */
-    ps5_compositor_surface_flush( surface->hwnd, rect, color_info, color_bits );
+    ps5_compositor_surface_flush( surface->hwnd, surface, rect, color_info, color_bits );
 #endif
     return TRUE;
 }
@@ -112,7 +112,7 @@ static BOOL offscreen_window_surface_flush( struct window_surface *surface, cons
 static void offscreen_window_surface_destroy( struct window_surface *surface )
 {
 #if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
-    ps5_compositor_surface_destroy( surface->hwnd );
+    ps5_compositor_surface_destroy( surface->hwnd, surface );
 #endif
 }
 
@@ -131,8 +131,13 @@ static void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect
 
     TRACE( "hwnd %p, surface_rect %s, window_surface %p.\n", hwnd, wine_dbgstr_rect( surface_rect ), window_surface );
 
-    /* check that old surface is an offscreen_window_surface, or release it */
-    if ((previous = *window_surface) && previous->funcs == &offscreen_window_surface_funcs) return;
+    /* check that old surface is an offscreen_window_surface, or release it; the
+     * compositor layer is sized from the surface, so it is reused only at the same size */
+    if ((previous = *window_surface) && previous->funcs == &offscreen_window_surface_funcs
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        && EqualRect( &previous->rect, surface_rect )
+#endif
+        ) return;
 
     memset( info, 0, sizeof(*info) );
     info->bmiHeader.biSize        = sizeof(info->bmiHeader);

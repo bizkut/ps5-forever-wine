@@ -1447,13 +1447,27 @@ static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
 {
 #ifdef WINE_PS5_RUNESCAPE
     /* The window compositor presents a desktop: a NULL cursor (e.g. a window
-     * class without one) keeps the last visible pointer instead of hiding the
-     * hardware cursor for good. The direct game path keeps NULL = hidden. */
+     * class without one) or a fully transparent one (a Java app hiding the
+     * pointer over a canvas) keeps the last visible pointer instead of hiding
+     * the hardware cursor for good. The direct game path keeps both as set. */
     const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
-    static LONG substituted;
+    static LONG substituted, inspected;
     if (present && !strcmp( present, "compositor" ))
     {
-        if (cursor) ps5_title_last_visible_cursor = cursor;
+        uint32_t width, height, visible;
+        if (cursor && wine_ps5_cursor_info( &ps5_title_cursor_cache, cursor, &width, &height, &visible ))
+        {
+            if (InterlockedExchangeAdd( &inspected, 1 ) < 16)
+            {
+                char line[160];
+                snprintf( line, sizeof(line), "wine: title cursor handle=%p size=%ux%u visible_pixels=%u kept=%u\n",
+                          cursor, width, height, visible, !visible && !!ps5_title_last_visible_cursor );
+                sceKernelDebugOutText( 0, line );
+            }
+            if (visible) ps5_title_last_visible_cursor = cursor;
+            else if (ps5_title_last_visible_cursor) cursor = ps5_title_last_visible_cursor;
+        }
+        else if (cursor) ps5_title_last_visible_cursor = cursor;
         else if (ps5_title_last_visible_cursor)
         {
             if (!InterlockedExchangeAdd( &substituted, 1 ))

@@ -3373,8 +3373,11 @@ static struct ps5_gdi_layer
     HWND hwnd;
     struct ps5c_chain *chain;
     RECT rect;      /* surface rectangle, relative to the window's visible rectangle */
+    const void *owner; /* the window surface that last flushed into this layer */
 } ps5_gdi_layers[32];
 static LONG ps5_scene_stale;
+static LONG ps5_gdi_logged;
+#define PS5_GDI_LOG_LIMIT 24
 
 /* The window's GDI layer state: its window state, sampled over the surface. */
 static BOOL ps5_compositor_gdi_state( HWND hwnd, struct ps5c_window_state *state )
@@ -3433,11 +3436,13 @@ static void ps5_compositor_publish_scene(void)
 
 /* dce.c's offscreen surface flush: the whole top-down 32-bit surface. Called
  * with the surface locked, so the scene is republished later, not here. */
-void ps5_compositor_surface_flush( HWND hwnd, const RECT *rect, const BITMAPINFO *info, const void *bits )
+void ps5_compositor_surface_flush( HWND hwnd, const void *owner, const RECT *rect, const BITMAPINFO *info,
+                                   const void *bits )
 {
     struct ps5c_chain *chain = NULL, *old = NULL;
     uint32_t width, height, i, slot = ARRAY_SIZE(ps5_gdi_layers);
-    VkResult res = VK_SUCCESS;
+    VkResult res = VK_SUCCESS, upload = VK_SUCCESS;
+    BOOL resized = FALSE;
 
     if (!ps5_compositor_mode || !ps5_compositor || !bits || info->bmiHeader.biBitCount != 32 ||
         info->bmiHeader.biWidth <= 0 || info->bmiHeader.biHeight >= 0)
@@ -3458,39 +3463,51 @@ void ps5_compositor_surface_flush( HWND hwnd, const RECT *rect, const BITMAPINFO
         {
             old = layer->chain;
             layer->chain = NULL;
+            resized = TRUE;
         }
         if (!layer->chain)
         {
             res = ps5c_chain_create_cpu( ps5_compositor, (UINT_PTR)hwnd | PS5_GDI_KEY, width, height, &layer->chain );
-            MESSAGE( "wine: title compositor gdi hwnd=%p surface=%ux%u result=%d\n", hwnd, width, height, res );
+            MESSAGE( "wine: title compositor gdi hwnd=%p surface=%ux%u result=%d replaced=%d\n", hwnd, width, height,
+                     res, resized );
             InterlockedExchange( &ps5_scene_stale, 1 );
         }
         layer->hwnd = layer->chain ? hwnd : NULL;
+        layer->owner = layer->chain ? owner : NULL;
         layer->rect = *rect;
         chain = layer->chain;
-        if (chain) res = ps5c_chain_upload( chain, bits, width * 4 );
+        if (chain) upload = ps5c_chain_upload( chain, bits, width * 4 );
     }
     pthread_mutex_unlock( &ps5_gdi_lock );
     if (old) ps5c_chain_destroy( old );
-    (void)res;
+    if (InterlockedExchangeAdd( &ps5_gdi_logged, 1 ) < PS5_GDI_LOG_LIMIT)
+        MESSAGE( "wine: title compositor gdi flush hwnd=%p surface=%ux%u slot=%u upload=%d\n", hwnd, width, height,
+                 slot, upload );
 }
 
-/* dce.c: the window's surface is going (window destroyed or surface replaced). */
-void ps5_compositor_surface_destroy( HWND hwnd )
+/* dce.c: a window surface is going (window destroyed or surface replaced). A
+ * replaced surface can be released after its successor already flushed, so
+ * only the surface that owns the layer removes it. */
+void ps5_compositor_surface_destroy( HWND hwnd, const void *owner )
 {
     struct ps5c_chain *chain = NULL;
     uint32_t i;
+    BOOL stale = FALSE;
 
     if (!ps5_compositor_mode || !ps5_compositor) return;
     pthread_mutex_lock( &ps5_gdi_lock );
     for (i = 0; i < ARRAY_SIZE(ps5_gdi_layers); i++)
         if (ps5_gdi_layers[i].hwnd == hwnd)
         {
+            if (ps5_gdi_layers[i].owner != owner) { stale = TRUE; continue; }
             chain = ps5_gdi_layers[i].chain;
             ps5_gdi_layers[i].chain = NULL;
             ps5_gdi_layers[i].hwnd = NULL;
+            ps5_gdi_layers[i].owner = NULL;
         }
     pthread_mutex_unlock( &ps5_gdi_lock );
+    if (InterlockedExchangeAdd( &ps5_gdi_logged, 1 ) < PS5_GDI_LOG_LIMIT)
+        MESSAGE( "wine: title compositor gdi destroy hwnd=%p owned=%d stale=%d\n", hwnd, !!chain, stale );
     if (!chain) return;
     ps5c_chain_destroy( chain );
     InterlockedExchange( &ps5_scene_stale, 1 );
