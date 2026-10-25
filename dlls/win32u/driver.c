@@ -837,6 +837,48 @@ static NTSTATUS ps5_send_hardware_input( HWND hwnd, UINT flags, const INPUT *inp
     return status;
 }
 
+#ifdef WINE_PS5_RUNESCAPE
+static void ps5_log_mouse_geometry(void);
+static void ps5_log_mouse_packet( const struct ps5_desktop_mouse *mouse, const INPUT *input,
+                                  BOOL relative, NTSTATUS status )
+{
+    static unsigned int clicks, move_samples;
+    static DWORD move_at;
+    POINT point = {0};
+    RECT raw;
+    char line[384];
+    unsigned int sequence, kind = mouse->kind & ~PS5_TITLE_MOUSE_RELATIVE;
+    DWORD error, now;
+    BOOL cursor_valid;
+
+    if (kind == PS5_DESKTOP_MOUSE_MOVE)
+    {
+        now = NtGetTickCount();
+        if (move_samples >= 4 && now - move_at < 2000) return;
+        sequence = ++move_samples;
+        move_at = now;
+    }
+    else
+    {
+        if (clicks >= 64) return;
+        sequence = ++clicks;
+    }
+    error = RtlGetLastWin32Error();
+    cursor_valid = NtUserGetCursorPos( &point );
+    raw = map_rect_virt_to_raw( (RECT){point.x, point.y, point.x, point.y}, get_thread_dpi() );
+    /* No keys, text, argv, environment, window titles or extra-info payloads. */
+    snprintf( line, sizeof(line),
+              "wine: title mouse packet seq=%u kind=%u button=%u down=%u relative=%u flags=%#lx "
+              "mapped_x=%ld mapped_y=%ld cursor_valid=%u cursor_raw_x=%ld cursor_raw_y=%ld status=%#lx tid=%04lx\n",
+              sequence, kind, mouse->button, mouse->down, relative, (unsigned long)input->mi.dwFlags,
+              (long)input->mi.dx, (long)input->mi.dy, cursor_valid, (long)raw.left, (long)raw.top,
+              (unsigned long)status, (unsigned long)GetCurrentThreadId() );
+    sceKernelDebugOutText( 0, line );
+    ps5_log_mouse_geometry();
+    RtlSetLastWin32Error( error );
+}
+#endif
+
 static void ps5_post_text_chars( const struct ps5_desktop_text *text )
 {
     HWND foreground = NtUserGetForegroundWindow(), target;
@@ -948,6 +990,82 @@ static void ps5_viewport_cursor_point( const struct wine_ps5_viewport_map *viewp
      * motion is still delivered unchanged, including at these edges. */
     if (x != point->x || y != point->y) NtUserSetCursorPos( x, y );
     wine_ps5_viewport_to_output( viewport, x, y, &point->x, &point->y );
+}
+
+static void ps5_log_mouse_window_geometry( const char *role, HWND hwnd, UINT dpi )
+{
+    RECT win = {0}, client = {0}, raw_win = {0}, raw_client = {0};
+    WCHAR class_buf[64] = {0};
+    UNICODE_STRING class_name = {.Buffer = class_buf, .MaximumLength = sizeof(class_buf)};
+    char window_class[64] = "-", line[640];
+    unsigned int count, i;
+    BOOL win_valid, client_valid;
+
+    win_valid = NtUserGetWindowRect( hwnd, &win, dpi );
+    client_valid = NtUserGetClientRect( hwnd, &client, dpi );
+    if (win_valid) raw_win = map_rect_virt_to_raw( win, dpi );
+    if (client_valid)
+    {
+        NtUserMapWindowPoints( hwnd, 0, (POINT *)&client, 2, dpi );
+        raw_client = map_rect_virt_to_raw( client, dpi );
+    }
+    if ((count = NtUserGetClassName( hwnd, FALSE, &class_name )))
+    {
+        for (i = 0; i < min( count, ARRAY_SIZE(window_class) - 1 ); i++)
+            window_class[i] = class_buf[i] >= 0x20 && class_buf[i] < 0x7f ? class_buf[i] : '?';
+        window_class[i] = 0;
+    }
+    snprintf( line, sizeof(line),
+              "wine: title mouse window role=%s hwnd=%lx class=%s tid=%04lx caller_dpi=%u window_dpi=%u style=%#lx exstyle=%#lx "
+              "win_valid=%u client_valid=%u win_virtual=%ld,%ld,%ld,%ld client_virtual=%ld,%ld,%ld,%ld "
+              "win_desktop_raw=%ld,%ld,%ld,%ld client_desktop_raw=%ld,%ld,%ld,%ld\n",
+              role, (unsigned long)HandleToULong( hwnd ), window_class,
+              (unsigned long)HandleToULong( NtUserQueryWindow( hwnd, WindowThread ) ), dpi, get_dpi_for_window( hwnd ),
+              (unsigned long)get_window_long( hwnd, GWL_STYLE ), (unsigned long)get_window_long( hwnd, GWL_EXSTYLE ),
+              win_valid, client_valid, (long)win.left, (long)win.top, (long)win.right, (long)win.bottom,
+              (long)client.left, (long)client.top, (long)client.right, (long)client.bottom,
+              (long)raw_win.left, (long)raw_win.top, (long)raw_win.right, (long)raw_win.bottom,
+              (long)raw_client.left, (long)raw_client.top, (long)raw_client.right, (long)raw_client.bottom );
+    sceKernelDebugOutText( 0, line );
+}
+
+static void ps5_log_mouse_geometry(void)
+{
+    static DWORD logged_at;
+    static BOOL logged;
+    struct wine_ps5_viewport_map map = {0};
+    HWND hwnd, root;
+    UINT dpi = get_thread_dpi(), monitor_dpi, raw_dpi = 0;
+    DWORD now = NtGetTickCount();
+    RECT desktop, raw_desktop;
+    char line[512];
+    BOOL fitted;
+
+    if (logged && now - logged_at < 2000) return;
+    logged = TRUE;
+    logged_at = now;
+    fitted = ps5_get_present_viewport( &map );
+    pthread_mutex_lock( &ps5_viewport_mutex );
+    hwnd = ps5_present_viewport.hwnd;
+    pthread_mutex_unlock( &ps5_viewport_mutex );
+    monitor_dpi = fitted ? get_win_monitor_dpi( hwnd, &raw_dpi ) : 0;
+    desktop = get_virtual_screen_rect( dpi, MDT_DEFAULT );
+    raw_desktop = get_virtual_screen_rect( 0, MDT_RAW_DPI );
+    snprintf( line, sizeof(line),
+              "wine: title mouse geometry fitted=%u viewport_hwnd=%lx dpi=%u monitor_dpi=%u monitor_raw_dpi=%u "
+              "desktop_virtual=%ld,%ld,%ld,%ld "
+              "desktop_raw=%ld,%ld,%ld,%ld image=%ux%u videoout=%ux%u fit=%u,%u,%u,%u origin=%d,%d live_client=%ux%u\n",
+              fitted, (unsigned long)HandleToULong( hwnd ), dpi, monitor_dpi, raw_dpi,
+              (long)desktop.left, (long)desktop.top, (long)desktop.right, (long)desktop.bottom,
+              (long)raw_desktop.left, (long)raw_desktop.top, (long)raw_desktop.right, (long)raw_desktop.bottom,
+              map.viewport.image_width, map.viewport.image_height, map.viewport.output_width, map.viewport.output_height,
+              map.viewport.left, map.viewport.top, map.viewport.width, map.viewport.height,
+              map.origin_x, map.origin_y, map.client_width, map.client_height );
+    sceKernelDebugOutText( 0, line );
+    if (!fitted) return;
+    ps5_log_mouse_window_geometry( "viewport", hwnd, dpi );
+    root = NtUserGetAncestor( hwnd, GA_ROOT );
+    if (root && root != hwnd) ps5_log_mouse_window_geometry( "root", root, dpi );
 }
 
 #endif
@@ -1102,7 +1220,15 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
             /* Wine 11 derives RAWMOUSE directly from these deltas/flags in
              * server/queue.c; unlike WoWPS5's older Wine, no raw_mouse
              * payload is required (lparam is only for HID INPUT_HARDWARE). */
-            ps5_send_hardware_input( 0, relative ? 0 : SEND_HWMSG_NO_RAW, &input, 0 );
+            {
+                NTSTATUS status = ps5_send_hardware_input( 0, relative ? 0 : SEND_HWMSG_NO_RAW, &input, 0 );
+#ifdef WINE_PS5_RUNESCAPE
+                if (kind == PS5_DESKTOP_MOUSE_BUTTON || kind == PS5_DESKTOP_MOUSE_MOVE)
+                    ps5_log_mouse_packet( mouse, &input, relative, status );
+#else
+                (void)status;
+#endif
+            }
             break;
         }
         }

@@ -138,6 +138,16 @@ struct user_thread_info
     DWORD                         clipping_reset;         /* time when clipping was last reset */
     struct session_thread_data   *session_data;           /* shared session thread data */
     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    struct ps5_mouse_diagnostics
+    {
+        DWORD move_at, pump_at;
+        UINT move_id, move_samples, move_stages, click_lines, pump_lines;
+        HWND move_hwnd;
+        LPARAM move_lparam;
+        ULONG peek_calls, get_calls, mouse_returns, dispatch_calls;
+    } ps5_mouse_diag;                                    /* Metadata-only, per-thread diagnostics */
+#endif
 };
 
 C_ASSERT( sizeof(struct user_thread_info) <= sizeof(((TEB *)0)->Win32ClientInfo) );

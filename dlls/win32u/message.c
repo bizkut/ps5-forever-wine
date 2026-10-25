@@ -39,6 +39,10 @@
 #include "wine/debug.h"
 #ifdef __PROSPERO__
 #include "wine/ps5_title.h"
+#ifdef WINE_PS5_RUNESCAPE
+#include <ps5platform/klog.h>
+#include <stdio.h>
+#endif
 #endif
 #ifdef WINEPS5_TEXT_DIAG
 #include <stdio.h>
@@ -2629,6 +2633,133 @@ static WORD pointer_buttons_from_mouse_buttons( WORD mouse_flags )
     return pointer_flags;
 }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static LONG ps5_mouse_input_seen;
+enum ps5_mouse_trace_stage
+{
+    PS5_MOUSE_HIT, PS5_MOUSE_DROP, PS5_MOUSE_RETURN, PS5_MOUSE_PEEK,
+    PS5_MOUSE_FILTER, PS5_MOUSE_DISPATCH, PS5_MOUSE_RAW
+};
+
+static BOOL ps5_is_mouse_button_message( UINT message )
+{
+    if (message >= WM_NCMOUSEFIRST && message <= WM_NCMOUSELAST)
+        message += WM_MOUSEMOVE - WM_NCMOUSEMOVE;
+    switch (message)
+    {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static void ps5_log_mouse_message( enum ps5_mouse_trace_stage stage, const char *reason, const MSG *msg,
+                                   UINT hw_id, INT hittest, HWND capture, const char *space )
+{
+    static const char *const stages[] = {"hit", "drop", "return", "peek", "filter", "dispatch-params", "raw"};
+    struct ps5_mouse_diagnostics *diag;
+    WCHAR class_buf[64] = {0};
+    UNICODE_STRING class_name = {.Buffer = class_buf, .MaximumLength = sizeof(class_buf)};
+    char window_class[64] = "-", line[512];
+    DWORD error, thread, now;
+    unsigned int count, i;
+    BOOL move = msg->message == WM_MOUSEMOVE || msg->message == WM_NCMOUSEMOVE;
+    BOOL hit_valid = stage != PS5_MOUSE_RAW && stage != PS5_MOUSE_DISPATCH;
+
+    if ((!move && !ps5_is_mouse_button_message( msg->message )) ||
+        !InterlockedCompareExchange( &ps5_mouse_input_seen, 0, 0 )) return;
+    diag = &get_user_thread_info()->ps5_mouse_diag;
+    if (move)
+    {
+        if (hw_id && hw_id != diag->move_id)
+        {
+            now = NtGetTickCount();
+            if (diag->move_samples >= 4 && now - diag->move_at < 2000) return;
+            diag->move_id = hw_id;
+            diag->move_at = now;
+            diag->move_samples++;
+            diag->move_stages = 0;
+            diag->move_hwnd = 0;
+        }
+        if (!hw_id && (!diag->move_id || msg->hwnd != diag->move_hwnd ||
+                       msg->lParam != diag->move_lparam)) return;
+        if (diag->move_stages & (1u << stage)) return;
+        diag->move_stages |= 1u << stage;
+        if (stage == PS5_MOUSE_RETURN || stage == PS5_MOUSE_PEEK)
+        {
+            diag->move_hwnd = msg->hwnd;
+            diag->move_lparam = msg->lParam;
+        }
+    }
+    else
+    {
+        if (diag->click_lines >= 192) return;
+        diag->click_lines++;
+    }
+    error = RtlGetLastWin32Error();
+    thread = HandleToULong( NtUserQueryWindow( msg->hwnd, WindowThread ));
+    if ((count = NtUserGetClassName( msg->hwnd, FALSE, &class_name )))
+    {
+        for (i = 0; i < min( count, ARRAY_SIZE(window_class) - 1 ); i++)
+            window_class[i] = class_buf[i] >= 0x20 && class_buf[i] < 0x7f ? class_buf[i] : '?';
+        window_class[i] = 0;
+    }
+    /* Only mouse metadata: no text, key codes, title, extra-info or session data. */
+    snprintf( line, sizeof(line),
+              "wine: title mouse message stage=%s reason=%s id=%u wm=%#x hwnd=%lx class=%s "
+              "target_tid=%04lx current_tid=%04lx dpi=%u ht_valid=%u ht=%d capture_valid=%u capture=%lx space=%s "
+              "point_x=%ld point_y=%ld lparam_x=%d lparam_y=%d\n",
+              stages[stage], reason, hw_id, msg->message, (unsigned long)HandleToULong( msg->hwnd ),
+              window_class, (unsigned long)thread, (unsigned long)GetCurrentThreadId(), get_thread_dpi(), hit_valid, hittest,
+              hit_valid, (unsigned long)HandleToULong( capture ), space, (long)msg->pt.x, (long)msg->pt.y,
+              (short)LOWORD( msg->lParam ), (short)HIWORD( msg->lParam ) );
+    sceKernelDebugOutText( 0, line );
+    RtlSetLastWin32Error( error );
+}
+static void ps5_note_message_pump( BOOL get, const MSG *msg, HWND filter, UINT first, UINT last, UINT flags )
+{
+    struct ps5_mouse_diagnostics *diag;
+    GUITHREADINFO info = {.cbSize = sizeof(info)};
+    DWORD now, error;
+    char line[384];
+
+    if (!InterlockedCompareExchange( &ps5_mouse_input_seen, 0, 0 )) return;
+    diag = &get_user_thread_info()->ps5_mouse_diag;
+    if (!msg)
+    {
+        if (get) diag->get_calls++;
+        else diag->peek_calls++;
+    }
+    else if (msg->message == WM_MOUSEMOVE || msg->message == WM_NCMOUSEMOVE ||
+             ps5_is_mouse_button_message( msg->message )) diag->mouse_returns++;
+    now = NtGetTickCount();
+    if (diag->pump_lines && now - diag->pump_at < 2000) return;
+    diag->pump_at = now;
+    diag->pump_lines++;
+    error = RtlGetLastWin32Error();
+    NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info );
+    snprintf( line, sizeof(line),
+              "wine: title mouse pump tid=%04lx peek=%lu get=%lu mouse_returned=%lu dispatch_params=%lu "
+              "active=%lx focus=%lx capture=%lx filter=%lx first=%#x last=%#x flags=%#x\n",
+              (unsigned long)GetCurrentThreadId(), (unsigned long)diag->peek_calls, (unsigned long)diag->get_calls,
+              (unsigned long)diag->mouse_returns, (unsigned long)diag->dispatch_calls,
+              (unsigned long)HandleToULong( info.hwndActive ), (unsigned long)HandleToULong( info.hwndFocus ),
+              (unsigned long)HandleToULong( info.hwndCapture ), (unsigned long)HandleToULong( filter ), first, last, flags );
+    sceKernelDebugOutText( 0, line );
+    RtlSetLastWin32Error( error );
+}
+#define PS5_CLICK_LOG(stage,reason,space) \
+    ps5_log_mouse_message( stage, reason, msg, hw_id, hittest, info.hwndCapture, space )
+#define PS5_MOUSE_PUMP(get,msg,filter,first,last,flags) ps5_note_message_pump( get, msg, filter, first, last, flags )
+#else
+#define PS5_CLICK_LOG(stage,reason,space) ((void)0)
+#define PS5_MOUSE_PUMP(get,msg,filter,first,last,flags) ((void)0)
+#endif
+
 /***********************************************************************
  *          process_mouse_message
  *
@@ -2641,7 +2772,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
 
     POINT pt;
     UINT message;
-    INT hittest;
+    INT hittest = HTNOWHERE;
     EVENTMSG event;
     GUITHREADINFO info;
     MOUSEHOOKSTRUCTEX hook;
@@ -2671,9 +2802,11 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                 msg->hwnd = window_from_point( next, msg->pt, &hittest, TRUE );
         }
     }
+    PS5_CLICK_LOG( PS5_MOUSE_HIT, "selected", "monitor-default" );
 
     if (!msg->hwnd || !is_current_thread_window( msg->hwnd ))
     {
+        PS5_CLICK_LOG( PS5_MOUSE_DROP, "window-or-thread", "monitor-default" );
         accept_hardware_message( hw_id );
         return FALSE;
     }
@@ -2740,7 +2873,11 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     event.paramH  = msg->pt.y;
     call_hooks( WH_JOURNALRECORD, HC_ACTION, 0, (LPARAM)&event, sizeof(event) );
 
-    if (!check_hwnd_filter( msg, hwnd_filter )) return FALSE;
+    if (!check_hwnd_filter( msg, hwnd_filter ))
+    {
+        PS5_CLICK_LOG( PS5_MOUSE_FILTER, "window", "window-dpi" );
+        return FALSE;
+    }
 
     pt = msg->pt;
     message = msg->message;
@@ -2795,13 +2932,21 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                }
            }
         }
-        if (message < first || message > last) return FALSE;
+        if (message < first || message > last)
+        {
+            PS5_CLICK_LOG( PS5_MOUSE_FILTER, "message-range", "window-dpi" );
+            return FALSE;
+        }
         /* update static double click conditions */
         if (update) clk_msg = *msg;
     }
     else
     {
-        if (message < first || message > last) return FALSE;
+        if (message < first || message > last)
+        {
+            PS5_CLICK_LOG( PS5_MOUSE_FILTER, "message-range", "window-dpi" );
+            return FALSE;
+        }
     }
     msg->wParam = wparam;
 
@@ -2821,6 +2966,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         hook.mouseData    = msg->wParam;
         accept_hardware_message( hw_id );
         call_hooks( WH_CBT, HCBT_CLICKSKIPPED, message, (LPARAM)&hook, sizeof(hook) );
+        PS5_CLICK_LOG( PS5_MOUSE_DROP, "mouse-hook", "window-dpi" );
         return FALSE;
     }
 
@@ -2828,6 +2974,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     {
         send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
         accept_hardware_message( hw_id );
+        PS5_CLICK_LOG( PS5_MOUSE_DROP, "hit-nowhere-or-error", "window-dpi" );
         return FALSE;
     }
 
@@ -2836,6 +2983,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     if (!remove || info.hwndCapture)
     {
         msg->message = message;
+        PS5_CLICK_LOG( remove ? PS5_MOUSE_RETURN : PS5_MOUSE_PEEK, remove ? "captured" : "peek", "window-dpi" );
         return TRUE;
     }
 
@@ -2891,6 +3039,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
 
     msg->message = message;
+    PS5_CLICK_LOG( eat_msg ? PS5_MOUSE_DROP : PS5_MOUSE_RETURN, eat_msg ? "mouse-activation" : "legacy", "window-dpi" );
     return !eat_msg;
 }
 
@@ -2909,6 +3058,9 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
 
     thread_info->msg_source.deviceType = msg_data->source.device;
     thread_info->msg_source.originId   = msg_data->source.origin;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    ps5_log_mouse_message( PS5_MOUSE_RAW, "server", msg, hw_id, HTNOWHERE, 0, "desktop-raw" );
+#endif
 
     /* hardware messages are always in raw physical coords */
     context = set_thread_dpi_awareness_context( NTUSER_DPI_PER_MONITOR_AWARE );
@@ -3649,6 +3801,7 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
     int ret;
 
     user_check_not_lock();
+    PS5_MOUSE_PUMP( FALSE, NULL, hwnd, first, last, flags );
     check_for_driver_events();
 
     if ((ret = peek_message( &msg, &filter )) <= 0)
@@ -3685,6 +3838,7 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
         return FALSE;
     }
     *msg_out = msg;
+    PS5_MOUSE_PUMP( FALSE, &msg, hwnd, first, last, flags );
     return TRUE;
 }
 
@@ -3699,6 +3853,7 @@ BOOL WINAPI NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     int ret;
 
     user_check_not_lock();
+    PS5_MOUSE_PUMP( TRUE, NULL, hwnd, first, last, 0 );
     check_for_driver_events();
 
     if (first || last)
@@ -3721,6 +3876,7 @@ BOOL WINAPI NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     if (ret < 0) return -1;
 
     check_for_driver_events();
+    PS5_MOUSE_PUMP( TRUE, msg, hwnd, first, last, filter.flags );
 
     return msg->message != WM_QUIT;
 }
@@ -3997,6 +4153,10 @@ NTSTATUS send_hardware_message( HWND hwnd, UINT flags, const INPUT *input, LPARA
     int prev_x, prev_y, new_x, new_y;
     NTSTATUS ret;
     BOOL wait;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if ((flags & SEND_HWMSG_PS5_TITLE) && input->type == INPUT_MOUSE)
+        InterlockedExchange( &ps5_mouse_input_seen, 1 );
+#endif
 
     info.type     = MSG_HARDWARE;
     info.dest_tid = 0;
@@ -4875,7 +5035,15 @@ LRESULT WINAPI NtUserMessageCall( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpa
         if (!hwnd) return FALSE;
         if (init_window_call_params( result_info, hwnd, msg, wparam, lparam,
                                      ansi, WMCHAR_MAP_DISPATCHMESSAGE ))
+        {
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+            MSG click = {.hwnd = hwnd, .message = msg, .wParam = wparam, .lParam = lparam};
+            if (msg == WM_MOUSEMOVE || msg == WM_NCMOUSEMOVE || ps5_is_mouse_button_message( msg ))
+                get_user_thread_info()->ps5_mouse_diag.dispatch_calls++;
+            ps5_log_mouse_message( PS5_MOUSE_DISPATCH, "ready", &click, 0, HTNOWHERE, 0, "dispatch-lparam" );
+#endif
             return TRUE;
+        }
         if (!is_window( hwnd )) RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
         else RtlSetLastWin32Error( ERROR_MESSAGE_SYNC_ONLY );
         return FALSE;

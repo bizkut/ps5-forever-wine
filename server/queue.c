@@ -276,6 +276,61 @@ static unsigned int cursor_history_latest;
 static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
 static void free_message( struct message *msg );
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+enum ps5_mouse_route_stage
+{
+    PS5_MOUSE_QUEUE, PS5_MOUSE_QUEUE_NO_WINDOW, PS5_MOUSE_QUEUE_NO_THREAD, PS5_MOUSE_QUEUE_NO_LEGACY,
+    PS5_MOUSE_RETRIEVE, PS5_MOUSE_RETRIEVE_NO_WINDOW, PS5_MOUSE_RETRIEVE_OTHER_INPUT,
+    PS5_MOUSE_HOOK_REJECT, PS5_MOUSE_HOOK_PASS, PS5_MOUSE_HOOK_ERROR_PASS
+};
+static void ps5_log_mouse_route( enum ps5_mouse_route_stage stage, const struct message *msg, user_handle_t target,
+                                const struct thread *thread, const struct thread_input *input,
+                                unsigned int raw_flags )
+{
+    static const char *const stages[] = {"queue", "queue-no-window", "queue-no-thread", "queue-no-legacy",
+                                        "retrieve", "retrieve-no-window", "retrieve-other-input",
+                                        "hook-reject", "hook-pass", "hook-error-pass"};
+    static struct { unsigned int samples, at; } moves[ARRAY_SIZE(stages)];
+    static unsigned int clicks;
+    unsigned int now;
+
+    if (!ps5_input_server_diag.active) return;
+    if (msg->msg == WM_MOUSEMOVE)
+    {
+        now = get_tick_count();
+        if (moves[stage].samples >= 4 && now - moves[stage].at < 2000) return;
+        moves[stage].samples++;
+        moves[stage].at = now;
+    }
+    else
+    {
+        switch (msg->msg)
+        {
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+            break;
+        default:
+            return;
+        }
+        if (clicks >= 128) return;
+        clicks++;
+    }
+    /* The server is serialized. Keep all text/key/session payloads out. */
+    fprintf( stderr, "wineserver: title mouse route stage=%s id=%u wm=%#x "
+             "requested=%08x target=%08x target_tid=%04x current_tid=%04x capture=%08x "
+             "raw_flags=%#x x=%d y=%d time=%u\n",
+             stages[stage], msg->unique_id, msg->msg, msg->win, target,
+             thread ? thread->id : 0, current ? current->id : 0,
+             input ? input->shared->capture : 0, raw_flags, msg->x, msg->y, msg->time );
+}
+#define PS5_CLICK_ROUTE(stage,msg,target,thread,input,flags) \
+    ps5_log_mouse_route( stage, msg, target, thread, input, flags )
+#else
+#define PS5_CLICK_ROUTE(stage,msg,target,thread,input,flags) ((void)0)
+#endif
+
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
 static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
 {
@@ -1044,6 +1099,9 @@ static void store_message_result( struct message_result *res, lparam_t result, u
 
     if (res->hardware_msg)
     {
+        PS5_CLICK_ROUTE( !error && result ? PS5_MOUSE_HOOK_REJECT :
+                         error ? PS5_MOUSE_HOOK_ERROR_PASS : PS5_MOUSE_HOOK_PASS,
+                         res->hardware_msg, 0, NULL, res->desktop->foreground_input, 0 );
         if (!error && result)  /* rejected by the hook */
             free_message( res->hardware_msg );
         else
@@ -2017,6 +2075,9 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
     win = find_hardware_message_window( desktop, input, msg, &msg_code, &thread );
     flags = thread ? get_rawinput_device_flags( thread->process, msg ) : 0;
     if (thread) input = thread->queue->input;
+    PS5_CLICK_ROUTE( !win ? PS5_MOUSE_QUEUE_NO_WINDOW : !thread ? PS5_MOUSE_QUEUE_NO_THREAD :
+                     (flags & RIDEV_NOLEGACY) ? PS5_MOUSE_QUEUE_NO_LEGACY : PS5_MOUSE_QUEUE,
+                     msg, win, thread, input, flags );
     if (input && (get_hardware_msg_bit( msg->msg ) & (QS_KEY | QS_MOUSEBUTTON)))
         input->user_time = monotonic_time;
 
@@ -2942,6 +3003,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
         win = find_hardware_message_window( input->desktop, input, msg, &msg_code, &win_thread );
         if (!win || !win_thread)
         {
+            PS5_CLICK_ROUTE( PS5_MOUSE_RETRIEVE_NO_WINDOW, msg, win, win_thread, input, 0 );
             /* no window at all, remove it */
             update_thread_input_key_state( input, msg->msg, msg->wparam );
             list_remove( &msg->entry );
@@ -2958,6 +3020,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
             }
             else
             {
+                PS5_CLICK_ROUTE( PS5_MOUSE_RETRIEVE_OTHER_INPUT, msg, win, win_thread, input, 0 );
                 /* for another thread input, drop it */
                 update_thread_input_key_state( input, msg->msg, msg->wparam );
                 list_remove( &msg->entry );
@@ -2989,6 +3052,7 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
 
         /* now we can return it */
         if (!msg->unique_id) msg->unique_id = get_unique_id();
+        PS5_CLICK_ROUTE( PS5_MOUSE_RETRIEVE, msg, win, thread, input, 0 );
         reply->type   = MSG_HARDWARE;
         reply->win    = win;
         reply->msg    = msg_code;
