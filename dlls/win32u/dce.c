@@ -102,11 +102,18 @@ static BOOL offscreen_window_surface_flush( struct window_surface *surface, cons
                                             const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                                             const BITMAPINFO *shape_info, const void *shape_bits )
 {
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    /* The title window compositor shows GDI-painted windows (no-op otherwise). */
+    ps5_compositor_surface_flush( surface->hwnd, rect, color_info, color_bits );
+#endif
     return TRUE;
 }
 
 static void offscreen_window_surface_destroy( struct window_surface *surface )
 {
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    ps5_compositor_surface_destroy( surface->hwnd );
+#endif
 }
 
 static const struct window_surface_funcs offscreen_window_surface_funcs =

@@ -51,6 +51,8 @@ struct ps5c_window_state
     struct ps5c_rect clip; /* client clipped by every ancestor's client area */
     uint32_t z_depth;
     uint16_t z[PS5C_Z_DEPTH];
+    /* Same window, same z path: the GDI surface (0) lies below its swapchains (1). */
+    uint32_t layer;
 };
 
 /* Mirrors the shader's push constant block (std430). */
@@ -105,7 +107,7 @@ struct ps5c_device
     X(vkDestroyFence) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) \
     X(vkDestroySampler) X(vkDestroySemaphore) X(vkDestroyShaderModule) X(vkEndCommandBuffer) \
     X(vkFreeCommandBuffers) X(vkFreeDescriptorSets) X(vkFreeMemory) X(vkGetFenceStatus) \
-    X(vkGetImageMemoryRequirements) X(vkGetMemoryHostPointerPropertiesEXT) X(vkQueueSubmit) \
+    X(vkGetImageMemoryRequirements) X(vkGetImageSubresourceLayout) X(vkGetMemoryHostPointerPropertiesEXT) X(vkQueueSubmit) \
     X(vkQueueWaitIdle) X(vkResetFences) X(vkUpdateDescriptorSets) X(vkWaitForFences)
 #define X(name) PFN_##name p_##name;
     PS5C_DEVICE_FUNCS
@@ -189,5 +191,14 @@ void ps5c_chain_release( struct ps5c_chain *chain, uint32_t index );
 /* Producer resources go now; the last presented frame stays the window's
  * content until a newer chain for the window presents or the window goes. */
 void ps5c_chain_destroy( struct ps5c_chain *chain );
+
+/* A CPU-written chain for a window's GDI surface: linear sRGB BGRA images in
+ * title host memory imported into the compositor device only. upload copies a
+ * whole top-down 32-bit frame (alpha ignored) into a free image and publishes
+ * it; it blocks while every image is queued or on screen. */
+VkResult ps5c_chain_create_cpu( struct ps5c_compositor *compositor, uint64_t window_key, uint32_t width,
+                                uint32_t height, struct ps5c_chain **out );
+VkResult ps5c_chain_upload( struct ps5c_chain *chain, const void *bits, uint32_t stride );
+VkExtent2D ps5c_chain_size( struct ps5c_chain *chain );
 
 #endif

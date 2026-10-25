@@ -1440,8 +1440,33 @@ static struct user_driver_funcs ps5_title_gpu_driver;
 static wine_ps5_cursor_send ps5_title_cursor_send;
 static pthread_once_t ps5_title_gpu_once = PTHREAD_ONCE_INIT;
 
+#ifdef WINE_PS5_RUNESCAPE
+static HCURSOR ps5_title_last_visible_cursor;
+#endif
 static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
 {
+#ifdef WINE_PS5_RUNESCAPE
+    /* The window compositor presents a desktop: a NULL cursor (e.g. a window
+     * class without one) keeps the last visible pointer instead of hiding the
+     * hardware cursor for good. The direct game path keeps NULL = hidden. */
+    static int compositor = -1;
+    static LONG substituted;
+    if (compositor < 0)
+    {
+        const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
+        compositor = present && !strcmp( present, "compositor" );
+    }
+    if (compositor)
+    {
+        if (cursor) ps5_title_last_visible_cursor = cursor;
+        else if (ps5_title_last_visible_cursor)
+        {
+            if (!InterlockedExchangeAdd( &substituted, 1 ))
+                sceKernelDebugOutText( 0, "wine: title cursor null kept-visible=1 mode=compositor\n" );
+            cursor = ps5_title_last_visible_cursor;
+        }
+    }
+#endif
     /* The GPU parent has no desktop compositor window list. */
     (void)hwnd;
     wine_ps5_cursor_publish( &ps5_title_cursor_cache, 0, cursor, ps5_title_cursor_send );
@@ -1449,6 +1474,9 @@ static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
 
 static void ps5_title_gpu_DestroyCursorIcon( HCURSOR cursor )
 {
+#ifdef WINE_PS5_RUNESCAPE
+    InterlockedCompareExchangePointer( (void **)&ps5_title_last_visible_cursor, NULL, cursor );
+#endif
     wine_ps5_cursor_destroy( &ps5_title_cursor_cache, cursor );
 }
 

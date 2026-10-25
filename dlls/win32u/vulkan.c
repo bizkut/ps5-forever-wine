@@ -3364,6 +3364,44 @@ static void ps5_compositor_window_state( HWND hwnd, struct ps5c_window_state *st
     state->z_depth = depth;
 }
 
+/* GDI surfaces of top-level windows (Java2D's DXVK GDI fallback, Swing, any
+ * GDI painting) are composed below the windows' swapchains. */
+#define PS5_GDI_KEY (1ull << 63)
+static pthread_mutex_t ps5_gdi_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ps5_gdi_layer
+{
+    HWND hwnd;
+    struct ps5c_chain *chain;
+    RECT rect;      /* surface rectangle, relative to the window's visible rectangle */
+} ps5_gdi_layers[32];
+static LONG ps5_scene_stale;
+
+/* The window's GDI layer state: its window state, sampled over the surface. */
+static BOOL ps5_compositor_gdi_state( HWND hwnd, struct ps5c_window_state *state )
+{
+    struct window_rects rects;
+    RECT rect = {0};
+    BOOL found = FALSE;
+    uint32_t i;
+
+    pthread_mutex_lock( &ps5_gdi_lock );
+    for (i = 0; i < ARRAY_SIZE(ps5_gdi_layers); i++)
+        if (ps5_gdi_layers[i].hwnd == hwnd && ps5_gdi_layers[i].chain)
+        {
+            rect = ps5_gdi_layers[i].rect;
+            found = TRUE;
+        }
+    pthread_mutex_unlock( &ps5_gdi_lock );
+    if (!found || !get_window_rects( hwnd, COORDS_SCREEN, &rects, 0 )) return FALSE;
+    ps5_compositor_window_state( hwnd, state );
+    state->key |= PS5_GDI_KEY;
+    state->layer = 0;
+    /* Sampled over the whole surface; shown only in the client area. */
+    state->client = (struct ps5c_rect){rects.visible.left + rect.left, rects.visible.top + rect.top,
+                                       rects.visible.left + rect.right, rects.visible.top + rect.bottom};
+    return TRUE;
+}
+
 /* Any Wine thread; a window that no longer exists leaves the scene. */
 static void ps5_compositor_publish_scene(void)
 {
@@ -3373,17 +3411,89 @@ static void ps5_compositor_publish_scene(void)
 
     if (!ps5_compositor) return;
     pthread_mutex_lock( &ps5_scene_lock );
+    InterlockedExchange( &ps5_scene_stale, 0 );
     count = ps5c_window_keys( ps5_compositor, keys, ARRAY_SIZE(keys) );
     for (i = 0; i < count; i++)
     {
-        HWND hwnd = (HWND)(UINT_PTR)keys[i];
+        HWND hwnd = (HWND)(UINT_PTR)(keys[i] & ~PS5_GDI_KEY);
         if (!is_window( hwnd )) continue;
-        ps5_compositor_window_state( hwnd, &states[n++] );
+        if (keys[i] & PS5_GDI_KEY)
+        {
+            if (ps5_compositor_gdi_state( hwnd, &states[n] )) n++;
+            continue;
+        }
+        ps5_compositor_window_state( hwnd, &states[n] );
+        states[n++].layer = 1;
     }
     memcpy( ps5_scene, states, n * sizeof(*states) );
     ps5_scene_count = n;
     ps5c_scene_update( ps5_compositor, states, n );
     pthread_mutex_unlock( &ps5_scene_lock );
+}
+
+/* dce.c's offscreen surface flush: the whole top-down 32-bit surface. Called
+ * with the surface locked, so the scene is republished later, not here. */
+void ps5_compositor_surface_flush( HWND hwnd, const RECT *rect, const BITMAPINFO *info, const void *bits )
+{
+    struct ps5c_chain *chain = NULL, *old = NULL;
+    uint32_t width, height, i, slot = ARRAY_SIZE(ps5_gdi_layers);
+    VkResult res = VK_SUCCESS;
+
+    if (!ps5_compositor_mode || !ps5_compositor || !bits || info->bmiHeader.biBitCount != 32 ||
+        info->bmiHeader.biWidth <= 0 || info->bmiHeader.biHeight >= 0)
+        return;
+    width = info->bmiHeader.biWidth;
+    height = -info->bmiHeader.biHeight;
+    pthread_mutex_lock( &ps5_gdi_lock );
+    for (i = 0; i < ARRAY_SIZE(ps5_gdi_layers); i++)
+    {
+        if (ps5_gdi_layers[i].hwnd == hwnd) { slot = i; break; }
+        if (!ps5_gdi_layers[i].hwnd && slot == ARRAY_SIZE(ps5_gdi_layers)) slot = i;
+    }
+    if (slot < ARRAY_SIZE(ps5_gdi_layers))
+    {
+        struct ps5_gdi_layer *layer = &ps5_gdi_layers[slot];
+        if (layer->chain && (ps5c_chain_size( layer->chain ).width != width ||
+                             ps5c_chain_size( layer->chain ).height != height))
+        {
+            old = layer->chain;
+            layer->chain = NULL;
+        }
+        if (!layer->chain)
+        {
+            res = ps5c_chain_create_cpu( ps5_compositor, (UINT_PTR)hwnd | PS5_GDI_KEY, width, height, &layer->chain );
+            MESSAGE( "wine: title compositor gdi hwnd=%p surface=%ux%u result=%d\n", hwnd, width, height, res );
+            InterlockedExchange( &ps5_scene_stale, 1 );
+        }
+        layer->hwnd = layer->chain ? hwnd : NULL;
+        layer->rect = *rect;
+        chain = layer->chain;
+        if (chain) res = ps5c_chain_upload( chain, bits, width * 4 );
+    }
+    pthread_mutex_unlock( &ps5_gdi_lock );
+    if (old) ps5c_chain_destroy( old );
+    (void)res;
+}
+
+/* dce.c: the window's surface is going (window destroyed or surface replaced). */
+void ps5_compositor_surface_destroy( HWND hwnd )
+{
+    struct ps5c_chain *chain = NULL;
+    uint32_t i;
+
+    if (!ps5_compositor_mode || !ps5_compositor) return;
+    pthread_mutex_lock( &ps5_gdi_lock );
+    for (i = 0; i < ARRAY_SIZE(ps5_gdi_layers); i++)
+        if (ps5_gdi_layers[i].hwnd == hwnd)
+        {
+            chain = ps5_gdi_layers[i].chain;
+            ps5_gdi_layers[i].chain = NULL;
+            ps5_gdi_layers[i].hwnd = NULL;
+        }
+    pthread_mutex_unlock( &ps5_gdi_lock );
+    if (!chain) return;
+    ps5c_chain_destroy( chain );
+    InterlockedExchange( &ps5_scene_stale, 1 );
 }
 
 /* window.c: after any position, size, z-order, show/hide or destroy. */
@@ -3406,7 +3516,7 @@ static void ps5_compositor_check_window( HWND hwnd )
             current = ps5_scene[i].client.left == client.left && ps5_scene[i].client.top == client.top &&
                       ps5_scene[i].client.right == client.right && ps5_scene[i].client.bottom == client.bottom;
     pthread_mutex_unlock( &ps5_scene_lock );
-    if (!current) ps5_compositor_publish_scene();
+    if (!current || InterlockedExchange( &ps5_scene_stale, 0 )) ps5_compositor_publish_scene();
 }
 
 static VkResult ps5_compositor_create_swapchain( struct vulkan_device *device, struct surface *surface,

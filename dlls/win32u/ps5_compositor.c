@@ -69,7 +69,8 @@ int ps5c_z_compare( const struct ps5c_window_state *a, const struct ps5c_window_
     for (uint32_t i = 0; i < depth; i++)
         if (a->z[i] != b->z[i]) return a->z[i] < b->z[i] ? -1 : 1;
     /* A parent sits below its children. */
-    return depth_a < depth_b ? -1 : depth_a > depth_b;
+    if (depth_a != depth_b) return depth_a < depth_b ? -1 : 1;
+    return a->layer < b->layer ? -1 : a->layer > b->layer;
 }
 
 static int32_t clamp_pixel( double value, int32_t limit )
@@ -104,8 +105,9 @@ int ps5c_plan_compose( const struct ps5c_window_state *states, const uint8_t *ha
         else rect_union( &any, &visible[i] );
         if (state->top_level)
         {
-            if (!have_top) view = state->client;
-            else rect_union( &view, &state->client );
+            /* The visible client: a GDI surface also holds the non-client frame. */
+            if (!have_top) view = visible[i];
+            else rect_union( &view, &visible[i] );
             have_top = 1;
         }
         /* Stable insertion by z-order, bottom first. */
@@ -216,6 +218,9 @@ struct chain_image
     VkImageView view;
     VkDescriptorSet set;
     int reclaimed, accounted;
+    /* CPU chains: linear layout, and whether the image left PREINITIALIZED */
+    VkDeviceSize row_offset, row_pitch;
+    int cpu_used;
 };
 
 struct ps5c_chain
@@ -229,6 +234,8 @@ struct ps5c_chain
     uint32_t families[PS5C_MAX_QUEUE_FAMILIES], family_count;
     VkCommandPool pools[PS5C_MAX_QUEUE_FAMILIES];
     int front, queued;
+    int cpu;                       /* GDI surface chain: no producer device */
+    uint32_t width, height;
     int destroyed, producer_gone, pinned;
 };
 
@@ -346,6 +353,7 @@ static VkResult import_host_image( struct ps5c_device *device, void *host, size_
 static void destroy_producer_image( struct ps5c_chain *chain, struct chain_image *img )
 {
     struct ps5c_device *p = chain->producer;
+    if (!p) return; /* CPU chain */
     for (uint32_t f = 0; f < chain->family_count; f++)
         if (img->release[f]) p->p_vkFreeCommandBuffers( p->device, chain->pools[f], 1, &img->release[f] );
     memset( img->release, 0, sizeof(img->release) );
@@ -655,9 +663,20 @@ static VkResult record_and_submit( struct ps5c_compositor *c, struct output_slot
         image_barrier( &barriers[count++], target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                        0, VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED );
         for (uint32_t i = 0; i < plan->pass_count; i++)
-            image_barrier( &barriers[count++], entries[i].chain->images[entries[i].image].image,
-                           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
-                           VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_EXTERNAL, family );
+        {
+            struct chain_image *img = &entries[i].chain->images[entries[i].image];
+            /* GDI images are host-written in place (GENERAL); vkQueueSubmit
+             * makes those writes visible. Swapchain images come from producers. */
+            if (entries[i].chain->cpu)
+                image_barrier( &barriers[count++], img->image, img->cpu_used ? VK_IMAGE_LAYOUT_GENERAL :
+                               VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+                               VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED );
+            else
+                image_barrier( &barriers[count++], img->image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+                               VK_QUEUE_FAMILY_EXTERNAL, family );
+            img->cpu_used = 1;
+        }
         d->p_vkCmdPipelineBarrier( slot->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    0, 0, NULL, 0, NULL, count, barriers );
         d->p_vkCmdBindPipeline( slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c->pipeline );
@@ -678,9 +697,17 @@ static VkResult record_and_submit( struct ps5c_compositor *c, struct output_slot
         image_barrier( &barriers[count++], target, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                        VK_ACCESS_SHADER_WRITE_BIT, 0, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED );
         for (uint32_t i = 0; i < plan->pass_count; i++)
-            image_barrier( &barriers[count++], entries[i].chain->images[entries[i].image].image,
-                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                           VK_ACCESS_SHADER_READ_BIT, 0, family, VK_QUEUE_FAMILY_EXTERNAL );
+        {
+            struct chain_image *img = &entries[i].chain->images[entries[i].image];
+            if (entries[i].chain->cpu)
+                image_barrier( &barriers[count++], img->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+                               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED );
+            else
+                image_barrier( &barriers[count++], img->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_SHADER_READ_BIT, 0, family,
+                               VK_QUEUE_FAMILY_EXTERNAL );
+        }
         d->p_vkCmdPipelineBarrier( slot->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, count, barriers );
     }
@@ -1262,4 +1289,115 @@ void ps5c_chain_destroy( struct ps5c_chain *chain )
     chain->producer_gone = 1;
     wake_compositor_locked( c );
     pthread_mutex_unlock( &ps5c_lock );
+}
+
+VkResult ps5c_chain_create_cpu( struct ps5c_compositor *c, uint64_t window_key, uint32_t width, uint32_t height,
+                                struct ps5c_chain **out )
+{
+    struct ps5c_device *d = c->device;
+    VkExternalMemoryImageCreateInfo external = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkImageCreateInfo info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external,
+            .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_SRGB, .extent = {width, height, 1},
+            .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED};
+    VkImageViewCreateInfo view = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_SRGB,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkImageSubresource subresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    struct ps5c_chain *chain;
+    VkResult res = VK_SUCCESS;
+
+    *out = NULL;
+    if (!width || !height || width > 16384 || height > 16384) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!(chain = calloc( 1, sizeof(*chain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    chain->compositor = c;
+    chain->key = window_key;
+    chain->cpu = 1;
+    chain->width = width;
+    chain->height = height;
+    chain->image_count = 3; /* one on screen, one queued, one being written */
+    chain->front = chain->queued = -1;
+    for (uint32_t i = 0; i < chain->image_count && !res; i++)
+    {
+        struct chain_image *img = &chain->images[i];
+        VkSubresourceLayout layout;
+        VkMemoryRequirements reqs;
+        size_t align, bytes;
+
+        if ((res = d->p_vkCreateImage( d->device, &info, NULL, &img->image ))) break;
+        d->p_vkGetImageMemoryRequirements( d->device, img->image, &reqs );
+        d->p_vkGetImageSubresourceLayout( d->device, img->image, &subresource, &layout );
+        img->row_offset = layout.offset;
+        img->row_pitch = layout.rowPitch;
+        align = reqs.alignment > PS5C_HOST_ALIGN ? reqs.alignment : PS5C_HOST_ALIGN;
+        bytes = (reqs.size + PS5C_HOST_ALIGN - 1) & ~(size_t)(PS5C_HOST_ALIGN - 1);
+        if ((align & (align - 1)) || layout.rowPitch < (VkDeviceSize)width * 4 ||
+            layout.offset + layout.rowPitch * (height - 1) + width * 4 > bytes)
+        {
+            res = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+        }
+        img->host_bytes = bytes + align;
+        img->host_base = mmap( NULL, img->host_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+        if (img->host_base == MAP_FAILED)
+        {
+            img->host_base = NULL;
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+        }
+        img->host = (void *)(((uintptr_t)img->host_base + align - 1) & ~(uintptr_t)(align - 1));
+        if ((res = import_host_image( d, img->host, bytes, img->image, &img->memory ))) break;
+        view.image = img->image;
+        res = d->p_vkCreateImageView( d->device, &view, NULL, &img->view );
+    }
+    pthread_mutex_lock( &ps5c_lock );
+    for (uint32_t i = 0; i < chain->image_count && !res; i++)
+        res = account_chain_image_locked( c, &chain->images[i] );
+    if (!res) res = c->lost;
+    if (!res)
+    {
+        chain->serial = ++c->next_serial;
+        chain->next = c->chains;
+        c->chains = chain;
+        c->stats.live_chains++;
+    }
+    pthread_mutex_unlock( &ps5c_lock );
+    if (res)
+    {
+        free_chain_unlinked( c, chain );
+        return res;
+    }
+    *out = chain;
+    return VK_SUCCESS;
+}
+
+VkResult ps5c_chain_upload( struct ps5c_chain *chain, const void *bits, uint32_t stride )
+{
+    struct ps5c_compositor *c = chain->compositor;
+    struct chain_image *img;
+    uint32_t index;
+    VkResult res;
+
+    if (!chain->cpu || stride < chain->width * 4) return VK_ERROR_UNKNOWN;
+    if ((res = ps5c_chain_acquire( chain, UINT64_MAX, &index ))) return res;
+    img = &chain->images[index];
+    /* Free means no composition samples it any more: write in place. */
+    for (uint32_t y = 0; y < chain->height; y++)
+        memcpy( (char *)img->host + img->row_offset + y * img->row_pitch, (const char *)bits + (size_t)y * stride,
+                chain->width * 4 );
+    pthread_mutex_lock( &ps5c_lock );
+    if (chain->queued >= 0) chain->images[chain->queued].state = IMAGE_RETIRED;
+    img->state = IMAGE_QUEUED;
+    chain->queued = index;
+    wake_compositor_locked( c );
+    pthread_mutex_unlock( &ps5c_lock );
+    return VK_SUCCESS;
+}
+
+VkExtent2D ps5c_chain_size( struct ps5c_chain *chain )
+{
+    VkExtent2D extent = {chain->width, chain->height};
+    return extent;
 }
