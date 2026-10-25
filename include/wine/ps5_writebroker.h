@@ -43,6 +43,9 @@
  * RuneScape selects version 7 for synchronous extent-checked diff writes.
  * Replies still report the full logical length only after all required native
  * writes (including EOF extension and identical-write metadata touch) finish.
+ * Same-inode broker requests serialize through ACK; requests at most 4 KiB
+ * retain ordinary writes. The chunked protocol promises no atomic whole-file
+ * update against unsynchronized native writers/readers.
  * It retains no dirty content and needs no deferred flush/read protocol.
  * Malformed requests close the connection.
  */
