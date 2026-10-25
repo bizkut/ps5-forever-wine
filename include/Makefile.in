@@ -999,6 +999,7 @@ SOURCES = \
 	wine/ps5_title_gamepad.h \
 	wine/ps5_title_input.h \
 	wine/ps5_title_private.h \
+	wine/ps5_viewport.h \
 	wine/ps5_wow.h \
 	wine/ps5_writebroker.h \
 	wine/rbtree.h \

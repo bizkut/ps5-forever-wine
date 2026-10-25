@@ -220,6 +220,10 @@ struct swapchain
     /* fs hack data below */
     UINT fshack_dpi;
     VkExtent2D host_extents;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    BOOL title_fit, title_viewport_set;
+    struct wine_ps5_viewport title_viewport;
+#endif
     VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
     VkDeviceMemory user_image_memory;
     uint32_t n_images;
@@ -2086,6 +2090,7 @@ static BOOL extents_equals( const VkExtent2D *extents, const RECT *rect )
 #version 460
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(constant_id = 0) const bool letterbox = false;
 
 layout(binding = 0) uniform sampler2D texSampler;
 layout(binding = 1) uniform writeonly image2D outImage;
@@ -2097,7 +2102,19 @@ layout(push_constant) uniform pushConstants {
 
 void main()
 {
-    vec2 texcoord = (vec2(gl_GlobalInvocationID.xy) - constants.offset) / constants.extents;
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (letterbox)
+    {
+        if (any(greaterThanEqual(pixel, imageSize(outImage)))) return;
+        vec2 first = constants.offset + vec2(0.5);
+        if (any(lessThan(vec2(pixel), first)) ||
+            any(greaterThanEqual(vec2(pixel), first + constants.extents)))
+        {
+            imageStore(outImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+    }
+    vec2 texcoord = (vec2(pixel) - constants.offset) / constants.extents;
     vec4 c = texture(texSampler, texcoord);
 
     // Convert linear -> srgb
@@ -2112,91 +2129,129 @@ void main()
 */
 const uint32_t blit_comp_spv[] =
 {
-    0x07230203, 0x00010000, 0x0008000a, 0x0000005e, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
-    0x00000038, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
-    0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
-    0x00060010, 0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001, 0x00030003, 0x00000002,
-    0x000001cc, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00050005, 0x00000009, 0x63786574,
-    0x64726f6f, 0x00000000, 0x00080005, 0x0000000d, 0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f,
-    0x496e6f69, 0x00000044, 0x00060005, 0x00000012, 0x68737570, 0x736e6f43, 0x746e6174, 0x00000073,
-    0x00050006, 0x00000012, 0x00000000, 0x7366666f, 0x00007465, 0x00050006, 0x00000012, 0x00000001,
-    0x65747865, 0x0073746e, 0x00050005, 0x00000014, 0x736e6f63, 0x746e6174, 0x00000073, 0x00030005,
-    0x00000021, 0x00000063, 0x00050005, 0x00000025, 0x53786574, 0x6c706d61, 0x00007265, 0x00040005,
-    0x0000002d, 0x6f4c7369, 0x00000000, 0x00040005, 0x00000035, 0x61506f6c, 0x00007472, 0x00040005,
-    0x0000003a, 0x61506968, 0x00007472, 0x00050005, 0x00000055, 0x4974756f, 0x6567616d, 0x00000000,
-    0x00040047, 0x0000000d, 0x0000000b, 0x0000001c, 0x00050048, 0x00000012, 0x00000000, 0x00000023,
-    0x00000000, 0x00050048, 0x00000012, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x00000012,
-    0x00000002, 0x00040047, 0x00000025, 0x00000022, 0x00000000, 0x00040047, 0x00000025, 0x00000021,
-    0x00000000, 0x00040047, 0x00000055, 0x00000022, 0x00000000, 0x00040047, 0x00000055, 0x00000021,
-    0x00000001, 0x00030047, 0x00000055, 0x00000019, 0x00040047, 0x0000005d, 0x0000000b, 0x00000019,
-    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
-    0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008, 0x00000007, 0x00000007,
-    0x00040015, 0x0000000a, 0x00000020, 0x00000000, 0x00040017, 0x0000000b, 0x0000000a, 0x00000003,
-    0x00040020, 0x0000000c, 0x00000001, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000001,
-    0x00040017, 0x0000000e, 0x0000000a, 0x00000002, 0x0004001e, 0x00000012, 0x00000007, 0x00000007,
-    0x00040020, 0x00000013, 0x00000009, 0x00000012, 0x0004003b, 0x00000013, 0x00000014, 0x00000009,
-    0x00040015, 0x00000015, 0x00000020, 0x00000001, 0x0004002b, 0x00000015, 0x00000016, 0x00000000,
-    0x00040020, 0x00000017, 0x00000009, 0x00000007, 0x0004002b, 0x00000015, 0x0000001b, 0x00000001,
-    0x00040017, 0x0000001f, 0x00000006, 0x00000004, 0x00040020, 0x00000020, 0x00000007, 0x0000001f,
-    0x00090019, 0x00000022, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
-    0x00000000, 0x0003001b, 0x00000023, 0x00000022, 0x00040020, 0x00000024, 0x00000000, 0x00000023,
-    0x0004003b, 0x00000024, 0x00000025, 0x00000000, 0x0004002b, 0x00000006, 0x00000028, 0x00000000,
-    0x00020014, 0x0000002a, 0x00040017, 0x0000002b, 0x0000002a, 0x00000003, 0x00040020, 0x0000002c,
-    0x00000007, 0x0000002b, 0x00040017, 0x0000002e, 0x00000006, 0x00000003, 0x0004002b, 0x00000006,
-    0x00000031, 0x3b4d2e1c, 0x0006002c, 0x0000002e, 0x00000032, 0x00000031, 0x00000031, 0x00000031,
-    0x00040020, 0x00000034, 0x00000007, 0x0000002e, 0x0004002b, 0x00000006, 0x00000038, 0x414eb852,
-    0x0004002b, 0x00000006, 0x0000003d, 0x3ed55555, 0x0006002c, 0x0000002e, 0x0000003e, 0x0000003d,
-    0x0000003d, 0x0000003d, 0x0004002b, 0x00000006, 0x00000040, 0x3f870a3d, 0x0004002b, 0x00000006,
-    0x00000042, 0x3d6147ae, 0x0004002b, 0x0000000a, 0x00000049, 0x00000000, 0x00040020, 0x0000004a,
-    0x00000007, 0x00000006, 0x0004002b, 0x0000000a, 0x0000004d, 0x00000001, 0x0004002b, 0x0000000a,
-    0x00000050, 0x00000002, 0x00090019, 0x00000053, 0x00000006, 0x00000001, 0x00000000, 0x00000000,
-    0x00000000, 0x00000002, 0x00000000, 0x00040020, 0x00000054, 0x00000000, 0x00000053, 0x0004003b,
-    0x00000054, 0x00000055, 0x00000000, 0x00040017, 0x00000059, 0x00000015, 0x00000002, 0x0004002b,
-    0x0000000a, 0x0000005c, 0x00000008, 0x0006002c, 0x0000000b, 0x0000005d, 0x0000005c, 0x0000005c,
-    0x0000004d, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
-    0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003b, 0x00000020, 0x00000021, 0x00000007,
-    0x0004003b, 0x0000002c, 0x0000002d, 0x00000007, 0x0004003b, 0x00000034, 0x00000035, 0x00000007,
-    0x0004003b, 0x00000034, 0x0000003a, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000f, 0x0000000d,
-    0x0007004f, 0x0000000e, 0x00000010, 0x0000000f, 0x0000000f, 0x00000000, 0x00000001, 0x00040070,
-    0x00000007, 0x00000011, 0x00000010, 0x00050041, 0x00000017, 0x00000018, 0x00000014, 0x00000016,
-    0x0004003d, 0x00000007, 0x00000019, 0x00000018, 0x00050083, 0x00000007, 0x0000001a, 0x00000011,
-    0x00000019, 0x00050041, 0x00000017, 0x0000001c, 0x00000014, 0x0000001b, 0x0004003d, 0x00000007,
-    0x0000001d, 0x0000001c, 0x00050088, 0x00000007, 0x0000001e, 0x0000001a, 0x0000001d, 0x0003003e,
-    0x00000009, 0x0000001e, 0x0004003d, 0x00000023, 0x00000026, 0x00000025, 0x0004003d, 0x00000007,
-    0x00000027, 0x00000009, 0x00070058, 0x0000001f, 0x00000029, 0x00000026, 0x00000027, 0x00000002,
-    0x00000028, 0x0003003e, 0x00000021, 0x00000029, 0x0004003d, 0x0000001f, 0x0000002f, 0x00000021,
-    0x0008004f, 0x0000002e, 0x00000030, 0x0000002f, 0x0000002f, 0x00000000, 0x00000001, 0x00000002,
-    0x000500bc, 0x0000002b, 0x00000033, 0x00000030, 0x00000032, 0x0003003e, 0x0000002d, 0x00000033,
-    0x0004003d, 0x0000001f, 0x00000036, 0x00000021, 0x0008004f, 0x0000002e, 0x00000037, 0x00000036,
-    0x00000036, 0x00000000, 0x00000001, 0x00000002, 0x0005008e, 0x0000002e, 0x00000039, 0x00000037,
-    0x00000038, 0x0003003e, 0x00000035, 0x00000039, 0x0004003d, 0x0000001f, 0x0000003b, 0x00000021,
-    0x0008004f, 0x0000002e, 0x0000003c, 0x0000003b, 0x0000003b, 0x00000000, 0x00000001, 0x00000002,
-    0x0007000c, 0x0000002e, 0x0000003f, 0x00000001, 0x0000001a, 0x0000003c, 0x0000003e, 0x0005008e,
-    0x0000002e, 0x00000041, 0x0000003f, 0x00000040, 0x00060050, 0x0000002e, 0x00000043, 0x00000042,
-    0x00000042, 0x00000042, 0x00050083, 0x0000002e, 0x00000044, 0x00000041, 0x00000043, 0x0003003e,
-    0x0000003a, 0x00000044, 0x0004003d, 0x0000002e, 0x00000045, 0x0000003a, 0x0004003d, 0x0000002e,
-    0x00000046, 0x00000035, 0x0004003d, 0x0000002b, 0x00000047, 0x0000002d, 0x000600a9, 0x0000002e,
-    0x00000048, 0x00000047, 0x00000046, 0x00000045, 0x00050041, 0x0000004a, 0x0000004b, 0x00000021,
-    0x00000049, 0x00050051, 0x00000006, 0x0000004c, 0x00000048, 0x00000000, 0x0003003e, 0x0000004b,
-    0x0000004c, 0x00050041, 0x0000004a, 0x0000004e, 0x00000021, 0x0000004d, 0x00050051, 0x00000006,
-    0x0000004f, 0x00000048, 0x00000001, 0x0003003e, 0x0000004e, 0x0000004f, 0x00050041, 0x0000004a,
-    0x00000051, 0x00000021, 0x00000050, 0x00050051, 0x00000006, 0x00000052, 0x00000048, 0x00000002,
-    0x0003003e, 0x00000051, 0x00000052, 0x0004003d, 0x00000053, 0x00000056, 0x00000055, 0x0004003d,
-    0x0000000b, 0x00000057, 0x0000000d, 0x0007004f, 0x0000000e, 0x00000058, 0x00000057, 0x00000057,
-    0x00000000, 0x00000001, 0x0004007c, 0x00000059, 0x0000005a, 0x00000058, 0x0004003d, 0x0000001f,
-    0x0000005b, 0x00000021, 0x00040063, 0x00000056, 0x0000005a, 0x0000005b, 0x000100fd, 0x00010038,
+    0x07230203, 0x00010000, 0x0008000b, 0x0000008c, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x00000032, 0x00020011, 0x00000038, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x0000000d, 0x00060010, 0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001,
+    0x00030003, 0x00000002, 0x000001cc, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00040005,
+    0x00000009, 0x65786970, 0x0000006c, 0x00080005, 0x0000000d, 0x475f6c67, 0x61626f6c, 0x766e496c,
+    0x7461636f, 0x496e6f69, 0x00000044, 0x00050005, 0x00000013, 0x7474656c, 0x6f627265, 0x00000078,
+    0x00050005, 0x0000001a, 0x4974756f, 0x6567616d, 0x00000000, 0x00040005, 0x00000025, 0x73726966,
+    0x00000074, 0x00060005, 0x00000026, 0x68737570, 0x736e6f43, 0x746e6174, 0x00000073, 0x00050006,
+    0x00000026, 0x00000000, 0x7366666f, 0x00007465, 0x00050006, 0x00000026, 0x00000001, 0x65747865,
+    0x0073746e, 0x00050005, 0x00000028, 0x736e6f63, 0x746e6174, 0x00000073, 0x00050005, 0x0000004b,
+    0x63786574, 0x64726f6f, 0x00000000, 0x00030005, 0x00000055, 0x00000063, 0x00050005, 0x00000059,
+    0x53786574, 0x6c706d61, 0x00007265, 0x00040005, 0x0000005f, 0x6f4c7369, 0x00000000, 0x00040005,
+    0x00000067, 0x61506f6c, 0x00007472, 0x00040005, 0x0000006c, 0x61506968, 0x00007472, 0x00040047,
+    0x0000000d, 0x0000000b, 0x0000001c, 0x00040047, 0x00000013, 0x00000001, 0x00000000, 0x00030047,
+    0x0000001a, 0x00000019, 0x00040047, 0x0000001a, 0x00000021, 0x00000001, 0x00040047, 0x0000001a,
+    0x00000022, 0x00000000, 0x00030047, 0x00000026, 0x00000002, 0x00050048, 0x00000026, 0x00000000,
+    0x00000023, 0x00000000, 0x00050048, 0x00000026, 0x00000001, 0x00000023, 0x00000008, 0x00040047,
+    0x00000059, 0x00000021, 0x00000000, 0x00040047, 0x00000059, 0x00000022, 0x00000000, 0x00040047,
+    0x0000008b, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
+    0x00040015, 0x00000006, 0x00000020, 0x00000001, 0x00040017, 0x00000007, 0x00000006, 0x00000002,
+    0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000000,
+    0x00040017, 0x0000000b, 0x0000000a, 0x00000003, 0x00040020, 0x0000000c, 0x00000001, 0x0000000b,
+    0x0004003b, 0x0000000c, 0x0000000d, 0x00000001, 0x00040017, 0x0000000e, 0x0000000a, 0x00000002,
+    0x00020014, 0x00000012, 0x00030031, 0x00000012, 0x00000013, 0x00030016, 0x00000017, 0x00000020,
+    0x00090019, 0x00000018, 0x00000017, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000002,
+    0x00000000, 0x00040020, 0x00000019, 0x00000000, 0x00000018, 0x0004003b, 0x00000019, 0x0000001a,
+    0x00000000, 0x00040017, 0x0000001d, 0x00000012, 0x00000002, 0x00040017, 0x00000023, 0x00000017,
+    0x00000002, 0x00040020, 0x00000024, 0x00000007, 0x00000023, 0x0004001e, 0x00000026, 0x00000023,
+    0x00000023, 0x00040020, 0x00000027, 0x00000009, 0x00000026, 0x0004003b, 0x00000027, 0x00000028,
+    0x00000009, 0x0004002b, 0x00000006, 0x00000029, 0x00000000, 0x00040020, 0x0000002a, 0x00000009,
+    0x00000023, 0x0004002b, 0x00000017, 0x0000002d, 0x3f000000, 0x0005002c, 0x00000023, 0x0000002e,
+    0x0000002d, 0x0000002d, 0x0004002b, 0x00000006, 0x0000003b, 0x00000001, 0x00040017, 0x00000046,
+    0x00000017, 0x00000004, 0x0004002b, 0x00000017, 0x00000047, 0x00000000, 0x0004002b, 0x00000017,
+    0x00000048, 0x3f800000, 0x0007002c, 0x00000046, 0x00000049, 0x00000047, 0x00000047, 0x00000047,
+    0x00000048, 0x00040020, 0x00000054, 0x00000007, 0x00000046, 0x00090019, 0x00000056, 0x00000017,
+    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000057,
+    0x00000056, 0x00040020, 0x00000058, 0x00000000, 0x00000057, 0x0004003b, 0x00000058, 0x00000059,
+    0x00000000, 0x00040017, 0x0000005d, 0x00000012, 0x00000003, 0x00040020, 0x0000005e, 0x00000007,
+    0x0000005d, 0x00040017, 0x00000060, 0x00000017, 0x00000003, 0x0004002b, 0x00000017, 0x00000063,
+    0x3b4d2e1c, 0x0006002c, 0x00000060, 0x00000064, 0x00000063, 0x00000063, 0x00000063, 0x00040020,
+    0x00000066, 0x00000007, 0x00000060, 0x0004002b, 0x00000017, 0x0000006a, 0x414eb852, 0x0004002b,
+    0x00000017, 0x0000006f, 0x3ed55555, 0x0006002c, 0x00000060, 0x00000070, 0x0000006f, 0x0000006f,
+    0x0000006f, 0x0004002b, 0x00000017, 0x00000072, 0x3f870a3d, 0x0004002b, 0x00000017, 0x00000074,
+    0x3d6147ae, 0x0004002b, 0x0000000a, 0x0000007b, 0x00000000, 0x00040020, 0x0000007c, 0x00000007,
+    0x00000017, 0x0004002b, 0x0000000a, 0x0000007f, 0x00000001, 0x0004002b, 0x0000000a, 0x00000082,
+    0x00000002, 0x0004002b, 0x0000000a, 0x0000008a, 0x00000008, 0x0006002c, 0x0000000b, 0x0000008b,
+    0x0000008a, 0x0000008a, 0x0000007f, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
+    0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003b, 0x00000024,
+    0x00000025, 0x00000007, 0x0004003b, 0x00000024, 0x0000004b, 0x00000007, 0x0004003b, 0x00000054,
+    0x00000055, 0x00000007, 0x0004003b, 0x0000005e, 0x0000005f, 0x00000007, 0x0004003b, 0x00000066,
+    0x00000067, 0x00000007, 0x0004003b, 0x00000066, 0x0000006c, 0x00000007, 0x0004003d, 0x0000000b,
+    0x0000000f, 0x0000000d, 0x0007004f, 0x0000000e, 0x00000010, 0x0000000f, 0x0000000f, 0x00000000,
+    0x00000001, 0x0004007c, 0x00000007, 0x00000011, 0x00000010, 0x0003003e, 0x00000009, 0x00000011,
+    0x000300f7, 0x00000015, 0x00000000, 0x000400fa, 0x00000013, 0x00000014, 0x00000015, 0x000200f8,
+    0x00000014, 0x0004003d, 0x00000007, 0x00000016, 0x00000009, 0x0004003d, 0x00000018, 0x0000001b,
+    0x0000001a, 0x00040068, 0x00000007, 0x0000001c, 0x0000001b, 0x000500af, 0x0000001d, 0x0000001e,
+    0x00000016, 0x0000001c, 0x0004009a, 0x00000012, 0x0000001f, 0x0000001e, 0x000300f7, 0x00000021,
+    0x00000000, 0x000400fa, 0x0000001f, 0x00000020, 0x00000021, 0x000200f8, 0x00000020, 0x000100fd,
+    0x000200f8, 0x00000021, 0x00050041, 0x0000002a, 0x0000002b, 0x00000028, 0x00000029, 0x0004003d,
+    0x00000023, 0x0000002c, 0x0000002b, 0x00050081, 0x00000023, 0x0000002f, 0x0000002c, 0x0000002e,
+    0x0003003e, 0x00000025, 0x0000002f, 0x0004003d, 0x00000007, 0x00000030, 0x00000009, 0x0004006f,
+    0x00000023, 0x00000031, 0x00000030, 0x0004003d, 0x00000023, 0x00000032, 0x00000025, 0x000500b8,
+    0x0000001d, 0x00000033, 0x00000031, 0x00000032, 0x0004009a, 0x00000012, 0x00000034, 0x00000033,
+    0x000400a8, 0x00000012, 0x00000035, 0x00000034, 0x000300f7, 0x00000037, 0x00000000, 0x000400fa,
+    0x00000035, 0x00000036, 0x00000037, 0x000200f8, 0x00000036, 0x0004003d, 0x00000007, 0x00000038,
+    0x00000009, 0x0004006f, 0x00000023, 0x00000039, 0x00000038, 0x0004003d, 0x00000023, 0x0000003a,
+    0x00000025, 0x00050041, 0x0000002a, 0x0000003c, 0x00000028, 0x0000003b, 0x0004003d, 0x00000023,
+    0x0000003d, 0x0000003c, 0x00050081, 0x00000023, 0x0000003e, 0x0000003a, 0x0000003d, 0x000500be,
+    0x0000001d, 0x0000003f, 0x00000039, 0x0000003e, 0x0004009a, 0x00000012, 0x00000040, 0x0000003f,
+    0x000200f9, 0x00000037, 0x000200f8, 0x00000037, 0x000700f5, 0x00000012, 0x00000041, 0x00000034,
+    0x00000021, 0x00000040, 0x00000036, 0x000300f7, 0x00000043, 0x00000000, 0x000400fa, 0x00000041,
+    0x00000042, 0x00000043, 0x000200f8, 0x00000042, 0x0004003d, 0x00000018, 0x00000044, 0x0000001a,
+    0x0004003d, 0x00000007, 0x00000045, 0x00000009, 0x00040063, 0x00000044, 0x00000045, 0x00000049,
+    0x000100fd, 0x000200f8, 0x00000043, 0x000200f9, 0x00000015, 0x000200f8, 0x00000015, 0x0004003d,
+    0x00000007, 0x0000004c, 0x00000009, 0x0004006f, 0x00000023, 0x0000004d, 0x0000004c, 0x00050041,
+    0x0000002a, 0x0000004e, 0x00000028, 0x00000029, 0x0004003d, 0x00000023, 0x0000004f, 0x0000004e,
+    0x00050083, 0x00000023, 0x00000050, 0x0000004d, 0x0000004f, 0x00050041, 0x0000002a, 0x00000051,
+    0x00000028, 0x0000003b, 0x0004003d, 0x00000023, 0x00000052, 0x00000051, 0x00050088, 0x00000023,
+    0x00000053, 0x00000050, 0x00000052, 0x0003003e, 0x0000004b, 0x00000053, 0x0004003d, 0x00000057,
+    0x0000005a, 0x00000059, 0x0004003d, 0x00000023, 0x0000005b, 0x0000004b, 0x00070058, 0x00000046,
+    0x0000005c, 0x0000005a, 0x0000005b, 0x00000002, 0x00000047, 0x0003003e, 0x00000055, 0x0000005c,
+    0x0004003d, 0x00000046, 0x00000061, 0x00000055, 0x0008004f, 0x00000060, 0x00000062, 0x00000061,
+    0x00000061, 0x00000000, 0x00000001, 0x00000002, 0x000500bc, 0x0000005d, 0x00000065, 0x00000062,
+    0x00000064, 0x0003003e, 0x0000005f, 0x00000065, 0x0004003d, 0x00000046, 0x00000068, 0x00000055,
+    0x0008004f, 0x00000060, 0x00000069, 0x00000068, 0x00000068, 0x00000000, 0x00000001, 0x00000002,
+    0x0005008e, 0x00000060, 0x0000006b, 0x00000069, 0x0000006a, 0x0003003e, 0x00000067, 0x0000006b,
+    0x0004003d, 0x00000046, 0x0000006d, 0x00000055, 0x0008004f, 0x00000060, 0x0000006e, 0x0000006d,
+    0x0000006d, 0x00000000, 0x00000001, 0x00000002, 0x0007000c, 0x00000060, 0x00000071, 0x00000001,
+    0x0000001a, 0x0000006e, 0x00000070, 0x0005008e, 0x00000060, 0x00000073, 0x00000071, 0x00000072,
+    0x00060050, 0x00000060, 0x00000075, 0x00000074, 0x00000074, 0x00000074, 0x00050083, 0x00000060,
+    0x00000076, 0x00000073, 0x00000075, 0x0003003e, 0x0000006c, 0x00000076, 0x0004003d, 0x00000060,
+    0x00000077, 0x0000006c, 0x0004003d, 0x00000060, 0x00000078, 0x00000067, 0x0004003d, 0x0000005d,
+    0x00000079, 0x0000005f, 0x000600a9, 0x00000060, 0x0000007a, 0x00000079, 0x00000078, 0x00000077,
+    0x00050041, 0x0000007c, 0x0000007d, 0x00000055, 0x0000007b, 0x00050051, 0x00000017, 0x0000007e,
+    0x0000007a, 0x00000000, 0x0003003e, 0x0000007d, 0x0000007e, 0x00050041, 0x0000007c, 0x00000080,
+    0x00000055, 0x0000007f, 0x00050051, 0x00000017, 0x00000081, 0x0000007a, 0x00000001, 0x0003003e,
+    0x00000080, 0x00000081, 0x00050041, 0x0000007c, 0x00000083, 0x00000055, 0x00000082, 0x00050051,
+    0x00000017, 0x00000084, 0x0000007a, 0x00000002, 0x0003003e, 0x00000083, 0x00000084, 0x0004003d,
+    0x00000018, 0x00000085, 0x0000001a, 0x0004003d, 0x0000000b, 0x00000086, 0x0000000d, 0x0007004f,
+    0x0000000e, 0x00000087, 0x00000086, 0x00000086, 0x00000000, 0x00000001, 0x0004007c, 0x00000007,
+    0x00000088, 0x00000087, 0x0004003d, 0x00000046, 0x00000089, 0x00000055, 0x00040063, 0x00000085,
+    0x00000088, 0x00000089, 0x000100fd, 0x00010038,
 };
 
 static VkResult create_pipeline( struct vulkan_device *device, struct swapchain *swapchain, VkShaderModule shaderModule )
 {
     VkComputePipelineCreateInfo pipelineInfo = {0};
     VkResult res;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    const VkBool32 letterbox = VK_TRUE;
+    const VkSpecializationMapEntry entry = {0, 0, sizeof(letterbox)};
+    const VkSpecializationInfo specialization = {1, &entry, sizeof(letterbox), &letterbox};
+#endif
 
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->title_fit) pipelineInfo.stage.pSpecializationInfo = &specialization;
+#endif
     pipelineInfo.layout = swapchain->pipeline_layout;
     pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineInfo.basePipelineIndex = -1;
@@ -2276,6 +2331,10 @@ static VkResult init_blit_images( struct vulkan_device *device, struct swapchain
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->title_fit)
+        samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+#endif
     samplerInfo.anisotropyEnable = VK_FALSE;
     samplerInfo.maxAnisotropy = 1;
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -2426,6 +2485,23 @@ static void destroy_fs_hack_image( struct vulkan_device *device, struct swapchai
     device->p_vkDestroySemaphore( device->host.device, hack->blit_finished, NULL );
 }
 
+static void destroy_fs_hack_images( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    for (uint32_t i = 0; i < swapchain->n_images; ++i)
+        destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
+    if (swapchain->cmd_pools)
+        for (uint32_t i = 0; i < device->queue_count; ++i)
+            if (swapchain->cmd_pools[i])
+                device->p_vkDestroyCommandPool( device->host.device, swapchain->cmd_pools[i], NULL );
+    device->p_vkFreeMemory( device->host.device, swapchain->user_image_memory, NULL );
+    free( swapchain->cmd_pools );
+    free( swapchain->fs_hack_images );
+    swapchain->cmd_pools = NULL;
+    swapchain->fs_hack_images = NULL;
+    swapchain->user_image_memory = VK_NULL_HANDLE;
+    swapchain->n_images = 0;
+}
+
 static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapchain *swapchain,
                                      const VkSwapchainCreateInfoKHR *createinfo )
 {
@@ -2451,7 +2527,11 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
     real_images = malloc( count * sizeof(VkImage) );
     swapchain->cmd_pools = calloc( device->queue_count, sizeof(VkCommandPool) );
     swapchain->fs_hack_images = calloc( count, sizeof(struct fs_hack_image) );
-    if (!real_images || !swapchain->cmd_pools || !swapchain->fs_hack_images) goto fail;
+    if (!real_images || !swapchain->cmd_pools || !swapchain->fs_hack_images)
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto fail;
+    }
 
     if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, real_images )))
     {
@@ -2459,6 +2539,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         goto fail;
     }
 
+    swapchain->n_images = count;
     /* create user images */
     for (i = 0; i < count; ++i)
     {
@@ -2507,7 +2588,6 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
 
         userMemTotal += userMemReq.size;
 
-        swapchain->n_images++;
     }
 
     /* allocate backing memory */
@@ -2584,16 +2664,18 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
     return VK_SUCCESS;
 
 fail:
-    for (i = 0; i < swapchain->n_images; ++i) destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
     free( real_images );
-    free( swapchain->cmd_pools );
-    free( swapchain->fs_hack_images );
+    destroy_fs_hack_images( device, swapchain );
     return res;
 }
 
-static BOOL surface_get_fshack_dpi( struct surface *surface )
+static BOOL surface_get_fshack_dpi( struct surface *surface, const VkExtent2D *image, const VkExtent2D *output )
 {
     UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (title_vulkan)
+        return fshack_enabled && (image->width != output->width || image->height != output->height) ? (raw ? raw : 96) : 0;
+#endif
     return fshack_enabled && dpi != raw ? raw : 0;
 }
 
@@ -3038,7 +3120,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if ((swapchain->fshack_dpi = surface_get_fshack_dpi( surface )))
+    swapchain->host_extents = capabilities.minImageExtent;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    swapchain->title_fit = title_vulkan && fshack_enabled;
+    if (swapchain->title_fit && !wine_ps5_viewport_fit( &swapchain->title_viewport,
+            create_info->imageExtent.width, create_info->imageExtent.height,
+            swapchain->host_extents.width, swapchain->host_extents.height ))
+    {
+        free( swapchain );
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+#endif
+    if ((swapchain->fshack_dpi = surface_get_fshack_dpi( surface, &create_info->imageExtent, &swapchain->host_extents )))
     {
         VkSurfaceCapabilitiesKHR caps = {0};
 
@@ -3050,10 +3143,17 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             return res;
         }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        if (swapchain->title_fit && (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) ||
+            (create_info->imageFormat != VK_FORMAT_B8G8R8A8_UNORM && create_info->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)))
+        {
+            free( swapchain );
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+#endif
         if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
-        swapchain->host_extents = capabilities.minImageExtent;
         create_info_host.imageExtent = capabilities.minImageExtent;
         create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
@@ -3073,7 +3173,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
-    instance->p_insert_object( instance, &swapchain->obj.obj );
     TRACE( "Host swapchain %p for hwnd %p: %s, readback surface %u, fullscreen hack %u, flags %#x usage %#x "
           "format %u images %u\n", swapchain, surface->hwnd, debugstr_vkextent2d( &create_info->imageExtent ),
           surface->readback, !!swapchain->fshack_dpi, create_info->flags, create_info->imageUsage,
@@ -3092,6 +3191,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         if ((res = init_blit_images( device, swapchain )))
         {
             ERR( "creating blit images failed: %d\n", res );
+            destroy_fs_hack_images( device, swapchain );
             device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
             free( swapchain );
             return res;
@@ -3105,11 +3205,19 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     {
         ERR( "Creating headless swapchain readback failed: %d\n", res );
         device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
-        instance->p_remove_object( instance, &swapchain->obj.obj );
         free( swapchain );
         return res;
     }
 
+    instance->p_insert_object( instance, &swapchain->obj.obj );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->title_fit)
+        MESSAGE( "wine: title viewport hwnd=%p image=%ux%u output=%ux%u fit=%u,%u %ux%u blit=%u\n",
+                 surface->hwnd, swapchain->extents.width, swapchain->extents.height,
+                 swapchain->host_extents.width, swapchain->host_extents.height,
+                 swapchain->title_viewport.left, swapchain->title_viewport.top,
+                 swapchain->title_viewport.width, swapchain->title_viewport.height, !!swapchain->fshack_dpi );
+#endif
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
 }
@@ -3123,27 +3231,19 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->title_viewport_set) ps5_clear_present_viewport( swapchain );
+#endif
 
     if (swapchain->fshack_dpi)
     {
-        for (uint32_t i = 0; i < swapchain->n_images; ++i)
-        {
-            destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
-        }
-        for (uint32_t i = 0; i < device->queue_count; ++i)
-        {
-            if (!swapchain->cmd_pools[i]) continue;
-            device->p_vkDestroyCommandPool( device->host.device, swapchain->cmd_pools[i], NULL );
-        }
+        destroy_fs_hack_images( device, swapchain );
 
         device->p_vkDestroyPipeline( device->host.device, swapchain->pipeline, NULL );
         device->p_vkDestroyPipelineLayout( device->host.device, swapchain->pipeline_layout, NULL );
         device->p_vkDestroyDescriptorSetLayout( device->host.device, swapchain->descriptor_set_layout, NULL );
         device->p_vkDestroyDescriptorPool( device->host.device, swapchain->descriptor_pool, NULL );
         device->p_vkDestroySampler( device->host.device, swapchain->sampler, NULL );
-        device->p_vkFreeMemory( device->host.device, swapchain->user_image_memory, NULL );
-        free( swapchain->cmd_pools );
-        free( swapchain->fs_hack_images );
     }
 
     if (swapchain->readback.pending)
@@ -3172,7 +3272,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.fence = fence ? fence->host.fence : 0;
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface, &swapchain->extents, &swapchain->host_extents ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
@@ -3204,7 +3304,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
 
-    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface, &swapchain->extents, &swapchain->host_extents ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
@@ -3285,7 +3385,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 
-    device->p_vkBeginCommandBuffer( hack->cmd, &beginInfo );
+    if ((res = device->p_vkBeginCommandBuffer( hack->cmd, &beginInfo ))) return res;
 
     /* for the cs we run... */
     /* transition user image from PRESENT_SRC to SHADER_READ */
@@ -3328,17 +3428,25 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                        swapchain->pipeline_layout, 0, 1, &hack->descriptor_set, 0, NULL );
 
-    /* vec2: blit dst offset in real coords */
-    constants[0] = 0;
-    constants[1] = 0;
-
-    /* offset by 0.5f because sampling is relative to pixel center */
-    constants[0] -= 0.5f * swapchain->host_extents.width / swapchain->extents.width;
-    constants[1] -= 0.5f * swapchain->host_extents.height / swapchain->extents.height;
-
-    /* vec2: blit dst extents in real coords */
-    constants[2] = swapchain->host_extents.width;
-    constants[3] = swapchain->host_extents.height;
+    /* Specialize the shared blit for an explicit black rectangle mask. */
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (title_vulkan && swapchain->title_fit)
+    {
+        constants[0] = swapchain->title_viewport.left - 0.5f;
+        constants[1] = swapchain->title_viewport.top - 0.5f;
+        constants[2] = swapchain->title_viewport.width;
+        constants[3] = swapchain->title_viewport.height;
+    }
+    else
+#endif
+    {
+        constants[0] = constants[1] = 0;
+        constants[2] = swapchain->host_extents.width;
+        constants[3] = swapchain->host_extents.height;
+        /* Preserve the original sampling convention outside the title fit. */
+        constants[0] -= 0.5f * constants[2] / swapchain->extents.width;
+        constants[1] -= 0.5f * constants[3] / swapchain->extents.height;
+    }
     device->p_vkCmdPushConstants( hack->cmd, swapchain->pipeline_layout,
                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants );
 
@@ -3589,6 +3697,14 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
             if (!res) res = VK_SUBOPTIMAL_KHR;
         }
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        if (swapchain->title_fit && !swapchain->title_viewport_set && res >= VK_SUCCESS &&
+            NtUserIsWindow( surface->hwnd ))
+        {
+            ps5_set_present_viewport( swapchain, surface->hwnd, &swapchain->title_viewport );
+            swapchain->title_viewport_set = TRUE;
+        }
+#endif
     }
 
     for (uint32_t i = 0; i < readback_submitted; i++)
@@ -4706,7 +4822,9 @@ static void vulkan_init_once(void)
         ERR( "Trusted title Vulkan proc callbacks are missing.\n" );
         return;
     }
-    if (title_vulkan) fshack_enabled = FALSE; /* native display, no fullscreen blit */
+#ifndef WINE_PS5_RUNESCAPE
+    if (title_vulkan) fshack_enabled = FALSE; /* fullscreen native products need no blit */
+#endif
     if (!title_vulkan)
 #endif
     {

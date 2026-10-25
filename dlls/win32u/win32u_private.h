@@ -456,4 +456,11 @@ static inline BOOL intersect_rect( RECT *dst, const RECT *src1, const RECT *src2
 
 int disable_gamescope_max_size_hack(void);
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+#include "wine/ps5_viewport.h"
+void ps5_set_present_viewport( const void *owner, HWND hwnd, const struct wine_ps5_viewport *viewport );
+void ps5_clear_present_viewport( const void *owner );
+BOOL ps5_get_present_viewport( struct wine_ps5_viewport_map *map );
+#endif
+
 #endif /* __WINE_WIN32U_PRIVATE */

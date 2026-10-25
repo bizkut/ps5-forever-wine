@@ -874,6 +874,84 @@ static void ps5_post_text_chars( const struct ps5_desktop_text *text )
 }
 #endif
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static pthread_mutex_t ps5_viewport_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct
+{
+    const void *owner;
+    HWND hwnd;
+    struct wine_ps5_viewport viewport;
+} ps5_present_viewport;
+
+void ps5_set_present_viewport( const void *owner, HWND hwnd, const struct wine_ps5_viewport *viewport )
+{
+    pthread_mutex_lock( &ps5_viewport_mutex );
+    ps5_present_viewport.owner = owner;
+    ps5_present_viewport.hwnd = hwnd;
+    ps5_present_viewport.viewport = *viewport;
+    pthread_mutex_unlock( &ps5_viewport_mutex );
+}
+
+void ps5_clear_present_viewport( const void *owner )
+{
+    pthread_mutex_lock( &ps5_viewport_mutex );
+    if (ps5_present_viewport.owner == owner) ps5_present_viewport.owner = NULL;
+    pthread_mutex_unlock( &ps5_viewport_mutex );
+}
+
+BOOL ps5_get_present_viewport( struct wine_ps5_viewport_map *map )
+{
+    HWND hwnd;
+    const void *owner;
+    RECT client;
+    POINT origin = {0, 0};
+    UINT dpi = get_thread_dpi();
+
+    pthread_mutex_lock( &ps5_viewport_mutex );
+    owner = ps5_present_viewport.owner;
+    hwnd = ps5_present_viewport.hwnd;
+    map->viewport = ps5_present_viewport.viewport;
+    pthread_mutex_unlock( &ps5_viewport_mutex );
+    if (!owner || !NtUserIsWindow( hwnd ) ||
+        !NtUserGetClientRect( hwnd, &client, dpi ) || client.right <= client.left || client.bottom <= client.top)
+        return FALSE;
+    NtUserMapWindowPoints( hwnd, 0, &origin, 1, dpi );
+    map->origin_x = origin.x;
+    map->origin_y = origin.y;
+    map->client_width = client.right - client.left;
+    map->client_height = client.bottom - client.top;
+    return TRUE;
+}
+
+static void ps5_viewport_input_point( const struct wine_ps5_viewport_map *viewport, int32_t x, int32_t y, POINT *point )
+{
+    RECT rect;
+
+    wine_ps5_viewport_to_client( viewport, x, y, &rect.left, &rect.top );
+    rect.right = rect.left;
+    rect.bottom = rect.top;
+    /* SendHardwareInput takes raw pixels, unlike GetCursorPos and the live
+     * client rectangle above, which are virtualized for the pumping thread. */
+    rect = map_rect_virt_to_raw( rect, get_thread_dpi() );
+    point->x = rect.left;
+    point->y = rect.top;
+}
+
+static void ps5_viewport_cursor_point( const struct wine_ps5_viewport_map *viewport, POINT *point )
+{
+    LONG x = max( viewport->origin_x, min( point->x,
+            wine_ps5_viewport_add( viewport->origin_x, viewport->client_width - 1 ) ) );
+    LONG y = max( viewport->origin_y, min( point->y,
+            wine_ps5_viewport_add( viewport->origin_y, viewport->client_height - 1 ) ) );
+
+    /* Keep the legacy GUI cursor in the visible client too. Raw relative
+     * motion is still delivered unchanged, including at these edges. */
+    if (x != point->x || y != point->y) NtUserSetCursorPos( x, y );
+    wine_ps5_viewport_to_output( viewport, x, y, &point->x, &point->y );
+}
+
+#endif
+
 static BOOL nulldrv_ProcessEvents( DWORD mask )
 {
 #ifdef __PROSPERO__
@@ -882,6 +960,10 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
     union ps5_title_input event;
     unsigned processed = 0;
     POINT cursor;
+#ifdef WINE_PS5_RUNESCAPE
+    struct wine_ps5_viewport_map viewport;
+    BOOL fitted;
+#endif
 
     /* As WoWPS5 does, inject only on a Wine thread. PeekMessage and
      * MsgWaitForMultipleObjectsEx enter here through wait_message(). The
@@ -893,12 +975,28 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
     /* Keep FIFO delivery and pressed-key state ordered across GUI threads,
      * without waiting for another thread's server calls. */
     if (InterlockedCompareExchange( &draining, 1, 0 )) return FALSE;
+#ifdef WINE_PS5_RUNESCAPE
+    fitted = ps5_get_present_viewport( &viewport );
+#endif
     while (processed < 64)
     {
+        int width, height;
+
         NtUserGetCursorPos( &cursor );
-        if (!read_input( &event, sizeof(event), cursor.x, cursor.y,
-                         NtUserGetSystemMetrics( SM_CXSCREEN ),
-                         NtUserGetSystemMetrics( SM_CYSCREEN ) )) break;
+#ifdef WINE_PS5_RUNESCAPE
+        if (fitted)
+        {
+            ps5_viewport_cursor_point( &viewport, &cursor );
+            width = viewport.viewport.output_width;
+            height = viewport.viewport.output_height;
+        }
+        else
+#endif
+        {
+            width = NtUserGetSystemMetrics( SM_CXSCREEN );
+            height = NtUserGetSystemMetrics( SM_CYSCREEN );
+        }
+        if (!read_input( &event, sizeof(event), cursor.x, cursor.y, width, height )) break;
         switch (event.header.type)
         {
         case PS5_TITLE_INPUT_RESET:
@@ -947,8 +1045,22 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
              * as WoWPS5 does, so camera dragging survives cursor warps. */
             if (!relative)
             {
-                input.mi.dx = (int)((int64_t)mouse->x * NtUserGetSystemMetrics( SM_CXSCREEN ) / PS5_DESKTOP_WIDTH);
-                input.mi.dy = (int)((int64_t)mouse->y * NtUserGetSystemMetrics( SM_CYSCREEN ) / PS5_DESKTOP_HEIGHT);
+#ifdef WINE_PS5_RUNESCAPE
+                if (fitted)
+                {
+                    int32_t x = (int64_t)mouse->x * viewport.viewport.output_width / PS5_DESKTOP_WIDTH;
+                    int32_t y = (int64_t)mouse->y * viewport.viewport.output_height / PS5_DESKTOP_HEIGHT;
+                    POINT point;
+                    ps5_viewport_input_point( &viewport, x, y, &point );
+                    input.mi.dx = point.x;
+                    input.mi.dy = point.y;
+                }
+                else
+#endif
+                {
+                    input.mi.dx = (int)((int64_t)mouse->x * NtUserGetSystemMetrics( SM_CXSCREEN ) / PS5_DESKTOP_WIDTH);
+                    input.mi.dy = (int)((int64_t)mouse->y * NtUserGetSystemMetrics( SM_CYSCREEN ) / PS5_DESKTOP_HEIGHT);
+                }
                 input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
             }
             else if (kind == PS5_DESKTOP_MOUSE_MOVE)

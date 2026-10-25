@@ -7864,7 +7864,8 @@ static int broker_transfer( int fd, void *buffer, size_t size, int sending )
         ssize_t count = sending ? send( fd, bytes + done, size - done, MSG_NOSIGNAL )
                                 : read( fd, bytes + done, size - done );
         if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return -1;
+        if (!count) { errno = EPIPE; return -1; }
+        if (count < 0) return -1;
         done += count;
     }
     return 0;
@@ -7877,13 +7878,17 @@ static int broker_connect(void)
     struct wb_hello hello = { .magic = WB_MAGIC, .version = WB_VERSION };
     struct wb_reply reply;
     struct timeval timeout = { .tv_sec = 20 };
-    int token_fd, fd, one = 1;
+    int token_fd, fd, one = 1, error;
+    ssize_t count;
 
     /* the broker writes a new token each time it starts */
     if ((token_fd = open( WB_TOKEN_FILE, O_RDONLY )) == -1) return -1;
-    if (read( token_fd, hello.token, sizeof(hello.token) ) != sizeof(hello.token))
+    count = read( token_fd, hello.token, sizeof(hello.token) );
+    if (count != (ssize_t)sizeof(hello.token))
     {
+        error = count < 0 ? errno : EINVAL;
         close( token_fd );
+        errno = error;
         return -1;
     }
     close( token_fd );
@@ -7894,13 +7899,20 @@ static int broker_connect(void)
      * 100 ms for a delayed ACK (run 20261009-iobench-wine-7) */
     setsockopt( fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one) );
     if (connect( fd, (struct sockaddr *)&address, sizeof(address) ) ||
-        broker_transfer( fd, &hello, sizeof(hello), 1 ) || broker_transfer( fd, &reply, sizeof(reply), 0 ) ||
-        reply.magic != WB_MAGIC || reply.result)
+        broker_transfer( fd, &hello, sizeof(hello), 1 ) || broker_transfer( fd, &reply, sizeof(reply), 0 ))
+        goto failed;
+    if (reply.magic != WB_MAGIC || reply.result)
     {
-        close( fd );
-        return -1;
+        errno = reply.magic != WB_MAGIC || reply.result > 0 || reply.result == INT32_MIN
+                ? EPROTO : -reply.result;
+        goto failed;
     }
     return fd;
+failed:
+    error = errno;
+    close( fd );
+    errno = error;
+    return -1;
 }
 
 /* Called with the selected pool slot locked, for writes and space queries. */
@@ -7911,16 +7923,17 @@ static int broker_get_connection( unsigned int index, LONG64 now )
         __atomic_store_n( &broker_retry_at, now + BROKER_RETRY_SECONDS * 1000000ll, __ATOMIC_SEQ_CST );
         if (!InterlockedExchange( &broker_logged_down, 1 ))
         {
-            char line[96];
-            snprintf( line, sizeof(line), "wine: title write broker unavailable pid=%d errno=%d\n",
-                      (int)getpid(), errno );
+            char line[192];
+            snprintf( line, sizeof(line), "wine: title write broker unavailable pid=%d port=%u root=%s errno=%d\n",
+                      (int)getpid(), (unsigned)WB_PORT, WB_USER_ROOT, errno );
             sceKernelDebugOutText( 0, line );
         }
     }
     else if (!InterlockedExchange( &broker_logged_up, 1 ))
     {
-        char line[96];
-        snprintf( line, sizeof(line), "wine: title write broker connected pid=%d\n", (int)getpid() );
+        char line[192];
+        snprintf( line, sizeof(line), "wine: title write broker connected pid=%d port=%u root=%s\n",
+                  (int)getpid(), (unsigned)WB_PORT, WB_USER_ROOT );
         sceKernelDebugOutText( 0, line );
     }
     return broker[index].fd;
@@ -8011,6 +8024,7 @@ static ssize_t broker_request( int fd, const char *path, size_t path_length, con
 static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, off_t offset,
                               int native_buffer, const char *known_path )
 {
+    static LONG write_logged;
     LONG64 now = title_io_now_us();
     char *allocated_path = NULL;
     const char *path = known_path;
@@ -8057,6 +8071,14 @@ static ssize_t broker_pwrite( HANDLE handle, const void *buffer, size_t length, 
     }
     wine_ps5_title_unlock_mutex( &lock );
     free( allocated_path );
+    if (ret > 0 && InterlockedCompareExchange( &write_logged, 1, 0 ) == 0)
+    {
+        char line[192];
+        snprintf( line, sizeof(line), "wine: title write broker active pid=%d port=%u bytes=%zu written=%lld source=%s\n",
+                  (int)getpid(), (unsigned)WB_PORT, length, (long long)ret,
+                  native_buffer ? "coalescer" : "nt-write" );
+        sceKernelDebugOutText( 0, line );
+    }
     return ret;
 }
 
@@ -8145,9 +8167,12 @@ static ssize_t title_file_pwrite_buffer( HANDLE handle, int fd, const void *buff
             path = allocated_path;
         }
         snprintf( line, sizeof(line), "wine: title slow write pid=%d ms=%lld bytes=%zu offset=%lld size=%lld->%lld "
-                  "allocated=%lld->%lld path=%s\n", (int)getpid(), (long long)took / 1000, length,
+                  "allocated=%lld->%lld route=%s source=%s port=%u written=%lld path=%s\n",
+                  (int)getpid(), (long long)took / 1000, length,
                   (long long)offset, (long long)before.st_size, (long long)after.st_size,
-                  (long long)before.st_blocks * 512, (long long)after.st_blocks * 512, path ? path : "?" );
+                  (long long)before.st_blocks * 512, (long long)after.st_blocks * 512,
+                  route, native_buffer ? "coalescer" : "nt-write", (unsigned)WB_PORT,
+                  (long long)ret, path ? path : "?" );
         sceKernelDebugOutText( 0, line );
         free( allocated_path );
     }

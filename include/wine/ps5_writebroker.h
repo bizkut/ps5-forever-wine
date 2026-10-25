@@ -47,7 +47,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Products may override their endpoint without colliding with Forever. */
+#ifndef WB_PORT
 #define WB_PORT        9141
+#endif
 #define WB_MAGIC       0x31524257u   /* "WBR1" */
 /* 2: WB_USER_ROOT, versioned hello. 3: user data only, token in WB_USER_ROOT.
  * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC. 6: startup permission repair. */
