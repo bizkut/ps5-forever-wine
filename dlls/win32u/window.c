@@ -32,6 +32,12 @@
 #include "wine/opengl_driver.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+#include <stdio.h>
+#include <stdlib.h>
+#include "wine/ps5_runelite_diag.h"
+extern int sceKernelDebugOutText( int channel, const char *text );
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
@@ -5760,6 +5766,44 @@ static void style_fixup_workarounds( CREATESTRUCTW *cs, const UNICODE_STRING *cl
     }
 }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static void ps5_runelite_log_awt_window( HWND hwnd, UINT dpi )
+{
+    static uint32_t samples;
+    const RTL_USER_PROCESS_PARAMETERS *params = NULL;
+    const char *marker;
+    WCHAR class_buffer[64];
+    UNICODE_STRING class_name = {0, sizeof(class_buffer), class_buffer};
+    RECT window = {0}, client = {0};
+    const char *known;
+    DWORD error;
+    int count;
+    BOOL window_valid, client_valid;
+    char line[256];
+    if (__atomic_load_n( &samples, __ATOMIC_RELAXED ) >= 16) return;
+    marker = getenv( "WINEPS5_RUNELITE_DIAG" );
+    if (!marker && NtCurrentTeb()->Peb) params = NtCurrentTeb()->Peb->ProcessParameters;
+    if (!wine_ps5_runelite_process_enabled( marker, params ? params->Environment : NULL,
+                                          params ? params->EnvironmentSize : 0 )) return;
+    error = RtlGetLastWin32Error();
+    count = NtUserGetClassName( hwnd, FALSE, &class_name );
+    if (count <= 0 || count > (int)ARRAY_SIZE(class_buffer) ||
+        !(known = wine_ps5_runelite_awt_class( class_buffer, count )) ||
+        !wine_ps5_runelite_sample( &samples, 16 )) goto done;
+    window_valid = NtUserGetWindowRect( hwnd, &window, dpi );
+    client_valid = NtUserGetClientRect( hwnd, &client, dpi );
+    snprintf( line, sizeof(line),
+              "wine: runelite diag event=awt-window-created class=%s hwnd=%lx tid=%04x dpi=%u window_valid=%u client_valid=%u window=%lldx%lld client=%lldx%lld\n",
+              known, (unsigned long)HandleToULong( hwnd ), (unsigned)GetCurrentThreadId(), dpi,
+              (unsigned)window_valid, (unsigned)client_valid,
+              (long long)window.right - window.left, (long long)window.bottom - window.top,
+              (long long)client.right - client.left, (long long)client.bottom - client.top );
+    sceKernelDebugOutText( 0, line );
+done:
+    RtlSetLastWin32Error( error );
+}
+#endif
+
 /***********************************************************************
  *           NtUserCreateWindowEx (win32u.@)
  */
@@ -6091,6 +6135,9 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
 
     toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     if (toplevel && toplevel != hwnd) update_window_state( toplevel );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    ps5_runelite_log_awt_window( hwnd, win_dpi );
+#endif
 
     return hwnd;
 

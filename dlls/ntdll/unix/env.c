@@ -2025,6 +2025,14 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         set_env_var( &env, &env_pos, &env_size, inputW, ARRAY_SIZE(inputW) - 1, valueW );
         if (driver && !strcmp( driver, "zink" ))
             set_env_var( &env, &env_pos, &env_size, galliumW, ARRAY_SIZE(galliumW) - 1, zinkW );
+#ifdef WINE_PS5_RUNESCAPE
+        {
+            const char *diagnostic = getenv("WINEPS5_RUNELITE_DIAG");
+            static const WCHAR diagnosticW[] = {'W','I','N','E','P','S','5','_','R','U','N','E','L','I','T','E','_','D','I','A','G',0};
+            if (diagnostic && !strcmp(diagnostic, "1"))
+                set_env_var( &env, &env_pos, &env_size, diagnosticW, ARRAY_SIZE(diagnosticW) - 1, valueW );
+        }
+#endif
         env[env_pos++] = 0;
     }
 #endif

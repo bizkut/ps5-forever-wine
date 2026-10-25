@@ -105,6 +105,9 @@
 #include "wine/ps5_title_private.h"
 #include <ps5platform/klog.h>
 #endif
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+#include "wine/ps5_runelite_diag.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 WINE_DECLARE_DEBUG_CHANNEL(module);
@@ -5195,6 +5198,31 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 }
 
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static void ps5_runelite_log_jvm_map( const UNICODE_STRING *name, USHORT machine, SIZE_T bytes )
+{
+    static uint32_t samples;
+    const RTL_USER_PROCESS_PARAMETERS *params = NULL;
+    const char *marker;
+    DWORD error;
+    char line[192];
+    if (__atomic_load_n( &samples, __ATOMIC_RELAXED ) >= 1 ||
+        !name || name->Length % sizeof(WCHAR) ||
+        !wine_ps5_runelite_jvm_image( name->Buffer, name->Length / sizeof(WCHAR) )) return;
+    marker = getenv( "WINEPS5_RUNELITE_DIAG" );
+    if (!marker && NtCurrentTeb()->Peb) params = NtCurrentTeb()->Peb->ProcessParameters;
+    if (!wine_ps5_runelite_process_enabled( marker, params ? params->Environment : NULL,
+                                          params ? params->EnvironmentSize : 0 ) ||
+        !wine_ps5_runelite_sample( &samples, 1 )) return;
+    error = RtlGetLastWin32Error();
+    snprintf( line, sizeof(line),
+              "wine: runelite diag event=jvm-image-mapped image=jvm.dll machine=%04x bytes=%llu tid=%04x\n",
+              (unsigned)machine, (unsigned long long)bytes, (unsigned)GetCurrentThreadId() );
+    sceKernelDebugOutText( 0, line );
+    RtlSetLastWin32Error( error );
+}
+#endif
+
 /***********************************************************************
  *           map_image_into_view
  *
@@ -5786,6 +5814,10 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
         *size_ptr = size;
 #ifdef __PROSPERO__
         if (title_profile_is_enabled()) title_map_bind( view );
+#endif
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        /* Mapping proves the actual JVM image is present, not JNI/VM startup. */
+        if (!offset) ps5_runelite_log_jvm_map( nt_name, image_info->machine, size );
 #endif
         VIRTUAL_DEBUG_DUMP_VIEW( view );
     }

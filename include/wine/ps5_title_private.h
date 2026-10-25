@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include "wine/ps5_title.h"
 #include "wine/ps5_writebroker.h"
+#include "wine/ps5_game.h"
 
 /* Half-open GPU windows, independent of the host pointer width. Return the
  * first intersected window so a caller can split its ordinary free search. */
@@ -739,20 +740,15 @@ static inline int wine_ps5_title_direct_cache_image( const uint16_t *image, size
     return wine_ps5_title_refused_program( image, length, "Agent.exe", NULL ) != NULL;
 }
 
-/* This product hands only the official OSRS C++ image to the GPU parent.
- * Keep the shared WoW predicate unchanged in non-RuneScape builds. */
+/* The RuneScape product uses the shared exact-image game descriptor list.
+ * Keep the WoW predicate unchanged in other builds. */
 static inline int wine_ps5_title_game_image( const char *dos, const char *unix_image,
                                              int (*exists)( const char * ))
 {
 #if defined(WINE_PS5_RUNESCAPE)
-    const char *base;
     (void)unix_image;
     (void)exists;
-    if (!dos || (dos[0] != 'C' && dos[0] != 'c') || dos[1] != ':' ||
-        (dos[2] != '\\' && dos[2] != '/')) return 0;
-    base = dos;
-    for (const char *p = dos; *p; ++p) if (*p == '\\' || *p == '/') base = p + 1;
-    return !strcasecmp(base, "osclient.exe");
+    return wine_ps5_game_profile(dos) != NULL;
 #else
     const char *base, *dot, *slash;
     char loader[4096];

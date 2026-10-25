@@ -1211,6 +1211,16 @@ static void test_game_image_rule(void)
                                       game_loader_exists ) );
     assert( wine_ps5_title_game_image( "c:/Game/OSCLIENT.EXE", "/prefix/drive_c/Game/OSCLIENT.EXE",
                                       game_loader_exists ) );
+    assert( wine_ps5_title_game_image( "C:\\RuneLite\\RuneLite.exe", "/prefix/drive_c/RuneLite/RuneLite.exe",
+                                      game_loader_exists ) );
+    assert( wine_ps5_title_game_image( "c:/RuneLite/RUNELITE.EXE", "/prefix/drive_c/RuneLite/RUNELITE.EXE",
+                                      game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "C:\\RuneLite\\RuneLite.exe.dll", "/prefix/drive_c/RuneLite/RuneLite.exe.dll",
+                                       game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "Z:\\RuneLite\\RuneLite.exe", "/prefix/drive_c/RuneLite/RuneLite.exe",
+                                       game_loader_exists ) );
+    assert( !wine_ps5_title_game_image( "C:\\Game\\HDOS.exe", "/prefix/drive_c/Game/HDOS.exe",
+                                       game_loader_exists ) );
     assert( !wine_ps5_title_game_image( "C:\\Game\\Wow.exe", "/prefix/drive_c/Game/Wow.exe",
                                        game_loader_exists ) );
     assert( !wine_ps5_title_game_image( "Z:\\Game\\osclient.exe", "/prefix/drive_c/Game/osclient.exe",
@@ -1219,7 +1229,7 @@ static void test_game_image_rule(void)
                                        game_loader_exists ) );
     assert( !wine_ps5_title_game_image( "osclient.exe", "/prefix/drive_c/Game/osclient.exe",
                                        game_loader_exists ) );
-    puts( "ps5 game image: official OSRS leaf, C drive, case-insensitive, no WoW loader heuristic PASS" );
+    puts( "ps5 game image: exact OSRS/RuneLite allowlist, C drive, case-insensitive, other clients rejected PASS" );
 #else
     assert( wine_ps5_title_game_image( "C:\\WoW\\WowB.exe",
                                       "/prefix/drive_c/WoW/WowB.exe", game_loader_exists ) );

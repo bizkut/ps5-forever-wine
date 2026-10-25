@@ -76,6 +76,10 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+#include "wine/ps5_runelite_diag.h"
+#include <ps5platform/klog.h>
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -2475,6 +2479,33 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 }
 
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+static void ps5_runelite_log_compiler_name( const UNICODE_STRING *name, NTSTATUS status, DWORD target_tid )
+{
+    static uint32_t samples;
+    const RTL_USER_PROCESS_PARAMETERS *params = NULL;
+    const char *marker;
+    unsigned tier, index;
+    DWORD error;
+    char line[224];
+    if (status != STATUS_SUCCESS || !target_tid ||
+        __atomic_load_n( &samples, __ATOMIC_RELAXED ) >= 16 ||
+        !name || name->Length % sizeof(WCHAR) ||
+        !wine_ps5_runelite_compiler_name( name->Buffer, name->Length / sizeof(WCHAR), &tier, &index )) return;
+    marker = getenv( "WINEPS5_RUNELITE_DIAG" );
+    if (!marker && NtCurrentTeb()->Peb) params = NtCurrentTeb()->Peb->ProcessParameters;
+    if (!wine_ps5_runelite_process_enabled( marker, params ? params->Environment : NULL,
+                                          params ? params->EnvironmentSize : 0 ) ||
+        !wine_ps5_runelite_sample( &samples, 16 )) return;
+    error = RtlGetLastWin32Error();
+    snprintf( line, sizeof(line),
+              "wine: runelite diag event=compiler-thread-name-set tier=C%u index=%u target_tid=%04x tid=%04x evidence=hotspot-name\n",
+              tier, index, (unsigned)target_tid, (unsigned)GetCurrentThreadId() );
+    sceKernelDebugOutText( 0, line );
+    RtlSetLastWin32Error( error );
+}
+#endif
+
 /******************************************************************************
  *              NtSetInformationThread  (NTDLL.@)
  */
@@ -2621,12 +2652,20 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const THREAD_NAME_INFORMATION *info = data;
         THREAD_BASIC_INFORMATION tbi;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        DWORD runelite_target_tid = 0;
+#endif
 
         if (length != sizeof(*info)) return STATUS_INFO_LENGTH_MISMATCH;
         if (!info) return STATUS_ACCESS_VIOLATION;
         if (info->ThreadName.Length && !info->ThreadName.Buffer) return STATUS_ACCESS_VIOLATION;
 
         status = NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        if (handle == GetCurrentThread()) runelite_target_tid = GetCurrentThreadId();
+        else if (!status && HandleToULong( tbi.ClientId.UniqueProcess ) == GetCurrentProcessId())
+            runelite_target_tid = HandleToULong( tbi.ClientId.UniqueThread );
+#endif
         if (handle == GetCurrentThread() || (!status && (HandleToULong(tbi.ClientId.UniqueThread) == GetCurrentThreadId())))
             WARN_(threadname)( "Thread renamed to %s\n", debugstr_us(&info->ThreadName) );
         else if (!status)
@@ -2644,6 +2683,9 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         SERVER_END_REQ;
 
         set_native_thread_name( handle, &info->ThreadName );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+        ps5_runelite_log_compiler_name( &info->ThreadName, status, runelite_target_tid );
+#endif
 
         return status;
     }
