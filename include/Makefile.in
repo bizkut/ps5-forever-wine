@@ -989,8 +989,10 @@ SOURCES = \
 	wine/plugplay.idl \
 	wine/ps5_cursor.h \
 	wine/ps5_desktop.h \
+	wine/ps5_game.h \
 	wine/ps5_input.h \
 	wine/ps5_prefix_init.h \
+	wine/ps5_runelite_diag.h \
 	wine/ps5_shared_mode.h \
 	wine/ps5_spawn.h \
 	wine/ps5_suspend.h \

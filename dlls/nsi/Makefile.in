@@ -1,7 +1,14 @@
 MODULE    = nsi.dll
 IMPORTLIB = nsi
 UNIXLIB   = nsi.so
+PARENTSRC = ../nsiproxy.sys
+EXTRADEFS = -DNSI_SERVICE_FREE
+UNIX_LIBS = $(PS5_NET_LIBS)
 
 SOURCES = \
 	nsi.c \
+	ip.c \
+	ndis.c \
+	scope.c \
+	tables.c \
 	unixlib.c

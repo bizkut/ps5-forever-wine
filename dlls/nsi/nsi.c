@@ -182,6 +182,18 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
         NTSTATUS status = WINE_UNIX_CALL( 0, params );
         if (status != STATUS_NOT_SUPPORTED) return RtlNtStatusToDosError( status );
     }
+#ifdef __WINE_PS5__
+    if (__wine_unixlib_handle &&
+        (NmrIsEqualNpiModuleId( params->module, &NPI_MS_NDIS_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV4_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV6_MODULEID )))
+    {
+        NTSTATUS status = WINE_UNIX_CALL( 1, params );
+        /* Only a non-title Unix side declines this route. Real provider
+         * errors, including unsupported native queries, must reach callers. */
+        if (status != STATUS_NOT_IMPLEMENTED) return RtlNtStatusToDosError( status );
+    }
+#endif
     device = get_nsi_device( FALSE );
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
@@ -259,13 +271,24 @@ DWORD WINAPI NsiGetAllParameters( DWORD unk, const NPI_MODULEID *module, DWORD t
 
 DWORD WINAPI NsiGetAllParametersEx( struct nsi_get_all_parameters_ex *params )
 {
-    HANDLE device = get_nsi_device( FALSE );
+    HANDLE device;
     struct nsiproxy_get_all_parameters *in;
     ULONG in_size = FIELD_OFFSET( struct nsiproxy_get_all_parameters, key[params->key_size] ), received;
     ULONG out_size = params->rw_size + params->dynamic_size + params->static_size;
     DWORD err = ERROR_SUCCESS;
     BYTE *out, *ptr;
 
+#ifdef __WINE_PS5__
+    if (__wine_unixlib_handle &&
+        (NmrIsEqualNpiModuleId( params->module, &NPI_MS_NDIS_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV4_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV6_MODULEID )))
+    {
+        NTSTATUS status = WINE_UNIX_CALL( 2, params );
+        if (status != STATUS_NOT_IMPLEMENTED) return RtlNtStatusToDosError( status );
+    }
+#endif
+    device = get_nsi_device( FALSE );
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
     in = malloc( in_size );
@@ -328,11 +351,22 @@ DWORD WINAPI NsiGetParameter( DWORD unk, const NPI_MODULEID *module, DWORD table
 
 DWORD WINAPI NsiGetParameterEx( struct nsi_get_parameter_ex *params )
 {
-    HANDLE device = get_nsi_device( FALSE );
+    HANDLE device;
     struct nsiproxy_get_parameter *in;
     ULONG in_size = FIELD_OFFSET( struct nsiproxy_get_parameter, key[params->key_size] ), received;
     DWORD err = ERROR_SUCCESS;
 
+#ifdef __WINE_PS5__
+    if (__wine_unixlib_handle &&
+        (NmrIsEqualNpiModuleId( params->module, &NPI_MS_NDIS_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV4_MODULEID ) ||
+         NmrIsEqualNpiModuleId( params->module, &NPI_MS_IPV6_MODULEID )))
+    {
+        NTSTATUS status = WINE_UNIX_CALL( 3, params );
+        if (status != STATUS_NOT_IMPLEMENTED) return RtlNtStatusToDosError( status );
+    }
+#endif
+    device = get_nsi_device( FALSE );
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
     in = malloc( in_size );

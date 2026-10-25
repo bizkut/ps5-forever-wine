@@ -2973,6 +2973,11 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
     HANDLE mountmgr;
     unsigned int status;
     int letter = -1;
+#ifdef __PROSPERO__
+    const BOOL title = ps5_direct_enabled();
+
+    if (title && size < sizeof(*drive)) return STATUS_BUFFER_TOO_SMALL;
+#endif
 
     if (!server_get_unix_name( handle, &unix_name ))
     {
@@ -2980,6 +2985,39 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
         free( unix_name );
     }
     memset( drive, 0, sizeof(*drive) );
+#ifdef __PROSPERO__
+    if (title)
+    {
+        const char *root;
+        struct stat root_stat, file_stat;
+        ULONGLONG identity;
+
+        /* These are registered logical volumes, not mount-manager devices.
+         * Derive their stable logical serial from the actual root identity;
+         * do not pretend to have read a physical NTFS superblock or label. */
+        if (letter < 0 || !(root = ps5_title_drive( 'a' + letter )))
+            return STATUS_BAD_DEVICE_TYPE;
+        if (fstat( fd, &file_stat ) < 0) return errno_to_status( errno );
+        if (!S_ISREG( file_stat.st_mode ) && !S_ISDIR( file_stat.st_mode ))
+            return STATUS_INVALID_DEVICE_REQUEST;
+        if (stat( root, &root_stat ) < 0) return errno_to_status( errno );
+        if (!S_ISDIR( root_stat.st_mode )) return STATUS_BAD_DEVICE_TYPE;
+
+        identity = (ULONGLONG)root_stat.st_dev ^ (ULONGLONG)root_stat.st_ino;
+        drive->size = sizeof(*drive) + sizeof(WCHAR);
+        drive->type = DRIVE_FIXED;
+        drive->fs_type = MOUNTMGR_FS_TYPE_NTFS;
+        drive->serial = (ULONG)(identity ^ (identity >> 32));
+        drive->unix_dev = root_stat.st_dev;
+        drive->letter = 'a' + letter;
+        drive->label_offset = sizeof(*drive);
+        /* Attribute/ID callers request just the fixed descriptor. The volume
+         * caller supplies space for the empty label's terminator as well. */
+        if (size >= drive->size)
+            *(WCHAR *)((char *)drive + drive->label_offset) = 0;
+        return STATUS_SUCCESS;
+    }
+#endif
     if (letter == -1)
     {
         struct stat st;

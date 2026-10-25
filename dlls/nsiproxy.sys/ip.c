@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#if !defined(NSI_SERVICE_FREE) || defined(__PROSPERO__)
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -992,7 +993,7 @@ static NTSTATUS ipv6_interface_get_all_parameters( const void *key, UINT key_siz
                               static_data, static_size, NULL );
 }
 
-static void unicast_fill_entry( struct ifaddrs *entry, void *key, struct nsi_ip_unicast_rw *rw,
+static BOOL unicast_fill_entry( struct ifaddrs *entry, void *key, struct nsi_ip_unicast_rw *rw,
                                 struct nsi_ip_unicast_dynamic *dyn, struct nsi_ip_unicast_static *stat )
 {
     struct nsi_ipv6_unicast_key placeholder, *key6 = key;
@@ -1005,7 +1006,7 @@ static void unicast_fill_entry( struct ifaddrs *entry, void *key, struct nsi_ip_
         key4 = (struct nsi_ipv4_unicast_key *)&placeholder;
     }
 
-    convert_unix_name_to_luid( entry->ifa_name, &key6->luid );
+    if (!convert_unix_name_to_luid( entry->ifa_name, &key6->luid )) return FALSE;
 
     if (entry->ifa_addr->sa_family == AF_INET)
     {
@@ -1049,6 +1050,7 @@ static void unicast_fill_entry( struct ifaddrs *entry, void *key, struct nsi_ip_
     }
 
     if (stat) stat->creation_time = get_boot_time();
+    return TRUE;
 }
 
 static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_size, void *rw_data, UINT rw_size,
@@ -1071,7 +1073,11 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
 
         if (num < *count)
         {
-            unicast_fill_entry( entry, key_data, rw_data, dynamic_data, static_data );
+            if (!unicast_fill_entry( entry, key_data, rw_data, dynamic_data, static_data ))
+            {
+                freeifaddrs( addrs );
+                return STATUS_NOT_FOUND;
+            }
             key_data = (BYTE *)key_data + key_size;
             rw_data = (BYTE *)rw_data + rw_size;
             dynamic_data = (BYTE *)dynamic_data + dynamic_size;
@@ -1132,8 +1138,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
         if (family == AF_INET6 &&
             memcmp( &key6->addr, &((struct sockaddr_in6 *)entry->ifa_addr)->sin6_addr, sizeof(key6->addr) )) continue;
 
-        unicast_fill_entry( entry, NULL, rw_data, dynamic_data, static_data );
-        status = STATUS_SUCCESS;
+        if (unicast_fill_entry( entry, NULL, rw_data, dynamic_data, static_data )) status = STATUS_SUCCESS;
         break;
     }
 
@@ -2000,3 +2005,4 @@ const struct module ipv6_module =
     &NPI_MS_IPV6_MODULEID,
     ipv6_tables
 };
+#endif /* !NSI_SERVICE_FREE || __PROSPERO__ */

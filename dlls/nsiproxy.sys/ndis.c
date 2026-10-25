@@ -23,12 +23,21 @@
 #endif
 
 #include "config.h"
+#if !defined(NSI_SERVICE_FREE) || defined(__PROSPERO__)
 
 #include <stdarg.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#ifdef HAVE_IFADDRS_H
+#include <ifaddrs.h>
+#endif
+#if defined(__linux__) && defined(NSI_SERVICE_FREE) && defined(__PROSPERO__)
+#include <netpacket/packet.h>
+#include <linux/if_link.h>
+#endif
 
 #ifdef HAVE_NET_IF_H
 #include <net/if.h>
@@ -87,6 +96,9 @@
 #include "wine/unixlib.h"
 
 #include "unix_private.h"
+#if defined(__PROSPERO__) && defined(NSI_SERVICE_FREE)
+#define NSI_TITLE_INTERFACES
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 
@@ -104,6 +116,11 @@ struct if_entry
     IF_PHYSICAL_ADDRESS if_phys_addr;
     UINT if_index;
     UINT if_type;
+#ifdef NSI_TITLE_INTERFACES
+    BOOL present;
+    UINT flags;
+    struct nsi_ndis_ifinfo_dynamic dynamic;
+#endif
 };
 
 static struct list if_list = LIST_INIT( if_list );
@@ -111,12 +128,21 @@ static pthread_mutex_t if_list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static BOOL have_ethernet_iface;
 
+static BOOL entry_is_current( const struct if_entry *entry )
+{
+#ifdef NSI_TITLE_INTERFACES
+    return entry->present;
+#else
+    return TRUE;
+#endif
+}
+
 static struct if_entry *find_entry_from_index( UINT index )
 {
     struct if_entry *entry;
 
     LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
-        if (entry->if_index == index) return entry;
+        if (entry_is_current( entry ) && entry->if_index == index) return entry;
 
     return NULL;
 }
@@ -126,11 +152,12 @@ static struct if_entry *find_entry_from_luid( const NET_LUID *luid )
     struct if_entry *entry;
 
     LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
-        if (entry->if_luid.Value == luid->Value) return entry;
+        if (entry_is_current( entry ) && entry->if_luid.Value == luid->Value) return entry;
 
     return NULL;
 }
 
+#ifndef NSI_TITLE_INTERFACES
 #if defined (SIOCGIFHWADDR) && defined (HAVE_STRUCT_IFREQ_IFR_HWADDR)
 static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
 {
@@ -286,6 +313,8 @@ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRE
 }
 #endif
 
+#endif
+
 static WCHAR *strdupAtoW( const char *str )
 {
     WCHAR *ret = NULL;
@@ -298,6 +327,7 @@ static WCHAR *strdupAtoW( const char *str )
     return ret;
 }
 
+#ifndef NSI_TITLE_INTERFACES
 static int fake_ethernet_adapter(void)
 {
     static int cached = -1;
@@ -312,6 +342,8 @@ static int fake_ethernet_adapter(void)
     }
     return cached;
 }
+
+#endif
 
 static struct if_entry *add_entry( UINT index, const char *name )
 {
@@ -336,7 +368,13 @@ static struct if_entry *add_entry( UINT index, const char *name )
         return NULL;
     }
 
+#ifdef NSI_TITLE_INTERFACES
+    entry->if_type = MIB_IF_TYPE_OTHER;
+    memset( &entry->if_phys_addr, 0, sizeof(entry->if_phys_addr) );
+    entry->present = FALSE;
+#else
     if_get_physical( name, &entry->if_type, &entry->if_phys_addr );
+#endif
 
     entry->if_luid.Info.Reserved = 0;
     entry->if_luid.Info.NetLuidIndex = index;
@@ -354,8 +392,195 @@ static struct if_entry *add_entry( UINT index, const char *name )
     return entry;
 }
 
+#ifdef NSI_TITLE_INTERFACES
+static NTSTATUS title_if_status;
+
+static UINT title_if_type( UINT type, UINT flags )
+{
+    if (flags & IFF_LOOPBACK) return MIB_IF_TYPE_LOOPBACK;
+#ifdef __linux__
+    switch (type)
+    {
+    case ARPHRD_ETHER: return MIB_IF_TYPE_ETHERNET;
+    case ARPHRD_PPP: return MIB_IF_TYPE_PPP;
+    case ARPHRD_SLIP: return MIB_IF_TYPE_SLIP;
+    default: break;
+    }
+#else
+    switch (type)
+    {
+    case IFT_ETHER: return MIB_IF_TYPE_ETHERNET;
+    case IFT_LOOP: return MIB_IF_TYPE_LOOPBACK;
+    case IFT_PPP: return MIB_IF_TYPE_PPP;
+    case IFT_SLIP: return MIB_IF_TYPE_SLIP;
+    case IFT_FDDI: return MIB_IF_TYPE_FDDI;
+    case IFT_IEEE80211: return IF_TYPE_IEEE80211;
+    case IFT_GIF: return IF_TYPE_TUNNEL;
+    default:
+        /* BSD's standard if_types use the same IANA values as Windows;
+         * private BSD types must not leak into the Windows namespace. */
+        if (type && type < IFT_GIF) return type;
+        break;
+    }
+#endif
+    if (flags & IFF_POINTOPOINT) return MIB_IF_TYPE_PPP;
+    return MIB_IF_TYPE_OTHER;
+}
+
+static void title_if_dynamic( struct if_entry *entry, const struct ifaddrs *ifa, int fd )
+{
+    struct nsi_ndis_ifinfo_dynamic *data = &entry->dynamic;
+    memset( data, 0, sizeof(*data) );
+    entry->flags = ifa->ifa_flags;
+    data->oper_status = !(ifa->ifa_flags & IFF_UP) ? IfOperStatusDown :
+                        (ifa->ifa_flags & IFF_RUNNING) ? IfOperStatusUp : IfOperStatusUnknown;
+    data->media_conn_state = MediaConnectStateUnknown;
+#ifdef __linux__
+    if (ifa->ifa_flags & IFF_RUNNING) data->media_conn_state = MediaConnectStateConnected;
+    else if (!(ifa->ifa_flags & IFF_UP)) data->media_conn_state = MediaConnectStateDisconnected;
+    if (ifa->ifa_data)
+    {
+        const struct rtnl_link_stats *stats = ifa->ifa_data;
+        data->in_octets = stats->rx_bytes;
+        data->out_octets = stats->tx_bytes;
+        data->in_ucast_pkts = stats->rx_packets;
+        data->out_ucast_pkts = stats->tx_packets;
+        data->in_mcast_pkts = stats->multicast;
+        data->in_errors = stats->rx_errors;
+        data->out_errors = stats->tx_errors;
+        data->in_discards = stats->rx_dropped;
+        data->out_discards = stats->tx_dropped;
+    }
+    if (fd >= 0)
+    {
+        struct ifreq request = {0};
+        memcpy( request.ifr_name, entry->if_unix_name, strlen(entry->if_unix_name) + 1 );
+        if (!ioctl( fd, SIOCGIFMTU, &request )) data->mtu = request.ifr_mtu;
+    }
+#else
+    if (ifa->ifa_data)
+    {
+        const struct if_data *stats = ifa->ifa_data;
+        data->mtu = stats->ifi_mtu;
+        data->rcv_speed = data->xmit_speed = stats->ifi_baudrate;
+        data->in_octets = stats->ifi_ibytes;
+        data->out_octets = stats->ifi_obytes;
+        data->in_ucast_pkts = stats->ifi_ipackets;
+        data->out_ucast_pkts = stats->ifi_opackets;
+        data->in_mcast_pkts = stats->ifi_imcasts;
+        data->out_mcast_pkts = stats->ifi_omcasts;
+        data->in_errors = stats->ifi_ierrors;
+        data->out_errors = stats->ifi_oerrors;
+        data->in_discards = stats->ifi_iqdrops;
+        data->out_discards = stats->ifi_oqdrops;
+        if (stats->ifi_link_state == LINK_STATE_UP)
+        {
+            data->media_conn_state = MediaConnectStateConnected;
+            if (ifa->ifa_flags & IFF_UP) data->oper_status = IfOperStatusUp;
+        }
+        else if (stats->ifi_link_state == LINK_STATE_DOWN)
+        {
+            data->media_conn_state = MediaConnectStateDisconnected;
+            data->oper_status = IfOperStatusDown;
+        }
+    }
+    else if ((ifa->ifa_flags & IFF_LOOPBACK) && (ifa->ifa_flags & IFF_UP))
+        data->media_conn_state = MediaConnectStateConnected;
+#endif
+    data->flags.not_media_conn = data->media_conn_state == MediaConnectStateDisconnected;
+}
+
+static unsigned int title_update_if_table(void)
+{
+    struct ifaddrs *list, *ifa;
+    struct if_entry *entry, *cached;
+    unsigned int appended = 0, linked = 0;
+    int fd = -1;
+    if (getifaddrs( &list ))
+    {
+        title_if_status = errno == ENOMEM ? STATUS_NO_MEMORY :
+                          (errno == EACCES || errno == EPERM) ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
+        return 0;
+    }
+    title_if_status = STATUS_SUCCESS;
+    LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry ) entry->present = FALSE;
+#ifdef __linux__
+    fd = socket( AF_INET, SOCK_DGRAM, 0 );
+#endif
+    for (ifa = list; ifa; ifa = ifa->ifa_next)
+    {
+        const BYTE *address;
+        UINT index, type, length;
+        if (!ifa->ifa_addr || !ifa->ifa_name) continue;
+#ifdef __linux__
+        {
+            const struct sockaddr_ll *link = (const struct sockaddr_ll *)ifa->ifa_addr;
+            if (ifa->ifa_addr->sa_family != AF_PACKET) continue;
+            index = link->sll_ifindex;
+            type = title_if_type( link->sll_hatype, ifa->ifa_flags );
+            address = link->sll_addr;
+            length = link->sll_halen <= sizeof(link->sll_addr) ? link->sll_halen : 0;
+        }
+#else
+        {
+            const struct sockaddr_dl *link = (const struct sockaddr_dl *)ifa->ifa_addr;
+            if (ifa->ifa_addr->sa_family != AF_LINK) continue;
+            index = link->sdl_index;
+            type = title_if_type( link->sdl_type, ifa->ifa_flags );
+            address = (const BYTE *)CLLADDR(link);
+            length = FIELD_OFFSET(struct sockaddr_dl, sdl_data) + link->sdl_nlen + link->sdl_alen <= link->sdl_len
+                     ? link->sdl_alen : 0;
+        }
+#endif
+        linked++;
+        if (!index || index > 0xffffff || strlen(ifa->ifa_name) >= IFNAMSIZ)
+        {
+            title_if_status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        cached = NULL;
+        LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
+            if (entry->if_index == index && !strcmp( entry->if_unix_name, ifa->ifa_name ))
+            { cached = entry;break; }
+        if (!cached)
+        {
+            if (!(cached = add_entry( index, ifa->ifa_name )))
+            { title_if_status = STATUS_NO_MEMORY;break; }
+            appended++;
+        }
+        cached->present = TRUE;
+        cached->if_type = cached->if_luid.Info.IfType = type;
+        memset( &cached->if_phys_addr, 0, sizeof(cached->if_phys_addr) );
+        if (type != MIB_IF_TYPE_LOOPBACK && length <= sizeof(cached->if_phys_addr.Address))
+        {
+            cached->if_phys_addr.Length = length;
+            if (length) memcpy( cached->if_phys_addr.Address, address, length );
+        }
+        /* Flags zero identifies only the primary Ethernet address. */
+        if (!cached->if_phys_addr.Length && type == MIB_IF_TYPE_ETHERNET &&
+            !strcmp( ifa->ifa_name, "eth0" ))
+        {
+            BYTE primary[6];
+            if (!sceNetGetMacAddress( primary, 0 ))
+            {
+                cached->if_phys_addr.Length = sizeof(primary);
+                memcpy( cached->if_phys_addr.Address, primary, sizeof(primary) );
+            }
+        }
+        title_if_dynamic( cached, ifa, fd );
+    }
+    if (!linked && list) title_if_status = STATUS_NOT_SUPPORTED;
+    if (fd >= 0) close( fd );
+    freeifaddrs( list );
+    return appended;
+}
+#endif
+
 static unsigned int update_if_table( void )
 {
+#ifdef NSI_TITLE_INTERFACES
+    return title_update_if_table();
+#else
     struct if_nameindex *indices = if_nameindex(), *entry;
     unsigned int append_count = 0;
     struct if_entry *if_entry;
@@ -376,7 +601,20 @@ static unsigned int update_if_table( void )
     }
 
     return append_count;
+#endif
 }
+
+#ifdef NSI_TITLE_INTERFACES
+NTSTATUS nsi_ndis_refresh(void)
+{
+    NTSTATUS status;
+    pthread_mutex_lock( &if_list_lock );
+    update_if_table();
+    status = title_if_status;
+    pthread_mutex_unlock( &if_list_lock );
+    return status;
+}
+#endif
 
 static void if_counted_string_init( IF_COUNTED_STRING *str, const WCHAR *value )
 {
@@ -387,6 +625,9 @@ static void if_counted_string_init( IF_COUNTED_STRING *str, const WCHAR *value )
 
 static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_dynamic *data )
 {
+#ifdef NSI_TITLE_INTERFACES
+    *data = entry->dynamic;
+#else
     int fd, name_len = strlen( entry->if_unix_name );
     struct ifreq req;
 
@@ -504,6 +745,7 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
         free( buf );
     }
 #endif
+#endif
 }
 
 static void ifinfo_fill_entry( struct if_entry *entry, NET_LUID *key, struct nsi_ndis_ifinfo_rw *rw,
@@ -513,8 +755,15 @@ static void ifinfo_fill_entry( struct if_entry *entry, NET_LUID *key, struct nsi
 
     if (rw)
     {
+#ifdef NSI_TITLE_INTERFACES
+        memset( rw, 0, sizeof(*rw) );
+#endif
         memset( &rw->network_guid, 0, sizeof(entry->if_guid) );
+#ifdef NSI_TITLE_INTERFACES
+        rw->admin_status = entry->flags & IFF_UP ? MIB_IF_ADMIN_STATUS_UP : MIB_IF_ADMIN_STATUS_DOWN;
+#else
         rw->admin_status = MIB_IF_ADMIN_STATUS_UP;
+#endif
         if_counted_string_init( &rw->alias, entry->if_name );
         memcpy( &rw->phys_addr, &entry->if_phys_addr, sizeof(entry->if_phys_addr) );
         rw->pad = 0;
@@ -526,16 +775,28 @@ static void ifinfo_fill_entry( struct if_entry *entry, NET_LUID *key, struct nsi
 
     if (stat)
     {
+#ifdef NSI_TITLE_INTERFACES
+        memset( stat, 0, sizeof(*stat) );
+#endif
         stat->if_index = entry->if_index;
         if_counted_string_init( &stat->descr, entry->if_name ); /* get a more descriptive name */
         stat->type = entry->if_type;
+#ifdef NSI_TITLE_INTERFACES
+        stat->access_type = (entry->flags & IFF_LOOPBACK) ? NET_IF_ACCESS_LOOPBACK :
+                            (entry->flags & IFF_POINTOPOINT) ? NET_IF_ACCESS_POINT_TO_POINT : NET_IF_ACCESS_BROADCAST;
+#else
         stat->access_type = (entry->if_type == MIB_IF_TYPE_LOOPBACK) ? NET_IF_ACCESS_LOOPBACK : NET_IF_ACCESS_BROADCAST;
+#endif
         stat->unk = 0;
         stat->conn_type = NET_IF_CONNECTION_DEDICATED;
         memcpy( &stat->if_guid, &entry->if_guid, sizeof(entry->if_guid) );
         stat->conn_present = entry->if_type != MIB_IF_TYPE_LOOPBACK;
         memcpy( &stat->perm_phys_addr, &entry->if_phys_addr, sizeof(entry->if_phys_addr) );
+#ifdef NSI_TITLE_INTERFACES
+        stat->flags.hw = entry->if_type == MIB_IF_TYPE_ETHERNET || entry->if_type == IF_TYPE_IEEE80211;
+#else
         stat->flags.hw = entry->if_type != MIB_IF_TYPE_LOOPBACK;
+#endif
         stat->flags.filter = 0;
         stat->flags.unk = 0;
         stat->media_type = 0;
@@ -558,9 +819,13 @@ static NTSTATUS ifinfo_enumerate_all( void *key_data, UINT key_size, void *rw_da
     pthread_mutex_lock( &if_list_lock );
 
     update_if_table();
+#ifdef NSI_TITLE_INTERFACES
+    if (title_if_status) { pthread_mutex_unlock( &if_list_lock );return title_if_status; }
+#endif
 
     LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
     {
+        if (!entry_is_current( entry )) continue;
         if (num < *count)
         {
             ifinfo_fill_entry( entry, key_data, rw_data, dynamic_data, static_data );
@@ -592,11 +857,17 @@ static NTSTATUS ifinfo_get_all_parameters( const void *key, UINT key_size, void 
 
     pthread_mutex_lock( &if_list_lock );
 
+#ifdef NSI_TITLE_INTERFACES
+    update_if_table();
+    if (title_if_status) { pthread_mutex_unlock( &if_list_lock );return title_if_status; }
+    entry = find_entry_from_luid( (const NET_LUID *)key );
+#else
     if (!(entry = find_entry_from_luid( (const NET_LUID *)key )))
     {
         update_if_table();
         entry = find_entry_from_luid( (const NET_LUID *)key );
     }
+#endif
     if (entry)
     {
         ifinfo_fill_entry( entry, NULL, rw_data, dynamic_data, static_data );
@@ -656,11 +927,17 @@ static NTSTATUS ifinfo_get_parameter( const void *key, UINT key_size, UINT param
 
     pthread_mutex_lock( &if_list_lock );
 
+#ifdef NSI_TITLE_INTERFACES
+    update_if_table();
+    if (title_if_status) { pthread_mutex_unlock( &if_list_lock );return title_if_status; }
+    entry = find_entry_from_luid( (const NET_LUID *)key );
+#else
     if (!(entry = find_entry_from_luid( (const NET_LUID *)key )))
     {
         update_if_table();
         entry = find_entry_from_luid( (const NET_LUID *)key );
     }
+#endif
     if (entry)
     {
         switch (param_type)
@@ -692,11 +969,17 @@ static NTSTATUS index_luid_get_parameter( const void *key, UINT key_size, UINT p
 
     pthread_mutex_lock( &if_list_lock );
 
+#ifdef NSI_TITLE_INTERFACES
+    update_if_table();
+    if (title_if_status) { pthread_mutex_unlock( &if_list_lock );return title_if_status; }
+    entry = find_entry_from_index( *(UINT *)key );
+#else
     if (!(entry = find_entry_from_index( *(UINT *)key )))
     {
         update_if_table();
         entry = find_entry_from_index( *(UINT *)key );
     }
+#endif
     if (entry)
     {
         *(NET_LUID *)data = entry->if_luid;
@@ -718,7 +1001,7 @@ BOOL convert_unix_name_to_luid( const char *unix_name, NET_LUID *luid )
     {
         LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
         {
-            if (!strcmp( entry->if_unix_name, unix_name ))
+            if (entry_is_current( entry ) && !strcmp( entry->if_unix_name, unix_name ))
             {
                 *luid = entry->if_luid;
                 ret = TRUE;
@@ -727,6 +1010,23 @@ BOOL convert_unix_name_to_luid( const char *unix_name, NET_LUID *luid )
         }
     } while (!updated++ && update_if_table());
 
+#if defined(NSI_TITLE_INTERFACES) && defined(__linux__)
+    /* Linux address labels (for example eth0:1) are not separate link
+     * records. Resolve their kernel index instead of inventing a LUID. */
+    if (strlen(unix_name) < IFNAMSIZ)
+    {
+        struct ifreq request = {0};
+        int fd = socket( AF_INET, SOCK_DGRAM, 0 );
+        memcpy( request.ifr_name, unix_name, strlen(unix_name) + 1 );
+        if (fd >= 0)
+        {
+            if (!ioctl( fd, SIOCGIFINDEX, &request ) &&
+                (entry = find_entry_from_index( request.ifr_ifindex )))
+            { *luid = entry->if_luid;ret = TRUE; }
+            close( fd );
+        }
+    }
+#endif
 done:
     pthread_mutex_unlock( &if_list_lock );
 
@@ -745,7 +1045,7 @@ BOOL convert_luid_to_unix_name( const NET_LUID *luid, const char **unix_name )
     {
         LIST_FOR_EACH_ENTRY( entry, &if_list, struct if_entry, entry )
         {
-            if (entry->if_luid.Value == luid->Value)
+            if (entry_is_current( entry ) && entry->if_luid.Value == luid->Value)
             {
                 *unix_name = entry->if_unix_name;
                 ret = TRUE;
@@ -790,3 +1090,4 @@ const struct module ndis_module =
     &NPI_MS_NDIS_MODULEID,
     tables
 };
+#endif /* !NSI_SERVICE_FREE || __PROSPERO__ */

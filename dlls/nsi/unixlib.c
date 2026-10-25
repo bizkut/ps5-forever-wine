@@ -33,6 +33,9 @@
 #include "wine/unixlib.h"
 #include "wine/ps5_title.h"
 #include "wine/nsi_tcp.h"
+#ifdef __PROSPERO__
+#include "../nsiproxy.sys/unix_private.h"
+#endif
 
 static NTSTATUS unix_enumerate_tcp( void *args )
 {
@@ -89,10 +92,69 @@ static NTSTATUS unix_enumerate_tcp( void *args )
 #endif
 }
 
-const unixlib_entry_t __wine_unix_call_funcs[] = { unix_enumerate_tcp };
+#ifdef __PROSPERO__
+static BOOL network_module( const NPI_MODULEID *module )
+{
+    return module && (NmrIsEqualNpiModuleId( module, &NPI_MS_NDIS_MODULEID ) ||
+                      NmrIsEqualNpiModuleId( module, &NPI_MS_IPV4_MODULEID ) ||
+                      NmrIsEqualNpiModuleId( module, &NPI_MS_IPV6_MODULEID ));
+}
+
+static NTSTATUS refresh_network_module( const NPI_MODULEID *module )
+{
+    return NmrIsEqualNpiModuleId( module, &NPI_MS_NDIS_MODULEID ) ? STATUS_SUCCESS : nsi_ndis_refresh();
+}
+#endif
+
+static NTSTATUS unix_enumerate_network( void *args )
+{
+#ifdef __PROSPERO__
+    struct nsi_enumerate_all_ex *params = args;
+    NTSTATUS status;
+    if (!__wine_ps5_is_title()) return STATUS_NOT_IMPLEMENTED;
+    if (!params || !network_module( params->module )) return STATUS_INVALID_PARAMETER;
+    if ((status = refresh_network_module( params->module ))) return status;
+    return nsi_enumerate_all_ex( params );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS unix_get_all_network( void *args )
+{
+#ifdef __PROSPERO__
+    struct nsi_get_all_parameters_ex *params = args;
+    NTSTATUS status;
+    if (!__wine_ps5_is_title()) return STATUS_NOT_IMPLEMENTED;
+    if (!params || !network_module( params->module )) return STATUS_INVALID_PARAMETER;
+    if ((status = refresh_network_module( params->module ))) return status;
+    return nsi_get_all_parameters_ex( params );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS unix_get_network_parameter( void *args )
+{
+#ifdef __PROSPERO__
+    struct nsi_get_parameter_ex *params = args;
+    NTSTATUS status;
+    if (!__wine_ps5_is_title()) return STATUS_NOT_IMPLEMENTED;
+    if (!params || !network_module( params->module )) return STATUS_INVALID_PARAMETER;
+    if ((status = refresh_network_module( params->module ))) return status;
+    return nsi_get_parameter_ex( params );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+const unixlib_entry_t __wine_unix_call_funcs[] =
+{
+    unix_enumerate_tcp, unix_enumerate_network, unix_get_all_network, unix_get_network_parameter
+};
 
 #ifdef _WIN64
-static NTSTATUS wow64_enumerate_tcp( void *args )
+static NTSTATUS wow64_enumerate( void *args, unixlib_entry_t enumerate )
 {
     struct params32
     {
@@ -115,9 +177,59 @@ static NTSTATUS wow64_enumerate_tcp( void *args )
     params.static_data = ULongToPtr( params32->static_data );
     params.static_size = params32->static_size;
     params.count = params32->count;
-    status = unix_enumerate_tcp( &params );
+    status = enumerate( &params );
     params32->count = params.count;
     return status;
 }
-const unixlib_entry_t __wine_unix_call_wow64_funcs[] = { wow64_enumerate_tcp };
+static NTSTATUS wow64_enumerate_tcp( void *args ) { return wow64_enumerate( args, unix_enumerate_tcp ); }
+static NTSTATUS wow64_enumerate_network( void *args ) { return wow64_enumerate( args, unix_enumerate_network ); }
+
+static NTSTATUS wow64_get_all_network( void *args )
+{
+    const struct params32
+    {
+        UINT unknown[2], module, table, first_arg, unknown2, key, key_size;
+        UINT rw_data, rw_size, dynamic_data, dynamic_size, static_data, static_size;
+    } *input = args;
+    struct nsi_get_all_parameters_ex params = {0};
+    params.module = ULongToPtr( input->module );
+    params.table = input->table;
+    params.first_arg = input->first_arg;
+    params.unknown2 = input->unknown2;
+    params.key = ULongToPtr( input->key );
+    params.key_size = input->key_size;
+    params.rw_data = ULongToPtr( input->rw_data );
+    params.rw_size = input->rw_size;
+    params.dynamic_data = ULongToPtr( input->dynamic_data );
+    params.dynamic_size = input->dynamic_size;
+    params.static_data = ULongToPtr( input->static_data );
+    params.static_size = input->static_size;
+    return unix_get_all_network( &params );
+}
+
+static NTSTATUS wow64_get_network_parameter( void *args )
+{
+    const struct params32
+    {
+        UINT unknown[2], module, table, first_arg, unknown2, key, key_size;
+        UINT param_type, data, data_size, data_offset;
+    } *input = args;
+    struct nsi_get_parameter_ex params = {0};
+    params.module = ULongToPtr( input->module );
+    params.table = input->table;
+    params.first_arg = input->first_arg;
+    params.unknown2 = input->unknown2;
+    params.key = ULongToPtr( input->key );
+    params.key_size = input->key_size;
+    params.param_type = input->param_type;
+    params.data = ULongToPtr( input->data );
+    params.data_size = input->data_size;
+    params.data_offset = input->data_offset;
+    return unix_get_network_parameter( &params );
+}
+
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    wow64_enumerate_tcp, wow64_enumerate_network, wow64_get_all_network, wow64_get_network_parameter
+};
 #endif

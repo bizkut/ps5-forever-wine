@@ -27,6 +27,7 @@
 NTSTATUS nsi_enumerate_all_ex( struct nsi_enumerate_all_ex *params );
 NTSTATUS nsi_get_all_parameters_ex( struct nsi_get_all_parameters_ex *params );
 NTSTATUS nsi_get_parameter_ex( struct nsi_get_parameter_ex *params );
+NTSTATUS nsi_ndis_refresh(void);
 
 static inline NTSTATUS nsi_enumerate_all( UINT unk, UINT unk2, const NPI_MODULEID *module, UINT table,
                                           void *key_data, UINT key_size, void *rw_data, UINT rw_size,
