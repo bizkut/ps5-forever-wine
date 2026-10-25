@@ -921,8 +921,10 @@ static pthread_mutex_t ps5_viewport_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct
 {
     const void *owner;
-    HWND hwnd;
+    HWND hwnd;                /* NULL: the composed desktop rectangle below */
     struct wine_ps5_viewport viewport;
+    int32_t desktop_x, desktop_y;
+    uint32_t desktop_width, desktop_height;
 } ps5_present_viewport;
 
 void ps5_set_present_viewport( const void *owner, HWND hwnd, const struct wine_ps5_viewport *viewport )
@@ -931,6 +933,22 @@ void ps5_set_present_viewport( const void *owner, HWND hwnd, const struct wine_p
     ps5_present_viewport.owner = owner;
     ps5_present_viewport.hwnd = hwnd;
     ps5_present_viewport.viewport = *viewport;
+    pthread_mutex_unlock( &ps5_viewport_mutex );
+}
+
+/* The window compositor's view: input maps through the composed desktop
+ * rectangle, not through one window. Safe on any thread. */
+void ps5_set_present_desktop_viewport( const void *owner, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                       const struct wine_ps5_viewport *viewport )
+{
+    pthread_mutex_lock( &ps5_viewport_mutex );
+    ps5_present_viewport.owner = owner;
+    ps5_present_viewport.hwnd = NULL;
+    ps5_present_viewport.viewport = *viewport;
+    ps5_present_viewport.desktop_x = x;
+    ps5_present_viewport.desktop_y = y;
+    ps5_present_viewport.desktop_width = width;
+    ps5_present_viewport.desktop_height = height;
     pthread_mutex_unlock( &ps5_viewport_mutex );
 }
 
@@ -953,7 +971,12 @@ BOOL ps5_get_present_viewport( struct wine_ps5_viewport_map *map )
     owner = ps5_present_viewport.owner;
     hwnd = ps5_present_viewport.hwnd;
     map->viewport = ps5_present_viewport.viewport;
+    map->origin_x = ps5_present_viewport.desktop_x;
+    map->origin_y = ps5_present_viewport.desktop_y;
+    map->client_width = ps5_present_viewport.desktop_width;
+    map->client_height = ps5_present_viewport.desktop_height;
     pthread_mutex_unlock( &ps5_viewport_mutex );
+    if (owner && !hwnd) return map->client_width && map->client_height;
     if (!owner || !NtUserIsWindow( hwnd ) ||
         !NtUserGetClientRect( hwnd, &client, dpi ) || client.right <= client.left || client.bottom <= client.top)
         return FALSE;
@@ -1048,7 +1071,7 @@ static void ps5_log_mouse_geometry(void)
     pthread_mutex_lock( &ps5_viewport_mutex );
     hwnd = ps5_present_viewport.hwnd;
     pthread_mutex_unlock( &ps5_viewport_mutex );
-    monitor_dpi = fitted ? get_win_monitor_dpi( hwnd, &raw_dpi ) : 0;
+    monitor_dpi = fitted && hwnd ? get_win_monitor_dpi( hwnd, &raw_dpi ) : 0;
     desktop = get_virtual_screen_rect( dpi, MDT_DEFAULT );
     raw_desktop = get_virtual_screen_rect( 0, MDT_RAW_DPI );
     snprintf( line, sizeof(line),
@@ -1062,7 +1085,7 @@ static void ps5_log_mouse_geometry(void)
               map.viewport.left, map.viewport.top, map.viewport.width, map.viewport.height,
               map.origin_x, map.origin_y, map.client_width, map.client_height );
     sceKernelDebugOutText( 0, line );
-    if (!fitted) return;
+    if (!fitted || !hwnd) return; /* the composed desktop has no viewport window */
     ps5_log_mouse_window_geometry( "viewport", hwnd, dpi );
     root = NtUserGetAncestor( hwnd, GA_ROOT );
     if (root && root != hwnd) ps5_log_mouse_window_geometry( "root", root, dpi );

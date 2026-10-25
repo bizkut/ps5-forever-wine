@@ -45,6 +45,7 @@ SOURCES = \
 	path.c \
 	pen.c \
 	printdrv.c \
+	ps5_compositor.c \
 	rawinput.c \
 	region.c \
 	scroll.c \

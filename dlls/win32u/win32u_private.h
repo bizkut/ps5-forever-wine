@@ -461,6 +461,9 @@ int disable_gamescope_max_size_hack(void);
 void ps5_set_present_viewport( const void *owner, HWND hwnd, const struct wine_ps5_viewport *viewport );
 void ps5_clear_present_viewport( const void *owner );
 BOOL ps5_get_present_viewport( struct wine_ps5_viewport_map *map );
+void ps5_set_present_desktop_viewport( const void *owner, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                       const struct wine_ps5_viewport *viewport );
+void ps5_compositor_window_changed(void);
 #endif
 
 #endif /* __WINE_WIN32U_PRIVATE */

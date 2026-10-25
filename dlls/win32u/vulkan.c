@@ -34,6 +34,10 @@
 #include "win32u_private.h"
 #include "ntuser_private.h"
 #include "wine/ps5_title.h"
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+#include <ps5platform/klog.h>
+#include "wine/ps5_compositor.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
@@ -47,6 +51,11 @@ static struct vulkan_funcs vulkan_funcs;
 #ifdef __PROSPERO__
 static BOOL title_vulkan;
 static BOOL title_vulkan_ready;
+#endif
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+/* WINEPS5_TITLE_PRESENT=compositor: every window swapchain is a private chain
+ * composed into the one VideoOut swapchain (wine/ps5_compositor.h). */
+static BOOL ps5_compositor_mode;
 #endif
 
 WINE_DECLARE_DEBUG_CHANNEL(fps);
@@ -223,6 +232,8 @@ struct swapchain
 #if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
     BOOL title_fit, title_viewport_set;
     struct wine_ps5_viewport title_viewport;
+    struct ps5c_chain *ps5_chain;       /* compositor mode: a private chain, no host swapchain */
+    struct ps5c_device *ps5_producer;
 #endif
     VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
     VkDeviceMemory user_image_memory;
@@ -247,6 +258,10 @@ struct semaphore
     D3DKMT_HANDLE local;
     D3DKMT_HANDLE global;
     HANDLE shared;
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    /* Handed out by a compositor-chain acquire; signalled when first waited. */
+    BOOL ps5_acquired;
+#endif
 };
 
 static struct semaphore *semaphore_from_handle( VkSemaphore handle )
@@ -637,6 +652,28 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
 #define USE_VK_EXT(x) client_physical_device->extensions.has_ ## x = extensions.has_ ## x;
     ALL_VK_CLIENT_DEVICE_EXTS
 #undef USE_VK_EXT
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    /* Compositor chains implement core swapchain semantics only; these
+     * extensions take swapchain handles or present-time structures that have
+     * no host swapchain behind them. */
+    if (ps5_compositor_mode)
+    {
+        client_physical_device->extensions.has_VK_EXT_swapchain_maintenance1 = 0;
+        client_physical_device->extensions.has_VK_KHR_swapchain_maintenance1 = 0;
+        client_physical_device->extensions.has_VK_KHR_present_id = 0;
+        client_physical_device->extensions.has_VK_KHR_present_id2 = 0;
+        client_physical_device->extensions.has_VK_KHR_present_wait = 0;
+        client_physical_device->extensions.has_VK_KHR_present_wait2 = 0;
+        client_physical_device->extensions.has_VK_EXT_hdr_metadata = 0;
+        client_physical_device->extensions.has_VK_EXT_present_timing = 0;
+        client_physical_device->extensions.has_VK_EXT_present_mode_fifo_latest_ready = 0;
+        client_physical_device->extensions.has_VK_KHR_present_mode_fifo_latest_ready = 0;
+        client_physical_device->extensions.has_VK_EXT_image_compression_control_swapchain = 0;
+        client_physical_device->extensions.has_VK_NV_low_latency = 0;
+        client_physical_device->extensions.has_VK_NV_low_latency2 = 0;
+        client_physical_device->extensions.has_VK_NV_present_barrier = 0;
+    }
+#endif
 
 done:
     free( properties );
@@ -885,6 +922,16 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         device->extensions.has_VK_EXT_external_memory_host = 1;
     }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    /* Compositor chains share host memory between this device and the compositor's. */
+    if (ps5_compositor_mode && device->extensions.has_VK_KHR_swapchain &&
+        physical_device->extensions.has_VK_EXT_external_memory_host)
+    {
+        device->extensions.has_VK_KHR_external_memory = 1;
+        device->extensions.has_VK_EXT_external_memory_host = 1;
+    }
+    else
+#endif
     /* win32u uses VkSwapchainPresentScalingCreateInfoEXT if available. */
     if (device->extensions.has_VK_KHR_swapchain && instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
@@ -1853,6 +1900,14 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
      * https://vulkan.gpuinfo.org/displayreport.php?id=9121#surface
      */
     if (!capabilities->maxImageCount) capabilities->maxImageCount = max( capabilities->minImageCount, 16 );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode)
+    {
+        /* A chain keeps one more image than requested for the composed frame. */
+        capabilities->minImageCount = 2;
+        capabilities->maxImageCount = PS5C_MAX_CHAIN_IMAGES - 1;
+    }
+#endif
 
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
@@ -2030,6 +2085,34 @@ static void win32u_vkGetPhysicalDeviceProperties2KHR( VkPhysicalDevice client_ph
     get_physical_device_properties2( physical_device, properties2, physical_device->instance->p_vkGetPhysicalDeviceProperties2KHR );
 }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+/* What a compositor chain composes: 8-bit BGRA, sRGB-encoded. */
+static const VkSurfaceFormatKHR ps5_compositor_formats[] =
+{
+    {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+    {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+};
+
+static VkResult ps5_compositor_surface_formats( uint32_t *count, VkSurfaceFormatKHR *formats,
+                                                VkSurfaceFormat2KHR *formats2 )
+{
+    uint32_t i, total = ARRAY_SIZE(ps5_compositor_formats);
+
+    if (!formats && !formats2)
+    {
+        *count = total;
+        return VK_SUCCESS;
+    }
+    for (i = 0; i < total && i < *count; i++)
+    {
+        if (formats) formats[i] = ps5_compositor_formats[i];
+        else formats2[i].surfaceFormat = ps5_compositor_formats[i];
+    }
+    *count = i;
+    return i < total ? VK_INCOMPLETE : VK_SUCCESS;
+}
+#endif
+
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
                                                              uint32_t *format_count, VkSurfaceFormatKHR *formats )
 {
@@ -2037,6 +2120,9 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
     struct surface *surface = surface_from_handle( client_surface );
     struct vulkan_instance *instance = physical_device->instance;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode) return ps5_compositor_surface_formats( format_count, formats, NULL );
+#endif
     return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
                                                                 surface->obj.host.surface, format_count, formats );
 }
@@ -2050,6 +2136,9 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
     struct vulkan_instance *instance = physical_device->instance;
     VkResult res;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode) return ps5_compositor_surface_formats( format_count, NULL, formats );
+#endif
     if (!instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR)
     {
         VkSurfaceFormatKHR *surface_formats;
@@ -3074,6 +3163,403 @@ static VkResult present_swapchain_readback( struct vulkan_device *device, struct
     return VK_SUCCESS;
 }
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+/* --- RuneScape title window compositor (WINEPS5_TITLE_PRESENT=compositor) ---
+ *
+ * The process owns one compositor VkInstance/VkDevice and the only VideoOut
+ * swapchain, created through the same trusted title callbacks as any title
+ * swapchain. Application swapchains become ps5c chains on their own devices;
+ * win32u publishes window geometry, visibility, z-order and ancestor clipping
+ * as the scene, and input maps through the composed desktop view. */
+
+struct ps5_compositor_host
+{
+    BOOL tried;
+    VkInstance instance;
+    VkDevice device;
+    VkQueue queue;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkExtent2D extent;
+    uint32_t image_count;
+    PFN_vkAcquireNextImageKHR p_vkAcquireNextImageKHR;
+    PFN_vkQueuePresentKHR p_vkQueuePresentKHR;
+    struct ps5c_device funcs;
+    struct ps5c_compositor *compositor;
+};
+
+static pthread_mutex_t ps5_compositor_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ps5_compositor_host ps5_compositor_host;
+static struct ps5c_compositor *ps5_compositor; /* set once, then read without the lock */
+static pthread_mutex_t ps5_scene_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ps5c_window_state ps5_scene[PS5C_MAX_WINDOWS];
+static uint32_t ps5_scene_count;
+
+static VkResult ps5_output_acquire( void *context, VkSemaphore signal, uint32_t *index )
+{
+    struct ps5_compositor_host *host = context;
+    return host->p_vkAcquireNextImageKHR( host->device, host->swapchain, UINT64_MAX, signal, VK_NULL_HANDLE, index );
+}
+
+static VkResult ps5_output_present( void *context, VkQueue queue, uint32_t index, VkSemaphore wait )
+{
+    struct ps5_compositor_host *host = context;
+    VkPresentInfoKHR info = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &wait, .swapchainCount = 1, .pSwapchains = &host->swapchain, .pImageIndices = &index};
+    return host->p_vkQueuePresentKHR( queue, &info );
+}
+
+/* Compositor thread: no Wine calls, native klog only. */
+static void ps5_compositor_view_changed( void *context, const struct ps5c_view *view )
+{
+    char line[256];
+
+    ps5_set_present_desktop_viewport( context, view->desktop.left, view->desktop.top,
+                                      view->desktop.right - view->desktop.left,
+                                      view->desktop.bottom - view->desktop.top, &view->fit );
+    snprintf( line, sizeof(line), "wine: title compositor view desktop=%d,%d,%d,%d fit=%u,%u %ux%u output=%ux%u\n",
+              view->desktop.left, view->desktop.top, view->desktop.right, view->desktop.bottom, view->fit.left,
+              view->fit.top, view->fit.width, view->fit.height, view->fit.output_width, view->fit.output_height );
+    sceKernelDebugOutText( 0, line );
+}
+
+static VkResult ps5_compositor_create_host( struct ps5_compositor_host *host )
+{
+    static const char *instance_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME};
+    static const char *device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+                                              VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+    VkResult (*create_surface)( VkInstance, uint32_t, uint32_t, VkSurfaceKHR * ) =
+            __wine_ps5_get_vulkan_proc( "wineCreateDisplaySurface" );
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pEngineName = "wine-ps5-compositor",
+            .apiVersion = VK_API_VERSION_1_1};
+    VkInstanceCreateInfo instance_info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+            .enabledExtensionCount = ARRAY_SIZE(instance_extensions), .ppEnabledExtensionNames = instance_extensions};
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
+            .pQueuePriorities = &priority};
+    VkPhysicalDeviceFeatures features = {.shaderStorageImageWriteWithoutFormat = VK_TRUE};
+    VkDeviceCreateInfo device_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
+            .pQueueCreateInfos = &queue_info, .enabledExtensionCount = ARRAY_SIZE(device_extensions),
+            .ppEnabledExtensionNames = device_extensions, .pEnabledFeatures = &features};
+    VkSwapchainCreateInfoKHR swapchain_info = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .imageFormat = VK_FORMAT_B8G8R8A8_UNORM, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+            .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+            .clipped = VK_TRUE};
+    struct ps5c_compositor_desc desc = {.device = &host->funcs, .view_changed = ps5_compositor_view_changed,
+            .view_context = host};
+    PFN_vkEnumeratePhysicalDevices enumerate;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_families;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR get_caps;
+    PFN_vkCreateDevice create_device;
+    PFN_vkGetDeviceQueue get_queue;
+    PFN_vkCreateSwapchainKHR create_swapchain;
+    PFN_vkGetSwapchainImagesKHR get_images;
+    VkQueueFamilyProperties families[8];
+    VkSurfaceCapabilitiesKHR caps;
+    VkPhysicalDevice physical;
+    uint32_t count = 1, family_count = ARRAY_SIZE(families), family;
+    VkResult res;
+
+    if (!create_surface) return VK_ERROR_INITIALIZATION_FAILED;
+    if ((res = p_vkCreateInstance( &instance_info, NULL, &host->instance ))) return res;
+    enumerate = (void *)p_vkGetInstanceProcAddr( host->instance, "vkEnumeratePhysicalDevices" );
+    get_families = (void *)p_vkGetInstanceProcAddr( host->instance, "vkGetPhysicalDeviceQueueFamilyProperties" );
+    get_caps = (void *)p_vkGetInstanceProcAddr( host->instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR" );
+    create_device = (void *)p_vkGetInstanceProcAddr( host->instance, "vkCreateDevice" );
+    if (!enumerate || !get_families || !get_caps || !create_device) return VK_ERROR_INITIALIZATION_FAILED;
+    if ((res = enumerate( host->instance, &count, &physical )) < 0 || !count) return res < 0 ? res : VK_ERROR_INITIALIZATION_FAILED;
+    get_families( physical, &family_count, families );
+    for (family = 0; family < family_count; family++)
+        if (families[family].queueFlags & VK_QUEUE_COMPUTE_BIT) break;
+    if (family == family_count) return VK_ERROR_INITIALIZATION_FAILED;
+    queue_info.queueFamilyIndex = family;
+    if ((res = create_device( physical, &device_info, NULL, &host->device ))) return res;
+    get_queue = (void *)p_vkGetDeviceProcAddr( host->device, "vkGetDeviceQueue" );
+    create_swapchain = (void *)p_vkGetDeviceProcAddr( host->device, "vkCreateSwapchainKHR" );
+    get_images = (void *)p_vkGetDeviceProcAddr( host->device, "vkGetSwapchainImagesKHR" );
+    host->p_vkAcquireNextImageKHR = (void *)p_vkGetDeviceProcAddr( host->device, "vkAcquireNextImageKHR" );
+    host->p_vkQueuePresentKHR = (void *)p_vkGetDeviceProcAddr( host->device, "vkQueuePresentKHR" );
+    if (!get_queue || !create_swapchain || !get_images || !host->p_vkAcquireNextImageKHR || !host->p_vkQueuePresentKHR)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    get_queue( host->device, family, 0, &host->queue );
+    if ((res = ps5c_device_init( &host->funcs, host->device, p_vkGetDeviceProcAddr ))) return res;
+
+    /* The VideoOut output, in its own mode and size, as every title surface. */
+    if ((res = create_surface( host->instance, 0, 0, &host->surface ))) return res;
+    if ((res = get_caps( physical, host->surface, &caps ))) return res;
+    swapchain_info.surface = host->surface;
+    swapchain_info.imageExtent = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : caps.minImageExtent;
+    swapchain_info.minImageCount = max( caps.minImageCount, 3 );
+    if (caps.maxImageCount) swapchain_info.minImageCount = min( swapchain_info.minImageCount, caps.maxImageCount );
+    if ((res = create_swapchain( host->device, &swapchain_info, NULL, &host->swapchain ))) return res;
+    count = PS5C_MAX_OUTPUT_IMAGES;
+    if ((res = get_images( host->device, host->swapchain, &count, desc.output.images )) < 0) return res;
+
+    desc.queue = host->queue;
+    desc.queue_family = family;
+    desc.output.context = host;
+    desc.output.image_count = count;
+    desc.output.extent = host->extent = swapchain_info.imageExtent;
+    host->image_count = count;
+    desc.output.format = swapchain_info.imageFormat;
+    desc.output.acquire = ps5_output_acquire;
+    desc.output.present = ps5_output_present;
+    return ps5c_compositor_create( &desc, &host->compositor );
+}
+
+static struct ps5c_compositor *ps5_compositor_get(void)
+{
+    struct ps5_compositor_host *host = &ps5_compositor_host;
+    VkResult res;
+
+    pthread_mutex_lock( &ps5_compositor_lock );
+    if (!host->tried)
+    {
+        host->tried = TRUE;
+        res = ps5_compositor_create_host( host );
+        MESSAGE( "wine: title compositor output=%ux%u images=%u result=%d\n",
+                 host->extent.width, host->extent.height, host->image_count, res );
+        /* A failed output is not retried: one VideoOut owner only. */
+        if (!res) ps5_compositor = host->compositor;
+    }
+    pthread_mutex_unlock( &ps5_compositor_lock );
+    return ps5_compositor;
+}
+
+/* A window's state in its own logical pixels; the GPU role runs at 96 DPI. */
+static void ps5_compositor_window_state( HWND hwnd, struct ps5c_window_state *state )
+{
+    HWND desktop = get_desktop_window(), ancestors[64], root;
+    uint32_t count = 0, depth, i;
+    RECT client, parent;
+
+    memset( state, 0, sizeof(*state) );
+    state->key = (UINT_PTR)hwnd;
+    for (HWND window = hwnd; window && window != desktop && count < ARRAY_SIZE(ancestors); window = get_parent( window ))
+        ancestors[count++] = window;
+    if (!count || !get_client_rect_rel( hwnd, COORDS_SCREEN, &client, 0 )) return;
+    root = ancestors[count - 1];
+    state->top_level = count == 1;
+    state->visible = is_window_visible( hwnd ) && !is_iconic( root );
+    state->client = (struct ps5c_rect){client.left, client.top, client.right, client.bottom};
+    state->clip = state->client;
+    for (i = 1; i < count; i++)
+    {
+        struct ps5c_rect rect;
+        if (!get_client_rect_rel( ancestors[i], COORDS_SCREEN, &parent, 0 )) continue;
+        rect = (struct ps5c_rect){parent.left, parent.top, parent.right, parent.bottom};
+        ps5c_rect_intersect( &state->clip, &state->clip, &rect );
+    }
+    /* Sibling position from the bottom, from the top-level window down. */
+    depth = min( count, PS5C_Z_DEPTH );
+    for (i = 0; i < depth; i++)
+    {
+        HWND sibling = get_window_relative( ancestors[count - 1 - i], GW_HWNDNEXT );
+        uint32_t below = 0;
+        for (; sibling && below < 0xffff; sibling = get_window_relative( sibling, GW_HWNDNEXT )) below++;
+        state->z[i] = below;
+    }
+    state->z_depth = depth;
+}
+
+/* Any Wine thread; a window that no longer exists leaves the scene. */
+static void ps5_compositor_publish_scene(void)
+{
+    struct ps5c_window_state states[PS5C_MAX_WINDOWS];
+    uint64_t keys[PS5C_MAX_WINDOWS];
+    uint32_t count, i, n = 0;
+
+    if (!ps5_compositor) return;
+    pthread_mutex_lock( &ps5_scene_lock );
+    count = ps5c_window_keys( ps5_compositor, keys, ARRAY_SIZE(keys) );
+    for (i = 0; i < count; i++)
+    {
+        HWND hwnd = (HWND)(UINT_PTR)keys[i];
+        if (!is_window( hwnd )) continue;
+        ps5_compositor_window_state( hwnd, &states[n++] );
+    }
+    memcpy( ps5_scene, states, n * sizeof(*states) );
+    ps5_scene_count = n;
+    ps5c_scene_update( ps5_compositor, states, n );
+    pthread_mutex_unlock( &ps5_scene_lock );
+}
+
+/* window.c: after any position, size, z-order, show/hide or destroy. */
+void ps5_compositor_window_changed(void)
+{
+    if (ps5_compositor) ps5_compositor_publish_scene();
+}
+
+/* Present time: republish only if the window's client area moved. */
+static void ps5_compositor_check_window( HWND hwnd )
+{
+    BOOL current = FALSE;
+    RECT client;
+    uint32_t i;
+
+    if (!get_client_rect_rel( hwnd, COORDS_SCREEN, &client, 0 )) return;
+    pthread_mutex_lock( &ps5_scene_lock );
+    for (i = 0; i < ps5_scene_count; i++)
+        if (ps5_scene[i].key == (UINT_PTR)hwnd)
+            current = ps5_scene[i].client.left == client.left && ps5_scene[i].client.top == client.top &&
+                      ps5_scene[i].client.right == client.right && ps5_scene[i].client.bottom == client.bottom;
+    pthread_mutex_unlock( &ps5_scene_lock );
+    if (!current) ps5_compositor_publish_scene();
+}
+
+static VkResult ps5_compositor_create_swapchain( struct vulkan_device *device, struct surface *surface,
+                                                 const VkSwapchainCreateInfoKHR *create_info, VkSwapchainKHR *ret )
+{
+    struct vulkan_instance *instance = device->physical_device->instance;
+    const VkImageFormatListCreateInfo *list = find_next_struct( (const void *)create_info,
+                                                                VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO );
+    struct ps5c_chain_desc desc = {0};
+    struct ps5c_compositor *compositor;
+    struct swapchain *swapchain;
+    VkResult res;
+
+    if (create_info->imageArrayLayers != 1 || (create_info->flags & ~VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!(compositor = ps5_compositor_get())) return VK_ERROR_SURFACE_LOST_KHR;
+    desc.image_count = max( 2, min( create_info->minImageCount, PS5C_MAX_CHAIN_IMAGES - 1 ) ) + 1;
+    desc.format = create_info->imageFormat;
+    desc.extent.width = max( create_info->imageExtent.width, 1 );
+    desc.extent.height = max( create_info->imageExtent.height, 1 );
+    desc.usage = create_info->imageUsage;
+    if ((create_info->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) && list)
+    {
+        desc.view_format_count = min( list->viewFormatCount, PS5C_MAX_VIEW_FORMATS );
+        desc.view_formats = list->pViewFormats;
+    }
+
+    if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(swapchain->ps5_producer = calloc( 1, sizeof(*swapchain->ps5_producer) )))
+    {
+        free( swapchain );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (!(res = ps5c_device_init( swapchain->ps5_producer, device->host.device, p_vkGetDeviceProcAddr )))
+        res = ps5c_chain_create( compositor, (UINT_PTR)surface->hwnd, swapchain->ps5_producer, &desc,
+                                 &swapchain->ps5_chain );
+    MESSAGE( "wine: title compositor chain hwnd=%p image=%ux%u format=%d images=%u result=%d\n", surface->hwnd,
+             desc.extent.width, desc.extent.height, desc.format, desc.image_count, res );
+    if (res)
+    {
+        free( swapchain->ps5_producer );
+        free( swapchain );
+        return res;
+    }
+
+    /* No host swapchain: the object's own address is its unique host handle. */
+    vulkan_object_init( &swapchain->obj.obj, (UINT_PTR)swapchain );
+    swapchain->surface = surface;
+    swapchain->extents = desc.extent;
+    instance->p_insert_object( instance, &swapchain->obj.obj );
+    ps5_compositor_publish_scene();
+    *ret = swapchain->obj.client.swapchain;
+    return VK_SUCCESS;
+}
+
+static void ps5_compositor_destroy_swapchain( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    struct vulkan_instance *instance = device->physical_device->instance;
+
+    ps5c_chain_destroy( swapchain->ps5_chain );
+    free( swapchain->ps5_producer );
+    instance->p_remove_object( instance, &swapchain->obj.obj );
+    free( swapchain );
+    ps5_compositor_publish_scene();
+}
+
+static VkResult ps5_compositor_acquire( struct vulkan_device *device, struct swapchain *swapchain, uint64_t timeout,
+                                        VkSemaphore client_semaphore, VkFence client_fence, uint32_t *index )
+{
+    struct vulkan_fence *fence = client_fence ? vulkan_fence_from_handle( client_fence ) : NULL;
+    RECT client_rect;
+    VkResult res;
+
+    if ((res = ps5c_chain_acquire( swapchain->ps5_chain, timeout, index ))) return res;
+    /* The image is idle: a semaphore is signalled just before its first wait. */
+    if (client_semaphore) semaphore_from_handle( client_semaphore )->ps5_acquired = TRUE;
+    if (fence && (res = device->p_vkQueueSubmit( device->queues[0].host.queue, 0, NULL, fence->host.fence )))
+    {
+        ps5c_chain_release( swapchain->ps5_chain, *index );
+        return res;
+    }
+    if (get_surface_rect( swapchain->surface->hwnd, &client_rect, NtUserGetDpiForWindow( swapchain->surface->hwnd ) ) &&
+        !extents_equals( &swapchain->extents, &client_rect ))
+        return VK_SUBOPTIMAL_KHR;
+    return VK_SUCCESS;
+}
+
+/* Signals acquired semaphores a submission is about to wait for, on the
+ * submitting queue the application is already synchronizing. */
+static VkResult ps5_compositor_signal_acquired( struct vulkan_queue *queue, const VkSemaphore *waits, uint32_t count )
+{
+    VkSemaphore signals[16];
+    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pSignalSemaphores = signals};
+    uint32_t i;
+
+    for (i = 0; i < count && submit.signalSemaphoreCount < ARRAY_SIZE(signals); i++)
+    {
+        struct semaphore *semaphore = semaphore_from_handle( waits[i] );
+        if (!semaphore->ps5_acquired) continue;
+        semaphore->ps5_acquired = FALSE;
+        signals[submit.signalSemaphoreCount++] = semaphore->obj.host.semaphore;
+    }
+    if (!submit.signalSemaphoreCount) return VK_SUCCESS;
+    return queue->device->p_vkQueueSubmit( queue->host.queue, 1, &submit, VK_NULL_HANDLE );
+}
+
+static VkResult ps5_compositor_queue_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info )
+{
+    VkSemaphore waits[16];
+    uint32_t wait_count = 0, i;
+    VkResult res = VK_SUCCESS;
+
+    /* An acquire semaphore never signalled stays unsignalled once consumed. */
+    for (i = 0; i < present_info->waitSemaphoreCount; i++)
+    {
+        struct semaphore *semaphore = semaphore_from_handle( present_info->pWaitSemaphores[i] );
+        if (semaphore->ps5_acquired)
+        {
+            semaphore->ps5_acquired = FALSE;
+            continue;
+        }
+        if (wait_count == ARRAY_SIZE(waits)) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        waits[wait_count++] = semaphore->obj.host.semaphore;
+    }
+
+    for (i = 0; i < present_info->swapchainCount; i++)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
+        HWND hwnd = swapchain->surface->hwnd;
+        RECT client_rect;
+        VkResult swapchain_res;
+
+        /* Later releases are ordered after the first by their barriers. */
+        swapchain_res = ps5c_chain_present( swapchain->ps5_chain, queue->host.queue, queue->info.queueFamilyIndex,
+                                            present_info->pImageIndices[i], i ? 0 : wait_count, waits );
+        if (!swapchain_res)
+        {
+            if (!get_surface_rect( hwnd, &client_rect, NtUserGetDpiForWindow( hwnd ) ))
+                swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
+            else
+            {
+                if (!extents_equals( &swapchain->extents, &client_rect )) swapchain_res = VK_SUBOPTIMAL_KHR;
+                ps5_compositor_check_window( hwnd );
+            }
+        }
+        if (present_info->pResults) present_info->pResults[i] = swapchain_res;
+        if (swapchain_res < 0 && res >= 0) res = swapchain_res;
+        else if (swapchain_res == VK_SUBOPTIMAL_KHR && res == VK_SUCCESS) res = swapchain_res;
+    }
+    return res;
+}
+#endif
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
@@ -3094,6 +3580,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         ERR( "surface %p, hwnd %p is invalid!\n", surface, surface->hwnd );
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode) return ps5_compositor_create_swapchain( device, surface, create_info, ret );
+#endif
 
     if (surface) create_info_host.surface = surface->obj.host.surface;
     if (old_swapchain) create_info_host.oldSwapchain = old_swapchain->obj.host.swapchain;
@@ -3232,6 +3721,11 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 #if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->ps5_chain)
+    {
+        ps5_compositor_destroy_swapchain( device, swapchain );
+        return;
+    }
     if (swapchain->title_viewport_set) ps5_clear_present_viewport( swapchain );
 #endif
 
@@ -3267,6 +3761,11 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     RECT client_rect;
     VkResult res;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->ps5_chain)
+        return ps5_compositor_acquire( device, swapchain, acquire_info->timeout, acquire_info->semaphore,
+                                       acquire_info->fence, image_index );
+#endif
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
@@ -3300,6 +3799,10 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->ps5_chain)
+        return ps5_compositor_acquire( device, swapchain, timeout, client_semaphore, client_fence, image_index );
+#endif
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
@@ -3328,6 +3831,18 @@ static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapch
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
     uint32_t i;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (swapchain->ps5_chain)
+    {
+        uint32_t total = ps5c_chain_images( swapchain->ps5_chain, images, images ? *count : 0 );
+        if (!images || *count >= total)
+        {
+            *count = total;
+            return VK_SUCCESS;
+        }
+        return VK_INCOMPLETE;
+    }
+#endif
     if (images && swapchain->fshack_dpi)
     {
         if (*count > swapchain->n_images) *count = swapchain->n_images;
@@ -3521,6 +4036,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     BOOL locked = FALSE;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode) return ps5_compositor_queue_present( queue, present_info );
+#endif
 
     if (!(swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*swapchains) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed;
@@ -3864,6 +4382,12 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
     struct mempool pool = {0};
 
     TRACE( "queue %p, count %u, submits %p, fence %p\n", queue, count, submits, fence );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode)
+        for (uint32_t i = 0; i < count; i++)
+            if ((res = ps5_compositor_signal_acquired( queue, submits[i].pWaitSemaphores, submits[i].waitSemaphoreCount )))
+                return res;
+#endif
 
     if (!(timelines = mem_alloc( &pool, count * sizeof(*timelines) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memset( timelines, 0, count * sizeof(*timelines) );
@@ -4030,6 +4554,13 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
     struct mempool pool = {0};
     VkResult res;
 
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode)
+        for (uint32_t i = 0; i < count; i++)
+            for (uint32_t j = 0; j < submits[i].waitSemaphoreInfoCount; j++)
+                if ((res = ps5_compositor_signal_acquired( queue, &submits[i].pWaitSemaphoreInfos[j].semaphore, 1 )))
+                    return res;
+#endif
     for (uint32_t i = 0; i < count; i++)
     {
         VkSubmitInfo2 *submit = (VkSubmitInfo2 *)submits + i; /* cast away const, chain has been copied in the thunks */
@@ -4824,6 +5355,14 @@ static void vulkan_init_once(void)
     }
 #ifndef WINE_PS5_RUNESCAPE
     if (title_vulkan) fshack_enabled = FALSE; /* fullscreen native products need no blit */
+#else
+    if (title_vulkan)
+    {
+        /* The native game profile selects the presenter; anything else is direct. */
+        const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
+        ps5_compositor_mode = present && !strcmp( present, "compositor" );
+        MESSAGE( "wine: title present mode=%s\n", ps5_compositor_mode ? "compositor" : "direct" );
+    }
 #endif
     if (!title_vulkan)
 #endif

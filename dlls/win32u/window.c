@@ -3999,6 +3999,10 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         goto done;
     }
     if (surface) window_surface_release( surface );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    /* Moves, resizes, z-order and show/hide reach the composed scene. */
+    ps5_compositor_window_changed();
+#endif
 
     if (winpos->flags & SWP_HIDEWINDOW)
     {
@@ -5381,6 +5385,9 @@ LRESULT destroy_window( HWND hwnd )
     user_driver->pDestroyWindow( hwnd );
 
     free_window_handle( hwnd );
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    ps5_compositor_window_changed(); /* a destroyed window leaves the composed scene */
+#endif
     return 0;
 }
 
