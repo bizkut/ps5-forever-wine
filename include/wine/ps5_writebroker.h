@@ -40,13 +40,17 @@
  * Protocol version 6 identifies brokers that perform bounded, no-follow
  * permission repair over their fixed launcher-data roots before creating
  * the authentication token or accepting connections.
- * RuneScape selects version 7 for synchronous extent-checked diff writes.
+ * RuneScape selects version 8: synchronous diff plus bounded session write-
+ * allocation certificates when native extent queries are unsupported.
  * Replies still report the full logical length only after all required native
  * writes (including EOF extension and identical-write metadata touch) finish.
  * Same-inode broker requests serialize through ACK; requests at most 4 KiB
  * retain ordinary writes. The chunked protocol promises no atomic whole-file
  * update against unsynchronized native writers/readers.
  * It retains no dirty content and needs no deferred flush/read protocol.
+ * Allocation certificates retain only pinned identity, stat stamps and ranges,
+ * never content. Observable mutation invalidates them; unobservable concurrent
+ * native hole changes are outside this broker root's cooperating-mutator scope.
  * Malformed requests close the connection.
  */
 
@@ -63,7 +67,8 @@
 #define WB_MAGIC       0x31524257u   /* "WBR1" */
 /* 2: WB_USER_ROOT, versioned hello. 3: user data only, token in WB_USER_ROOT.
  * 4: WB_ICON_MAGIC. 5: WB_STATFS_MAGIC. 6: startup permission repair.
- * Product version 7: synchronous extent-checked diff writes, same wire layout. */
+ * Product 7: synchronous extent-checked diff. 8: session allocation certificates.
+ * Both retain the same wire layout. */
 #ifndef WB_VERSION
 #define WB_VERSION     6
 #endif
