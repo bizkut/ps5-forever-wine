@@ -1797,6 +1797,25 @@ static VkResult win32u_vkGetPhysicalDeviceImageFormatProperties2KHR( VkPhysicalD
     return get_physical_device_image_format_properties( physical_device, format_info, format_properties, instance->p_vkGetPhysicalDeviceImageFormatProperties2KHR );
 }
 
+/* Whether a new Vulkan surface marks its window as presented by the GPU, which
+ * clips the window's client area out of GDI drawing. The compositor shows both
+ * GDI layers and swapchain chains, and a swapchain it never receives (Direct3D 9
+ * on Java2D falls back to GDI presentation) would otherwise lose every frame
+ * with the frame window's own GDI painting. */
+static BOOL surface_sets_pixel_format( BOOL readback )
+{
+#if defined(__PROSPERO__) && defined(WINE_PS5_RUNESCAPE)
+    if (ps5_compositor_mode)
+    {
+        static LONG logged;
+        if (InterlockedExchangeAdd( &logged, 1 ) < 16)
+            MESSAGE( "wine: title compositor surface pixel_format=skipped readback=%d\n", readback );
+        return FALSE;
+    }
+#endif
+    return !readback;
+}
+
 static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, const VkWin32SurfaceCreateInfoKHR *create_info,
                                                 const VkAllocationCallbacks *allocator, VkSurfaceKHR *ret )
 {
@@ -1838,7 +1857,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
      * and a headless swapchain's frames reach the window through GDI
      * (present_swapchain_readback): set, every frame was cut away and the
      * window stayed as it was drawn before. */
-    if (!surface->readback) set_window_pixel_format( surface->hwnd, -1, TRUE );
+    if (surface_sets_pixel_format( surface->readback )) set_window_pixel_format( surface->hwnd, -1, TRUE );
 
     vulkan_object_init( &surface->obj.obj, host_surface );
     surface->obj.instance = instance;
