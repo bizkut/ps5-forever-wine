@@ -348,9 +348,9 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
         static LONG surface_logs;
         /* Bounded evidence of the sizes behind big Chromium buffers. */
         if (InterlockedIncrement( &surface_logs ) <= 32)
-            ERR( "ps5-surface hwnd=%p rect=%d,%d-%d,%d size=%dx%d plane_bytes=%zu dpi=%u\n", hwnd,
+            ERR( "ps5-surface hwnd=%p rect=%d,%d-%d,%d size=%dx%d plane_bytes=%zu\n", hwnd,
                  (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom, width, height,
-                 size, NtUserGetDpiForWindow( hwnd ));
+                 size );
     }
 #endif
 
