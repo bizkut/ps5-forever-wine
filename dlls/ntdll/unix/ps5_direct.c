@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <ps5platform/kernel.h>
 #include <ps5platform/klog.h>
@@ -398,6 +399,58 @@ void *ps5_direct_placeholder_reserve( void *base, size_t size, BOOL replace )
     return base;
 }
 /* WINE_PS5_PLACEHOLDER_TEST_END */
+
+/* Flexible-memory attribution for the 1-GiB FMEM pool that every PsmKit child
+ * shares. Only the placeholder/chunked-reserve (RuneScape CEF) profile reports.
+ * The pool is system-wide, so `free` and `delta` include other children; the
+ * cumulative per-kind byte counters are this process's own mappings that
+ * charge flexible memory: replaced placeholder subsets, non-direct file or
+ * section mappings, and non-direct anonymous placements (an anonymous
+ * placement later replaced by a file mapping is counted in both kinds).
+ * A line is written for every mapping of >= 4 MiB and otherwise when the pool
+ * has moved by >= 8 MiB since the last line, sampled at most every 100 ms and
+ * at most 400 lines per process. */
+#define FLEX_LOG_LINES 400
+#define FLEX_BIG_BYTES ((size_t)4 << 20)
+#define FLEX_DELTA_BYTES ((size_t)8 << 20)
+static uint64_t flex_bytes[PS5_FLEX_KINDS], flex_logged[PS5_FLEX_KINDS];
+static uint64_t flex_next_ns;
+static size_t flex_last_free;
+static unsigned int flex_lines;
+
+void ps5_direct_flex_note( unsigned int kind, void *base, size_t size )
+{
+    static const char *const names[PS5_FLEX_KINDS] = { "replace", "filemap", "anon" };
+    struct timespec ts;
+    uint64_t now;
+    size_t flexible = 0;
+    long long delta;
+    BOOL big = size >= FLEX_BIG_BYTES;
+
+    if (kind >= PS5_FLEX_KINDS || !ps5_direct_reserve_placeholders()) return;
+    __atomic_add_fetch( &flex_bytes[kind], size, __ATOMIC_RELAXED );
+    if (flex_lines >= FLEX_LOG_LINES) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+    if (!big && now < flex_next_ns) return;
+    flex_next_ns = now + 100000000;
+    if (sceKernelAvailableFlexibleMemorySize( &flexible )) return;
+    delta = (long long)flexible - (long long)flex_last_free;
+    if (!big && flex_last_free && (delta > -(long long)FLEX_DELTA_BYTES && delta < (long long)FLEX_DELTA_BYTES))
+        return;
+    flex_lines++;
+    direct_log( "wine: ps5-flex pid=%d kind=%s base=%p size=%zu free=%zu delta=%lld "
+                "replace_kib=%llu(+%llu) filemap_kib=%llu(+%llu) anon_kib=%llu(+%llu)\n",
+                (int)getpid(), names[kind], base, size, flexible, flex_last_free ? delta : 0,
+                (unsigned long long)(flex_bytes[PS5_FLEX_REPLACE] >> 10),
+                (unsigned long long)((flex_bytes[PS5_FLEX_REPLACE] - flex_logged[PS5_FLEX_REPLACE]) >> 10),
+                (unsigned long long)(flex_bytes[PS5_FLEX_FILEMAP] >> 10),
+                (unsigned long long)((flex_bytes[PS5_FLEX_FILEMAP] - flex_logged[PS5_FLEX_FILEMAP]) >> 10),
+                (unsigned long long)(flex_bytes[PS5_FLEX_ANON] >> 10),
+                (unsigned long long)((flex_bytes[PS5_FLEX_ANON] - flex_logged[PS5_FLEX_ANON]) >> 10) );
+    memcpy( flex_logged, flex_bytes, sizeof(flex_logged) );
+    flex_last_free = flexible;
+}
 
 struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size )
 {

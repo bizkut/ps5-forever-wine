@@ -4245,8 +4245,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * lifecycle. Host-page splits must not acquire direct-memory units
          * that also belong to neighbouring placeholders. */
         if (view->protect & VPROT_PS5_PLACEHOLDER)
+        {
             if (anon_mmap_fixed( base, host_size, unix_prot, 0 ) == MAP_FAILED)
                 return STATUS_NO_MEMORY;
+            ps5_direct_flex_note( PS5_FLEX_REPLACE, base, host_size );
+        }
 #endif
 
         view->protect = vprot | VPROT_PLACEHOLDER;
@@ -4332,6 +4335,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         status = ps5_set_vprot( *view_ret, ptr, size, vprot );
         if (status) delete_view( *view_ret );
     }
+    else if (!(vprot & VPROT_PS5_DIRECT) && (vprot & VPROT_COMMITTED))
+        ps5_direct_flex_note( PS5_FLEX_ANON, ptr, host_size );
 #endif
     return status;
 }
@@ -4440,7 +4445,12 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     if ((!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size)
     {
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
+        {
+#ifdef __PROSPERO__
+            ps5_direct_flex_note( PS5_FLEX_FILEMAP, host_addr, host_size );
+#endif
             return STATUS_SUCCESS;
+        }
 
         switch (errno)
         {

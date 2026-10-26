@@ -586,7 +586,25 @@ static void trace_physical( const char *event, file_pos_t bytes )
         inprocess_trace( "physical sections %s bytes=%llu live=%lu live_bytes=%llu created=%lu destroyed=%lu\n",
                          event, (unsigned long long)bytes, physical_live, physical_live_bytes,
                          physical_created, physical_destroyed );
-    if (!(ops % 512)) enum_processes( dump_physical_holder, NULL );
+    /* Large sections name the process whose request made or released them,
+     * and every process's holdings follow, so a flexible-memory drop can be
+     * attributed to a renderer, utility or the browser. */
+    if (bytes >= (16 << 20) && current && current->process)
+        inprocess_trace( "physical section %s big pid=%04x unix_pid=%d tid=%04x bytes=%llu\n",
+                         event, current->process->id, current->process->unix_pid, current->id,
+                         (unsigned long long)bytes );
+    if (!(ops % 512) || bytes >= (16 << 20)) enum_processes( dump_physical_holder, NULL );
+}
+
+/* a process mapped a large physical section; bounded per server */
+static void trace_physical_view( const struct process *process, client_ptr_t base, file_pos_t size )
+{
+    static unsigned int count;
+
+    if (size < (16 << 20) || count >= 256) return;
+    count++;
+    inprocess_trace( "physical view map pid=%04x unix_pid=%d base=%llx bytes=%llu\n", process->id,
+                     process->unix_pid, (unsigned long long)base, (unsigned long long)size );
 }
 
 static int create_physical_temp_file( file_pos_t size )
@@ -2201,6 +2219,7 @@ DECL_HANDLER(map_view)
         view->shared    = NULL;
 #ifdef __PROSPERO__
         view->physical  = !!mapping->physical_bytes;
+        if (view->physical) trace_physical_view( current->process, view->base, view->size );
 #endif
         add_process_view( current, view );
     }
