@@ -576,6 +576,15 @@ static HRESULT create_surrogate_server(REFCLSID rclsid, HANDLE *process)
     size = (MAX_PATH + 1) * sizeof(WCHAR);
     ret = RegQueryValueExW(key, L"DllSurrogate", NULL, NULL, (LPBYTE)command, &size);
     RegCloseKey(key);
+    if (ret == ERROR_FILE_NOT_FOUND)
+    {
+        /* Only an AppID with a DllSurrogate value (empty meaning the default
+         * dllhost) asks for a surrogate. Without one, a class that has no
+         * server must fail at once instead of starting dllhost.exe for every
+         * attempt: on the PS5 each of those is a title child process. */
+        TRACE("No DllSurrogate value for %s\n", debugstr_guid(rclsid));
+        return REGDB_E_CLASSNOTREG;
+    }
     if (ret || !size || !command[0])
     {
         TRACE("No value for DllSurrogate key\n");
