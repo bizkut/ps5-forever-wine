@@ -3371,6 +3371,24 @@ NTSTATUS WINAPI NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJEC
         return STATUS_INVALID_PAGE_PROTECTION;
     }
 
+#ifdef __PROSPERO__
+    if (!file && size && size->QuadPart >= ((LONGLONG)16 << 20))
+    {
+        ULONG_PTR frames[16], stack;
+        const ULONG_PTR *words;
+        unsigned int count = 0, i;
+
+        if (ps5_title_get_syscall_user_stack( &stack ) && !(stack & 7))
+        {
+            words = (const ULONG_PTR *)stack;
+            for (i = 0; i < 512 && count < ARRAY_SIZE(frames) &&
+                 (const char *)(words + i + 1) <= (const char *)NtCurrentTeb()->Tib.StackBase; i++)
+                if (words[i] > 0x10000 && virtual_ps5_is_image_code( (void *)words[i] ))
+                    frames[count++] = words[i];
+        }
+        ps5_direct_section_note( size->QuadPart, sec_flags, protect, frames, count );
+    }
+#endif
     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
 
     SERVER_START_REQ( create_mapping )

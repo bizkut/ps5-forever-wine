@@ -450,6 +450,8 @@ extern BOOL ps5_direct_reserve_placeholders(void);
 extern void *ps5_direct_placeholder_reserve( void *base, size_t size, BOOL replace );
 enum { PS5_FLEX_REPLACE, PS5_FLEX_FILEMAP, PS5_FLEX_ANON, PS5_FLEX_KINDS };
 extern void ps5_direct_flex_note( unsigned int kind, void *base, size_t size );
+extern BOOL virtual_ps5_is_image_code( const void *addr );
+extern void ps5_direct_section_note( SIZE_T size, ULONG sec_flags, ULONG protect, const ULONG_PTR *stack, unsigned int words );
 extern struct ps5_direct_view *ps5_direct_create_view( void *base, size_t size );
 extern void ps5_direct_retain_view( struct ps5_direct_view *view );
 extern void ps5_direct_free_view( struct ps5_direct_view *view );

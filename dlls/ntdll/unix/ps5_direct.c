@@ -1182,3 +1182,22 @@ void ps5_direct_init(void)
 }
 
 #endif /* __PROSPERO__ */
+
+/* Who asks for a big section: raw return addresses found on the caller's
+ * stack that point into executable PE images, resolved by the `loaddll`
+ * base addresses in the same log. Bounded per process. */
+void ps5_direct_section_note( SIZE_T size, ULONG sec_flags, ULONG protect, const ULONG_PTR *frames,
+                              unsigned int count )
+{
+    static unsigned int lines;
+    char text[16 * 20 + 1];
+    unsigned int i, at = 0;
+
+    if (size < ((size_t)16 << 20) || lines >= 24 || !ps5_direct_reserve_placeholders()) return;
+    lines++;
+    text[0] = 0;
+    for (i = 0; i < count && at + 20 < sizeof(text); i++)
+        at += snprintf( text + at, sizeof(text) - at, "%llx,", (unsigned long long)frames[i] );
+    direct_log( "wine: ps5-section pid=%d size=%zu flags=%#x protect=%#x frames=%s\n", (int)getpid(),
+                (size_t)size, (unsigned int)sec_flags, (unsigned int)protect, text );
+}

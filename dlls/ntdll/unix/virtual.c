@@ -2590,6 +2590,22 @@ static struct file_view *find_view( const void *addr, size_t size )
     return NULL;
 }
 
+#ifdef __PROSPERO__
+/* Whether `addr` is executable code of a mapped PE image; the caller holds no lock. */
+BOOL virtual_ps5_is_image_code( const void *addr )
+{
+    struct file_view *view;
+    sigset_t sigset;
+    BOOL ret;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    ret = (view = find_view( addr, 0 )) && (view->protect & SEC_IMAGE) &&
+          (get_page_vprot( addr ) & VPROT_EXEC);
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return ret;
+}
+#endif
+
 
 /***********************************************************************
  *           is_write_watch_range

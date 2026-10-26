@@ -342,6 +342,17 @@ static struct window_surface *create_surface( HWND hwnd, const RECT *rect )
         return NULL;
     }
     close( fd );
+#ifdef __PROSPERO__
+    if (ps5_title_desktop)
+    {
+        static LONG surface_logs;
+        /* Bounded evidence of the sizes behind big Chromium buffers. */
+        if (InterlockedIncrement( &surface_logs ) <= 32)
+            ERR( "ps5-surface hwnd=%p rect=%d,%d-%d,%d size=%dx%d plane_bytes=%zu dpi=%u\n", hwnd,
+                 (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom, width, height,
+                 size, NtUserGetDpiForWindow( hwnd ));
+    }
+#endif
 
     /* GDI draws into the first plane; a flush copies dirty rows into the
      * second plane, the only pixels the title reads. */
