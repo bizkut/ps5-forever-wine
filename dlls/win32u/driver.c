@@ -1451,10 +1451,11 @@ static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
      * pointer over a canvas) keeps the last visible pointer instead of hiding
      * the hardware cursor for good. The direct game path keeps both as set. */
     const char *present = getenv( "WINEPS5_TITLE_PRESENT" );
-    static LONG substituted, inspected;
+    static LONG substituted, inspected, seen, ignored, failed;
     if (present && !strcmp( present, "compositor" ))
     {
         uint32_t width, height, visible;
+        if (cursor && !seen) InterlockedExchangeAdd( &seen, 1 );
         if (cursor && wine_ps5_cursor_info( &ps5_title_cursor_cache, cursor, &width, &height, &visible ))
         {
             if (InterlockedExchangeAdd( &inspected, 1 ) < 16)
@@ -1467,12 +1468,29 @@ static void ps5_title_gpu_SetCursor( HWND hwnd, HCURSOR cursor )
             if (visible) ps5_title_last_visible_cursor = cursor;
             else if (ps5_title_last_visible_cursor) cursor = ps5_title_last_visible_cursor;
         }
-        else if (cursor) ps5_title_last_visible_cursor = cursor;
+        else if (cursor)
+        {
+            if (InterlockedExchangeAdd( &failed, 1 ) < 4)
+            {
+                char line[96];
+                snprintf( line, sizeof(line), "wine: title cursor handle=%p convert=failed mode=compositor\n", cursor );
+                sceKernelDebugOutText( 0, line );
+            }
+            ps5_title_last_visible_cursor = cursor;
+        }
         else if (ps5_title_last_visible_cursor)
         {
             if (!InterlockedExchangeAdd( &substituted, 1 ))
                 sceKernelDebugOutText( 0, "wine: title cursor null kept-visible=1 mode=compositor\n" );
             cursor = ps5_title_last_visible_cursor;
+        }
+        else if (!seen)
+        {
+            /* No cursor was ever set: a start-up NULL must not hide the pointer for
+             * good (the title's own arrow stays) while real shapes may still follow. */
+            if (!InterlockedExchangeAdd( &ignored, 1 ))
+                sceKernelDebugOutText( 0, "wine: title cursor null ignored=1 mode=compositor\n" );
+            return;
         }
     }
 #endif
