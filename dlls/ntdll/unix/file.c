@@ -9474,11 +9474,17 @@ retry:
     }
     if (handle_count >= WINE_PS5_TITLE_BUFFER_EXTENTS_PER_HANDLE)
     {
+        /* Battle.net's Agent writes several sequential streams into one archive
+         * through one handle; a new stream writes out only the handle's oldest
+         * extent and keeps the others merging. */
+        int oldest = title_buffer_find_earliest_locked( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0, 0 );
+        uint64_t sequence = title_buffer.runs[oldest].sequence;
+
         title_buffer_diag.total_cap++;
         title_buffer_diag.handle_evictions++;
         title_buffer_unlock( &lock );
-        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_HANDLE, handle, 0, 0,
-                                              1, 0, WINE_PS5_TITLE_BUFFER_BARRIERS );
+        status = title_buffer_flush_run( oldest, sequence, handle, 1, 0,
+                                         WINE_PS5_TITLE_BUFFER_BARRIERS );
         if (status) { *handled = 1; return status; }
         goto retry;
     }
@@ -9695,50 +9701,39 @@ void ps5_title_stop_coalesced_writes(void)
     InterlockedExchange( &title_buffer_shutdown, 1 );
 }
 
+/* Writes out each run that reached its residence deadline, oldest first. A
+ * file's other runs keep merging until their own deadlines. */
 static NTSTATUS title_buffer_flush_idle_due( uint64_t now, int native_worker )
 {
     struct wine_ps5_title_lock lock;
     NTSTATUS first_status = STATUS_SUCCESS, status;
-    uint64_t attempted_dev[WINE_PS5_TITLE_BUFFER_RUNS];
-    uint64_t attempted_ino[WINE_PS5_TITLE_BUFFER_RUNS];
-    unsigned int attempted_count = 0;
+    unsigned int attempted = 0;
 
     for (;;)
     {
-        uint64_t earliest = UINT64_MAX, dev = 0, ino = 0;
+        uint64_t earliest = UINT64_MAX;
         int index = -1;
-        unsigned int i, j;
+        unsigned int i;
 
         title_buffer_lock( &lock );
         for (i = 0; i < WINE_PS5_TITLE_BUFFER_RUNS; i++)
         {
             struct title_buffer_run *run = &title_buffer.runs[i];
-            int attempted = 0;
 
-            if (!wine_ps5_title_buffer_idle( run->length, run->first_us, now )) continue;
-            for (j = 0; j < attempted_count; j++)
-                if (attempted_dev[j] == run->dev && attempted_ino[j] == run->ino)
-                {
-                    attempted = 1;
-                    break;
-                }
-            if (attempted) continue;
+            if ((attempted & (1u << i)) ||
+                !wine_ps5_title_buffer_idle( run->length, run->first_us, now )) continue;
             if (run->sequence < earliest)
             {
                 earliest = run->sequence;
-                dev = run->dev;
-                ino = run->ino;
                 index = i;
             }
         }
         if (index != -1) title_buffer_diag.idle++;
         title_buffer_unlock( &lock );
         if (index == -1) break;
-        attempted_dev[attempted_count] = dev;
-        attempted_ino[attempted_count++] = ino;
-        status = title_buffer_flush_matching( TITLE_BUFFER_MATCH_IDENTITY, 0, dev, ino,
-                                              0, native_worker,
-                                              WINE_PS5_TITLE_BUFFER_BARRIERS );
+        attempted |= 1u << index;
+        status = title_buffer_flush_run( index, earliest, 0, 0, native_worker,
+                                         WINE_PS5_TITLE_BUFFER_BARRIERS );
         if (status && !first_status) first_status = status;
     }
     return first_status;
