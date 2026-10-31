@@ -251,6 +251,9 @@ struct bound_addr
 #define MAX_ICMP_HISTORY_LENGTH 8
 
 #define MIN_RCVBUF 65536
+#ifdef __PROSPERO__
+#define PS5_TCP_RCVBUF (1024 * 1024)
+#endif
 
 struct sock
 {
@@ -2043,6 +2046,22 @@ static int init_socket( struct sock *sock, int family, int type, int protocol )
     len = sizeof(value);
     if (!getsockopt( sockfd, SOL_SOCKET, SO_RCVBUF, &value, &len ))
     {
+#ifdef __PROSPERO__
+        /* The PS5 kernel stops growing a TCP receive buffer at 128 KiB: on a
+         * 47 ms CDN connection that caps each Battle.net download connection
+         * near 2.7 MB/s (per-connection census, WoW Forever update). Ask for
+         * 1 MiB at creation (the kernel grants up to 512 KiB) and record what
+         * it granted; a program's own SO_RCVBUF still replaces it. */
+        if (type == WS_SOCK_STREAM && value < PS5_TCP_RCVBUF)
+        {
+            int wanted = PS5_TCP_RCVBUF;
+            if (!setsockopt( sockfd, SOL_SOCKET, SO_RCVBUF, &wanted, sizeof(wanted) ))
+            {
+                len = sizeof(value);
+                getsockopt( sockfd, SOL_SOCKET, SO_RCVBUF, &value, &len );
+            }
+        }
+#endif
         if (value < MIN_RCVBUF)
         {
             value = MIN_RCVBUF;
